@@ -1,0 +1,199 @@
+package vpp
+
+import (
+	"fmt"
+
+	govppapi "go.fd.io/govpp/api"
+
+	"github.com/fivetime/sbw-contract/model"
+	"github.com/fivetime/sbw-limiter/internal/binapi/policer"
+	"github.com/fivetime/sbw-limiter/internal/binapi/policer_types"
+)
+
+// Policers materializes pool policers (T-402, DESIGN.md §5.2): one VPP policer
+// per pool per direction, named by PolicerName so the agent can attribute and
+// reconcile them (§7). Large pools bind to a single worker for exact accounting
+// (§5.2 / §1.1-7). Methods take a govppapi.Channel from Conn.Channel().
+type Policers struct {
+	ch govppapi.Channel
+}
+
+// NewPolicers wraps a channel for policer operations.
+func NewPolicers(ch govppapi.Channel) *Policers { return &Policers{ch: ch} }
+
+// toConfig translates a PolicerSpec into the VPP policer_config. V1 uses a
+// single-rate two-color (1R2C) policer: cir + committed burst, transmit on
+// conform, the spec's action on exceed; violate mirrors exceed (unused in 1R2C).
+func toConfig(s model.PolicerSpec) (policer_types.PolicerConfig, error) {
+	rate, err := rateType(s.RateType)
+	if err != nil {
+		return policer_types.PolicerConfig{}, err
+	}
+	conform, err := action(s.ConformAction)
+	if err != nil {
+		return policer_types.PolicerConfig{}, err
+	}
+	exceed, err := action(s.ExceedAction)
+	if err != nil {
+		return policer_types.PolicerConfig{}, err
+	}
+	return policer_types.PolicerConfig{
+		Cir:           uint32(s.CIR),
+		Cb:            s.CommittedBurstBytes,
+		Eir:           0,
+		Eb:            0,
+		RateType:      rate,
+		RoundType:     policer_types.SSE2_QOS_ROUND_API_TO_CLOSEST,
+		Type:          policer_types.SSE2_QOS_POLICER_TYPE_API_1R2C,
+		ColorAware:    s.ColorAware,
+		ConformAction: policer_types.Sse2QosAction{Type: conform},
+		ExceedAction:  policer_types.Sse2QosAction{Type: exceed},
+		ViolateAction: policer_types.Sse2QosAction{Type: exceed},
+	}, nil
+}
+
+func rateType(r model.RateType) (policer_types.Sse2QosRateType, error) {
+	switch r {
+	case model.RateKbps:
+		return policer_types.SSE2_QOS_RATE_API_KBPS, nil
+	case model.RatePps:
+		return policer_types.SSE2_QOS_RATE_API_PPS, nil
+	default:
+		return 0, fmt.Errorf("vpp: unknown rate type %v", r)
+	}
+}
+
+func action(a model.PolicerAction) (policer_types.Sse2QosActionType, error) {
+	switch a {
+	case model.PolicerTransmit:
+		return policer_types.SSE2_QOS_ACTION_API_TRANSMIT, nil
+	case model.PolicerDrop:
+		return policer_types.SSE2_QOS_ACTION_API_DROP, nil
+	case model.PolicerMarkAndTransmit:
+		return policer_types.SSE2_QOS_ACTION_API_MARK_AND_TRANSMIT, nil
+	default:
+		return 0, fmt.Errorf("vpp: unknown policer action %v", a)
+	}
+}
+
+// Add creates the policer and returns its VPP index. The CIR upper bound is
+// asserted because PolicerConfig.Cir is u32; classify hit_next_index (the
+// pool-policer link) is u16, but that limit lives in the classify layer.
+func (p *Policers) Add(spec model.PolicerSpec) (uint32, error) {
+	if err := spec.Validate(); err != nil {
+		return 0, err
+	}
+	cfg, err := toConfig(spec)
+	if err != nil {
+		return 0, err
+	}
+	req := &policer.PolicerAdd{Name: spec.Name, Infos: cfg}
+	reply := &policer.PolicerAddReply{}
+	if err := p.ch.SendRequest(req).ReceiveReply(reply); err != nil {
+		return 0, fmt.Errorf("vpp: policer_add %q: %w", spec.Name, err)
+	}
+	if reply.Retval != 0 {
+		return 0, fmt.Errorf("vpp: policer_add %q failed: retval %d", spec.Name, reply.Retval)
+	}
+
+	if spec.BindWorker {
+		if err := p.bind(reply.PolicerIndex, spec.WorkerIndex, true); err != nil {
+			// The policer exists but is unbound; report so the caller can retry
+			// or alert. Leave it in place (reconcile will re-attempt the bind).
+			return reply.PolicerIndex, fmt.Errorf("vpp: policer %q added but worker bind failed: %w", spec.Name, err)
+		}
+	}
+	return reply.PolicerIndex, nil
+}
+
+// Update reconfigures an existing policer's rate/burst/actions in place (by
+// index). The worker bind is not part of policer_update; callers manage it via
+// Bind when the spec's bind flag changes.
+func (p *Policers) Update(index uint32, spec model.PolicerSpec) error {
+	if err := spec.Validate(); err != nil {
+		return err
+	}
+	cfg, err := toConfig(spec)
+	if err != nil {
+		return err
+	}
+	reply := &policer.PolicerUpdateReply{}
+	if err := p.ch.SendRequest(&policer.PolicerUpdate{PolicerIndex: index, Infos: cfg}).ReceiveReply(reply); err != nil {
+		return fmt.Errorf("vpp: policer_update %d: %w", index, err)
+	}
+	if reply.Retval != 0 {
+		return fmt.Errorf("vpp: policer_update %d failed: retval %d", index, reply.Retval)
+	}
+	return nil
+}
+
+// Delete removes a policer by index.
+func (p *Policers) Delete(index uint32) error {
+	reply := &policer.PolicerDelReply{}
+	if err := p.ch.SendRequest(&policer.PolicerDel{PolicerIndex: index}).ReceiveReply(reply); err != nil {
+		return fmt.Errorf("vpp: policer_del %d: %w", index, err)
+	}
+	if reply.Retval != 0 {
+		return fmt.Errorf("vpp: policer_del %d failed: retval %d", index, reply.Retval)
+	}
+	return nil
+}
+
+// Bind enables or disables pinning a policer to a single worker thread, which
+// restores exact token-bucket accounting under multiple workers (§5.2).
+func (p *Policers) Bind(index, worker uint32, enable bool) error {
+	return p.bind(index, worker, enable)
+}
+
+func (p *Policers) bind(index, worker uint32, enable bool) error {
+	reply := &policer.PolicerBindV2Reply{}
+	req := &policer.PolicerBindV2{PolicerIndex: index, WorkerIndex: worker, BindEnable: enable}
+	if err := p.ch.SendRequest(req).ReceiveReply(reply); err != nil {
+		return fmt.Errorf("vpp: policer_bind_v2 %d: %w", index, err)
+	}
+	if reply.Retval != 0 {
+		return fmt.Errorf("vpp: policer_bind_v2 %d failed: retval %d", index, reply.Retval)
+	}
+	return nil
+}
+
+// PolicerInfo is one enumerated policer (for reconciliation, T-501). policer
+// dump does not return the index, so deletion is by name (DeleteByName).
+type PolicerInfo struct {
+	Name string
+	CIR  uint32
+	CB   uint64
+}
+
+// DeleteByName removes a policer by name via policer_add_del — policer dump
+// does not expose the index, so reconciliation deletes orphans by name.
+func (p *Policers) DeleteByName(name string) error {
+	reply := &policer.PolicerAddDelReply{}
+	if err := p.ch.SendRequest(&policer.PolicerAddDel{IsAdd: false, Name: name}).ReceiveReply(reply); err != nil {
+		return fmt.Errorf("vpp: policer_add_del(del) %q: %w", name, err)
+	}
+	if reply.Retval != 0 {
+		return fmt.Errorf("vpp: policer delete %q failed: retval %d", name, reply.Retval)
+	}
+	return nil
+}
+
+// Dump enumerates the policers currently in VPP. The agent uses this to find
+// orphans and missing pool policers during reconciliation; names encode the
+// pool id (model.ParsePolicerName).
+func (p *Policers) Dump() ([]PolicerInfo, error) {
+	reqCtx := p.ch.SendMultiRequest(&policer.PolicerDump{})
+	var out []PolicerInfo
+	for {
+		details := &policer.PolicerDetails{}
+		stop, err := reqCtx.ReceiveReply(details)
+		if err != nil {
+			return nil, fmt.Errorf("vpp: policer_dump: %w", err)
+		}
+		if stop {
+			break
+		}
+		out = append(out, PolicerInfo{Name: details.Name, CIR: details.Cir, CB: details.Cb})
+	}
+	return out, nil
+}

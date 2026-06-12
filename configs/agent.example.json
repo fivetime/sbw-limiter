@@ -1,0 +1,12 @@
+{
+  "log": {
+    "level": "info",
+    "format": "json",
+    "add_source": false
+  },
+  "edge_id": "edge-a",
+  "bird_socket_path": "/run/bird.ctl",
+  "vpp_api_socket": "/run/vpp/api.sock",
+  "controller_endpoint": "localhost:1791",
+  "reconcile_interval": "60s"
+}

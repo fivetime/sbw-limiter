@@ -1,0 +1,95 @@
+package vpp
+
+import (
+	"fmt"
+
+	govppapi "go.fd.io/govpp/api"
+
+	vppif "github.com/fivetime/sbw-limiter/internal/binapi/interface"
+	"github.com/fivetime/sbw-limiter/internal/binapi/interface_types"
+)
+
+// Interfaces resolves VPP interface names to sw_if_index (T-410): the agent's
+// config names interfaces (uplink/core/inter-edge); the materializers
+// (policer-classify attach, ABF attach, uRPF, lcp pairs) need the numeric
+// sw_if_index. VPP assigns indexes at runtime, so the agent must look them up.
+type Interfaces struct {
+	ch govppapi.Channel
+}
+
+// NewInterfaces wraps a channel for interface lookups.
+func NewInterfaces(ch govppapi.Channel) *Interfaces { return &Interfaces{ch: ch} }
+
+// Interface is a name→index pair read from VPP.
+type Interface struct {
+	Name      string
+	SwIfIndex uint32
+	Up        bool
+}
+
+// List dumps all interfaces.
+func (i *Interfaces) List() ([]Interface, error) {
+	reqCtx := i.ch.SendMultiRequest(&vppif.SwInterfaceDump{SwIfIndex: interface_types.InterfaceIndex(NoTable)})
+	var out []Interface
+	for {
+		d := &vppif.SwInterfaceDetails{}
+		stop, err := reqCtx.ReceiveReply(d)
+		if err != nil {
+			return nil, fmt.Errorf("vpp: sw_interface_dump: %w", err)
+		}
+		if stop {
+			break
+		}
+		out = append(out, Interface{
+			Name:      d.InterfaceName,
+			SwIfIndex: uint32(d.SwIfIndex),
+			Up:        d.Flags&interfaceFlagAdminUp != 0,
+		})
+	}
+	return out, nil
+}
+
+// interfaceFlagAdminUp is IF_STATUS_API_FLAG_ADMIN_UP (bit 0).
+const interfaceFlagAdminUp = 1
+
+// Index resolves one interface name to its sw_if_index. It errors if the name
+// is not present (the agent should treat that as a misconfiguration or a
+// not-yet-created interface and retry on the next reconcile).
+func (i *Interfaces) Index(name string) (uint32, error) {
+	list, err := i.List()
+	if err != nil {
+		return 0, err
+	}
+	for _, iface := range list {
+		if iface.Name == name {
+			return iface.SwIfIndex, nil
+		}
+	}
+	return 0, fmt.Errorf("vpp: interface %q not found", name)
+}
+
+// IndexMap resolves several names at once, returning a name→index map. Missing
+// names are reported together.
+func (i *Interfaces) IndexMap(names ...string) (map[string]uint32, error) {
+	list, err := i.List()
+	if err != nil {
+		return nil, err
+	}
+	byName := make(map[string]uint32, len(list))
+	for _, iface := range list {
+		byName[iface.Name] = iface.SwIfIndex
+	}
+	out := make(map[string]uint32, len(names))
+	var missing []string
+	for _, n := range names {
+		if idx, ok := byName[n]; ok {
+			out[n] = idx
+		} else {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) > 0 {
+		return out, fmt.Errorf("vpp: interfaces not found: %v", missing)
+	}
+	return out, nil
+}

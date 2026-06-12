@@ -1,0 +1,41 @@
+[Unit]
+Description=DC egress shared-bandwidth-pool edge agent
+Documentation=file:///opt/bwpool/DESIGN.md
+# Ordering & deps (DESIGN.md §7): the agent programs VPP and BIRD, so it must
+# start after both. VPP is a HARD dependency — the agent has nothing to
+# materialise without it, and Requires= pulls VPP in and stops the agent if VPP
+# is stopped. BIRD is After-only (soft): the agent tolerates BIRD reloads and a
+# briefly-absent control socket (it retries), so a BIRD restart must not tear
+# the agent down.
+Requires=vpp.service
+After=vpp.service bird.service network-online.target
+Wants=network-online.target
+# Keep restarting forever on crashes — do not let systemd's start-rate limiter
+# give up on a flapping data plane (the agent is the thing that re-converges it).
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+# EDGE_ID etc. come from the environment file (see deploy/systemd/edge-agent.env).
+# The leading '-' makes a missing file non-fatal; config defaults still apply,
+# but EDGE_ID is required and the agent will exit non-zero without it.
+EnvironmentFile=-/etc/bwpool/edge-agent.env
+ExecStart=/usr/local/bin/bwpool-edge-agent
+# Crash recovery (DoD): always bring the agent back, fast but not in a tight
+# spin. Type=exec means systemd considers the unit started once exec succeeds.
+Restart=always
+RestartSec=2
+# Graceful stop: the daemon catches SIGTERM and exits 0.
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+# Runs as root: it needs the root-owned VPP API socket (/run/vpp/api.sock), the
+# BIRD control socket (/run/bird.ctl), and netns/netlink access for the route
+# audit (§5.1). Light hardening only — fuller sandboxing would need explicit
+# ReadWritePaths for the anchors directory and the runtime sockets.
+User=root
+Group=root
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

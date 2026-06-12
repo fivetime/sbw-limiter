@@ -1,0 +1,6 @@
+/dist/
+*.test
+*.out
+*.prof
+.env
+coverage.out

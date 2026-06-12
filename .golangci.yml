@@ -1,0 +1,23 @@
+# golangci-lint v2 config (T-202). Standard preset = errcheck, govet,
+# ineffassign, staticcheck, unused. Keep additions conservative; tighten later
+# as the codebase grows.
+version: "2"
+
+linters:
+  default: standard
+  settings:
+    staticcheck:
+      checks: ["all", "-ST1000"] # allow missing package comments on _test files
+  exclusions:
+    # Generated VPP bindings (T-204) are vendored as-is; do not lint them.
+    paths:
+      - internal/binapi/.*/.*\.ba\.go$
+
+formatters:
+  exclusions:
+    paths:
+      - internal/binapi/.*/.*\.ba\.go$
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

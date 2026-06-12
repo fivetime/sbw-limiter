@@ -1,0 +1,25 @@
+# Fast VPP 26.06 test image built by copying a pre-built install tree (the
+# output of `make build-release` from the vetted stable/2606 source). Use this
+# for containerlab functional tests; the .deb-based Dockerfile is the cleaner
+# production path. Build context must contain the install tree under ./vpp-tree/.
+#
+#   cp -a <vpp-src>/build-root/install-vpp-native/vpp bwpool/deploy/vpp/vpp-tree
+#   docker build -f bwpool/deploy/vpp/Dockerfile.tree -t bwpool/vpp:26.06 bwpool/deploy/vpp
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y \
+      iproute2 libnuma1 libssl3 libunwind8 libnl-3-200 libnl-route-3-200 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY vpp-tree/ /opt/vpp/
+COPY startup.conf /etc/vpp/startup.conf
+
+# Override rpath baked for the host build path; point at the copied tree.
+ENV LD_LIBRARY_PATH=/opt/vpp/lib/x86_64-linux-gnu:/opt/vpp/lib
+ENV VPP_PLUGIN_PATH=/opt/vpp/lib/x86_64-linux-gnu/vpp_plugins
+
+RUN groupadd -f vpp && mkdir -p /run/vpp /var/log/vpp
+
+ENTRYPOINT ["/opt/vpp/bin/vpp", "-c", "/etc/vpp/startup.conf"]
