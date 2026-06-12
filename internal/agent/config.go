@@ -22,6 +22,13 @@ type Config struct {
 	ReconcileInterval  config.Duration `json:"reconcile_interval"`  // §7: 60s
 	ReportInterval     config.Duration `json:"report_interval"`     // B-03 uplink cadence
 	MetricsListenAddr  string          `json:"metrics_listen_addr"` // Prometheus /metrics; empty disables (T-1003)
+
+	// BIRD materialization (B-03 apply): the two agent-managed include files the
+	// main bird.conf includes. BOTH set (with BIRDSocketPath) enables the BIRD
+	// apply loop — anchors (/32 carriers) + egress FlowSpec; empty disables it
+	// (VPP-only deployments / tests).
+	BirdAnchorsInclude  string `json:"bird_anchors_include"`
+	BirdFlowspecInclude string `json:"bird_flowspec_include"`
 }
 
 // DefaultConfig returns the edge-agent defaults from DESIGN.md §4/§5/§7.
@@ -81,6 +88,8 @@ func (c *Config) applyEnv() error {
 	c.ReportInterval = rp
 
 	c.MetricsListenAddr = config.String("METRICS_LISTEN_ADDR", c.MetricsListenAddr)
+	c.BirdAnchorsInclude = config.String("BIRD_ANCHORS_INCLUDE", c.BirdAnchorsInclude)
+	c.BirdFlowspecInclude = config.String("BIRD_FLOWSPEC_INCLUDE", c.BirdFlowspecInclude)
 	return nil
 }
 

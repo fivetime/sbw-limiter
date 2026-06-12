@@ -18,6 +18,8 @@ import (
 	"github.com/fivetime/sbw-contract/logx"
 	"github.com/fivetime/sbw-contract/model"
 	"github.com/fivetime/sbw-limiter/internal/agent"
+	"github.com/fivetime/sbw-limiter/internal/anchors"
+	"github.com/fivetime/sbw-limiter/internal/bird"
 	"github.com/fivetime/sbw-limiter/internal/grpcclient"
 	"github.com/fivetime/sbw-limiter/internal/metrics"
 	"github.com/fivetime/sbw-limiter/internal/vpp"
@@ -95,10 +97,35 @@ func main() {
 		agent.WithReporterLogger(log),
 	)
 
+	// BIRD materialization (B-03 apply): only when the include paths are
+	// configured — anchors (/32 carriers to MX204) + egress FlowSpec (to R),
+	// applied with check+configure+rollback discipline.
+	var birdApply *agent.BirdApplier
+	if cfg.BirdAnchorsInclude != "" && cfg.BirdFlowspecInclude != "" {
+		bc, err := bird.Dial(cfg.BIRDSocketPath)
+		if err != nil {
+			log.Error("bird dial failed", "socket", cfg.BIRDSocketPath, "err", err)
+			os.Exit(1)
+		}
+		defer func() { _ = bc.Close() }()
+		birdApply = agent.NewBirdApplier(
+			anchors.NewApplier(cfg.BirdAnchorsInclude, bc, anchors.WithLogger(log)),
+			anchors.NewApplier(cfg.BirdFlowspecInclude, bc, anchors.WithLogger(log)),
+			log,
+		)
+		if err := birdApply.EnsureFiles(); err != nil {
+			log.Error("bird include init failed", "err", err)
+			os.Exit(1)
+		}
+	}
+
 	client, err := grpcclient.Dial(cfg.ControllerEndpoint, model.EdgeID(cfg.EdgeID),
 		grpcclient.WithDesired(func(st model.EdgeDesiredState) {
 			if store.Accept(st) {
 				recon.Wake() // apply a fresh push now, not on the next timer tick (T-705)
+				if birdApply != nil {
+					birdApply.Wake()
+				}
 			}
 		}),
 		grpcclient.WithLogger(log),
@@ -130,10 +157,13 @@ func main() {
 		log.Info("metrics serving", "addr", cfg.MetricsListenAddr, "path", "/metrics")
 	}
 
-	// Start the three loops. Each blocks until ctx is cancelled.
+	// Start the loops. Each blocks until ctx is cancelled.
 	go client.Run(ctx)                                            // downlink: subscribe + dispatch desired state
 	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // converge VPP to desired every interval
 	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)        // uplink: health/capacity report (B-03)
+	if birdApply != nil {
+		go birdApply.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // anchors+FlowSpec → BIRD
+	}
 
 	// TODO(C-05 触发源 / B-04 audit): wire the BIRD route audit (agent.RouteAudit)
 	// + anchor reloader and controller-down/up fail-static signalling once the

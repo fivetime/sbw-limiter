@@ -112,13 +112,24 @@ func (a *Applier) EnsureFile() error {
 // Equal consecutive sets are skipped without touching BIRD; after a process
 // restart the first Apply always reloads (BIRD state is unknown).
 func (a *Applier) Apply(set []model.Anchor) (ApplyResult, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	content, err := Render(set)
 	if err != nil {
 		return ApplyResult{}, err
 	}
+	res, err := a.ApplyBytes(content)
+	if err == nil && !res.Skipped {
+		a.log.Info("anchors applied", "anchors", len(set))
+	}
+	return res, err
+}
+
+// ApplyBytes is the content-agnostic core of Apply: atomically replace the
+// include file with content, validate with configure check, reload, roll back
+// on failure. Used directly for non-anchor includes the agent manages with the
+// same discipline (e.g. the egress-homing FlowSpec include, B-01/B-03).
+func (a *Applier) ApplyBytes(content []byte) (ApplyResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
 	prev, err := os.ReadFile(a.path)
 	if err != nil {
@@ -155,12 +166,26 @@ func (a *Applier) Apply(set []model.Anchor) (ApplyResult, error) {
 	}
 
 	a.lastGood = content
-	a.log.Info("anchors applied",
-		"anchors", len(set),
-		"check_code", res.Check.Code,
-		"configure_code", res.Configure.Code,
-	)
+	a.log.Info("include applied", "path", a.path,
+		"check_code", res.Check.Code, "configure_code", res.Configure.Code)
 	return res, nil
+}
+
+// EnsureFileBytes is EnsureFile with caller-supplied initial content (for
+// non-anchor includes whose empty form differs from the anchors one).
+func (a *Applier) EnsureFileBytes(content []byte) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if _, err := os.Stat(a.path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := atomicWrite(a.path, content); err != nil {
+		return err
+	}
+	a.log.Info("include file initialized", "path", a.path)
+	return nil
 }
 
 // reconfigure runs plain configure, or the timeout+confirm pattern when a
