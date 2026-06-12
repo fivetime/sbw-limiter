@@ -55,6 +55,15 @@ func (r Result) Empty() bool {
 		r.SessionsAdded == 0 && r.SessionsDeleted == 0 && r.SessionsMoved == 0
 }
 
+// Total is the number of data-plane operations this pass applied; 0 means the
+// data plane already matched desired. A non-zero total on a steady desired state
+// is a drift signal — a soft-death symptom (rules lost/destroyed) that was
+// self-healed locally this cycle (B-05, limiter §5.6).
+func (r Result) Total() int {
+	return r.PolicersAdded + r.PolicersUpdated + r.PolicersDeleted +
+		r.SessionsAdded + r.SessionsDeleted + r.SessionsMoved
+}
+
 // Reconciler converges VPP to the desired state. It tracks policer name→index
 // in memory (VPP's policer dump omits the index), rebuilt as it adds them.
 type Reconciler struct {
@@ -62,6 +71,24 @@ type Reconciler struct {
 	log  *slog.Logger
 
 	polIdx map[string]uint32 // policer name → VPP index, learned on Add
+
+	// observers are notified after each reconcile pass (B-05): the reconcile is
+	// itself the dataplane-penetrating probe, so the soft-death health report is
+	// driven off its result rather than a second VPP scan.
+	observers []func(model.EdgeDesiredState, Result, error)
+}
+
+// AddObserver registers a callback invoked after each reconcile pass (success or
+// failure) with the desired state, the result, and any error. Used to drive the
+// soft-death health report (B-05, limiter §5.6) off the reconcile loop.
+func (r *Reconciler) AddObserver(fn func(model.EdgeDesiredState, Result, error)) {
+	r.observers = append(r.observers, fn)
+}
+
+func (r *Reconciler) notify(desired model.EdgeDesiredState, res Result, err error) {
+	for _, fn := range r.observers {
+		fn(desired, res, err)
+	}
 }
 
 // New creates a reconciler over a VPP connection.
@@ -329,6 +356,7 @@ func (r *Reconciler) runOnce(provider DesiredProvider) {
 	res, err := r.Reconcile(desired)
 	if err != nil {
 		r.log.Error("reconcile pass failed", "err", err)
+		r.notify(desired, res, err)
 		return
 	}
 	if !res.Empty() {
@@ -340,4 +368,5 @@ func (r *Reconciler) runOnce(provider DesiredProvider) {
 			"sessions_deleted", res.SessionsDeleted,
 			"sessions_moved", res.SessionsMoved)
 	}
+	r.notify(desired, res, nil)
 }
