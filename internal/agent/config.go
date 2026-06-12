@@ -15,10 +15,12 @@ type Config struct {
 	Log logx.Config `json:"log"`
 
 	EdgeID             string          `json:"edge_id"`
+	CapacityBps        uint64          `json:"capacity_bps"`        // NIC line rate; controller sells capacity×90% (§4.1)
 	BIRDSocketPath     string          `json:"bird_socket_path"`    // §4: /run/bird.ctl
 	VPPAPISocket       string          `json:"vpp_api_socket"`      // §5: govpp binary API
 	ControllerEndpoint string          `json:"controller_endpoint"` // desired-state source
 	ReconcileInterval  config.Duration `json:"reconcile_interval"`  // §7: 60s
+	ReportInterval     config.Duration `json:"report_interval"`     // B-03 uplink cadence
 }
 
 // DefaultConfig returns the edge-agent defaults from DESIGN.md §4/§5/§7.
@@ -28,6 +30,7 @@ func DefaultConfig() Config {
 		BIRDSocketPath:    "/run/bird.ctl",
 		VPPAPISocket:      "/run/vpp/api.sock",
 		ReconcileInterval: config.Duration(60 * time.Second),
+		ReportInterval:    config.Duration(15 * time.Second),
 	}
 }
 
@@ -57,11 +60,23 @@ func (c *Config) applyEnv() error {
 	c.VPPAPISocket = config.String("VPP_API_SOCKET", c.VPPAPISocket)
 	c.ControllerEndpoint = config.String("CONTROLLER_ENDPOINT", c.ControllerEndpoint)
 
+	capBps, err := config.Uint64("CAPACITY_BPS", c.CapacityBps)
+	if err != nil {
+		return err
+	}
+	c.CapacityBps = capBps
+
 	ri, err := config.DurationEnv("RECONCILE_INTERVAL", c.ReconcileInterval)
 	if err != nil {
 		return err
 	}
 	c.ReconcileInterval = ri
+
+	rp, err := config.DurationEnv("REPORT_INTERVAL", c.ReportInterval)
+	if err != nil {
+		return err
+	}
+	c.ReportInterval = rp
 	return nil
 }
 

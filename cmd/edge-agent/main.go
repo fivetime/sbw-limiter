@@ -11,10 +11,14 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/fivetime/sbw-contract/buildinfo"
 	"github.com/fivetime/sbw-contract/logx"
+	"github.com/fivetime/sbw-contract/model"
 	"github.com/fivetime/sbw-limiter/internal/agent"
+	"github.com/fivetime/sbw-limiter/internal/grpcclient"
+	"github.com/fivetime/sbw-limiter/internal/vpp"
 )
 
 func main() {
@@ -45,21 +49,67 @@ func main() {
 		"edge_id", cfg.EdgeID,
 		"bird_socket", cfg.BIRDSocketPath,
 		"vpp_api_socket", cfg.VPPAPISocket,
+		"controller", cfg.ControllerEndpoint,
+		"capacity_bps", cfg.CapacityBps,
 		"reconcile_interval", cfg.ReconcileInterval.String(),
 	)
 
-	// Run as a long-lived daemon under systemd (T-504): block until SIGTERM
-	// (systemctl stop) or SIGINT, then shut down cleanly so the unit reports a
-	// clean stop rather than a failure.
-	//
-	// TODO(T-6xx): wire the controller desired-state subscription, the govpp
-	// materializers + reconcile loop (agent.Reconciler.Run), the route audit
-	// (agent.RouteAudit), and the anchor reloader into this run loop. Until then
-	// the daemon idles; the unit lifecycle (start/restart/stop) is already real.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Info("edge-agent running; awaiting desired-state wiring (T-6xx). Send SIGTERM/SIGINT to stop.")
+	// VPP data-plane connection — the agent reconciles desired state into it.
+	conn, err := vpp.Dial(ctx, cfg.VPPAPISocket)
+	if err != nil {
+		log.Error("vpp connect failed", "socket", cfg.VPPAPISocket, "err", err)
+		os.Exit(1)
+	}
+	defer conn.Close()
+
+	// Control-plane plumbing:
+	//   grpcclient ──desired──▶ DesiredStore ──provider──▶ Reconciler ─▶ VPP
+	//        ▲                                    │
+	//        └────── Reporter ◀── HealthChecker ◀─┘ (observer)
+	store := agent.NewDesiredStore()
+	recon := agent.New(conn, log)
+	health := agent.NewHealthChecker(model.EdgeID(cfg.EdgeID), conn)
+	recon.AddObserver(health.Observe) // reconcile result drives soft-death health (B-05)
+
+	reporter := agent.NewReporter(model.EdgeID(cfg.EdgeID), health,
+		agent.WithCapacity(func() model.CapacityReport {
+			return model.CapacityReport{NICCapacityBps: cfg.CapacityBps}
+		}),
+		agent.WithReporterLogger(log),
+	)
+
+	client, err := grpcclient.Dial(cfg.ControllerEndpoint, model.EdgeID(cfg.EdgeID),
+		grpcclient.WithDesired(func(st model.EdgeDesiredState) { store.Accept(st) }),
+		grpcclient.WithLogger(log),
+	)
+	if err != nil {
+		log.Error("controller dial failed", "endpoint", cfg.ControllerEndpoint, "err", err)
+		os.Exit(1)
+	}
+	defer func() { _ = client.Close() }()
+
+	// Announce this edge + its NIC capacity (controller turns it into tokens). A
+	// transient failure here is non-fatal: client.Run re-subscribes, and the next
+	// reconcile/report cadence proceeds; registration is idempotent server-side.
+	if err := client.Register(ctx, cfg.CapacityBps); err != nil {
+		log.Warn("initial register failed; will proceed and rely on resubscribe", "err", err)
+	}
+
+	// Start the three loops. Each blocks until ctx is cancelled.
+	go client.Run(ctx)                                            // downlink: subscribe + dispatch desired state
+	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // converge VPP to desired every interval
+	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)        // uplink: health/capacity report (B-03)
+
+	// TODO(C-05 触发源 / B-04 audit): wire the BIRD route audit (agent.RouteAudit)
+	// + anchor reloader and controller-down/up fail-static signalling once the
+	// accounting checker is composed here.
+
+	log.Info("edge-agent running; subscribed to controller. Send SIGTERM/SIGINT to stop.")
 	<-ctx.Done()
 	log.Info("edge-agent received shutdown signal; stopping")
+	// Give in-flight loops a moment to observe ctx cancellation before exit.
+	time.Sleep(100 * time.Millisecond)
 }
