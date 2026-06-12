@@ -76,6 +76,23 @@ type Reconciler struct {
 	// itself the dataplane-penetrating probe, so the soft-death health report is
 	// driven off its result rather than a second VPP scan.
 	observers []func(model.EdgeDesiredState, Result, error)
+
+	// wake forces an immediate reconcile out of band (a fresh desired-state push)
+	// so a failover/urgent change applies in milliseconds, not up to a full
+	// interval later. Buffered+coalescing: extra wakes are dropped because the
+	// next pass reads the latest desired state anyway.
+	wake chan struct{}
+}
+
+// Wake requests an immediate reconcile pass (a fresh desired-state push arrived,
+// T-705). Non-blocking and coalescing: if a wake is already pending it is a
+// no-op, since the next pass reads the latest desired state. Safe before Run
+// starts (the buffered slot just carries the request to the first select).
+func (r *Reconciler) Wake() {
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
 }
 
 // AddObserver registers a callback invoked after each reconcile pass (success or
@@ -96,7 +113,7 @@ func New(conn *vpp.Conn, log *slog.Logger) *Reconciler {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Reconciler{conn: conn, log: log, polIdx: map[string]uint32{}}
+	return &Reconciler{conn: conn, log: log, polIdx: map[string]uint32{}, wake: make(chan struct{}, 1)}
 }
 
 // Reset drops in-memory caches that a VPP restart invalidates. The policer
@@ -323,6 +340,12 @@ type DesiredProvider func() (model.EdgeDesiredState, bool)
 func (r *Reconciler) Run(ctx context.Context, interval time.Duration, provider DesiredProvider) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	// A nil conn (tests) has no reconnect channel; a nil channel blocks forever in
+	// select, which is the right behaviour (that case simply never fires).
+	var reconnects <-chan struct{}
+	if r.conn != nil {
+		reconnects = r.conn.Reconnects()
+	}
 	r.runOnce(provider) // converge immediately, don't wait a full interval
 	for {
 		select {
@@ -331,7 +354,11 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration, provider D
 			return
 		case <-t.C:
 			r.runOnce(provider)
-		case <-r.conn.Reconnects():
+		case <-r.wake:
+			// A fresh desired-state push: apply now (failover/urgent) rather than
+			// waiting up to a full interval (T-705 / §5).
+			r.runOnce(provider)
+		case <-reconnects:
 			// VPP restarted (or the link flapped): the data plane lost our
 			// rules. Drop stale index caches and reinstall immediately rather
 			// than waiting up to a full interval (T-503, §5/§7). Reconcile is

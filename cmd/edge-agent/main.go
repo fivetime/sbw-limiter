@@ -96,7 +96,11 @@ func main() {
 	)
 
 	client, err := grpcclient.Dial(cfg.ControllerEndpoint, model.EdgeID(cfg.EdgeID),
-		grpcclient.WithDesired(func(st model.EdgeDesiredState) { store.Accept(st) }),
+		grpcclient.WithDesired(func(st model.EdgeDesiredState) {
+			if store.Accept(st) {
+				recon.Wake() // apply a fresh push now, not on the next timer tick (T-705)
+			}
+		}),
 		grpcclient.WithLogger(log),
 	)
 	if err != nil {
