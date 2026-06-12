@@ -21,6 +21,7 @@ type Config struct {
 	ControllerEndpoint string          `json:"controller_endpoint"` // desired-state source
 	ReconcileInterval  config.Duration `json:"reconcile_interval"`  // §7: 60s
 	ReportInterval     config.Duration `json:"report_interval"`     // B-03 uplink cadence
+	MetricsListenAddr  string          `json:"metrics_listen_addr"` // Prometheus /metrics; empty disables (T-1003)
 }
 
 // DefaultConfig returns the edge-agent defaults from DESIGN.md §4/§5/§7.
@@ -31,6 +32,7 @@ func DefaultConfig() Config {
 		VPPAPISocket:      "/run/vpp/api.sock",
 		ReconcileInterval: config.Duration(60 * time.Second),
 		ReportInterval:    config.Duration(15 * time.Second),
+		MetricsListenAddr: ":9102",
 	}
 }
 
@@ -77,6 +79,8 @@ func (c *Config) applyEnv() error {
 		return err
 	}
 	c.ReportInterval = rp
+
+	c.MetricsListenAddr = config.String("METRICS_LISTEN_ADDR", c.MetricsListenAddr)
 	return nil
 }
 

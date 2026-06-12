@@ -8,6 +8,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	"github.com/fivetime/sbw-contract/model"
 	"github.com/fivetime/sbw-limiter/internal/agent"
 	"github.com/fivetime/sbw-limiter/internal/grpcclient"
+	"github.com/fivetime/sbw-limiter/internal/metrics"
 	"github.com/fivetime/sbw-limiter/internal/vpp"
 )
 
@@ -74,6 +76,18 @@ func main() {
 	health := agent.NewHealthChecker(model.EdgeID(cfg.EdgeID), conn)
 	recon.AddObserver(health.Observe) // reconcile result drives soft-death health (B-05)
 
+	// Observability (T-1003): the metrics observer runs AFTER health.Observe, so
+	// health.Last() reflects this pass. Record reconcile activity + health gauges.
+	met := metrics.New(model.EdgeID(cfg.EdgeID))
+	recon.AddObserver(func(_ model.EdgeDesiredState, _ agent.Result, reconcileErr error) {
+		met.RecordReconcile(reconcileErr)
+		if rep, ok := health.Last(); ok {
+			met.RecordHealth(rep)
+		}
+		st := store.Status()
+		met.RecordDesiredStatus(st.Frozen, st.Generation)
+	})
+
 	reporter := agent.NewReporter(model.EdgeID(cfg.EdgeID), health,
 		agent.WithCapacity(func() model.CapacityReport {
 			return model.CapacityReport{NICCapacityBps: cfg.CapacityBps}
@@ -96,6 +110,20 @@ func main() {
 	// reconcile/report cadence proceeds; registration is idempotent server-side.
 	if err := client.Register(ctx, cfg.CapacityBps); err != nil {
 		log.Warn("initial register failed; will proceed and rely on resubscribe", "err", err)
+	}
+
+	// Prometheus /metrics (T-1003).
+	if cfg.MetricsListenAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", met.Handler())
+		msrv := &http.Server{Addr: cfg.MetricsListenAddr, Handler: mux}
+		go func() {
+			if err := msrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Error("metrics server stopped", "err", err)
+			}
+		}()
+		defer func() { _ = msrv.Close() }()
+		log.Info("metrics serving", "addr", cfg.MetricsListenAddr, "path", "/metrics")
 	}
 
 	// Start the three loops. Each blocks until ctx is cancelled.
