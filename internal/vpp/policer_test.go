@@ -68,6 +68,8 @@ func TestPolicerAddPPS(t *testing.T) {
 	spec := ingressSpec()
 	spec.RateType = model.RatePps
 	spec.CIR = 200_000
+	spec.CommittedBurstBytes = 0       // pps burst is in packets, not bytes
+	spec.CommittedBurstPackets = 1_000 // burst tolerance
 	ch := newFakeChannel(nil)
 	if _, err := NewPolicers(ch).Add(spec); err != nil {
 		t.Fatalf("Add: %v", err)
@@ -75,6 +77,29 @@ func TestPolicerAddPPS(t *testing.T) {
 	req := ch.lastSent().(*policer.PolicerAdd)
 	if req.Infos.RateType != policer_types.SSE2_QOS_RATE_API_PPS {
 		t.Errorf("rate_type = %v, want PPS", req.Infos.RateType)
+	}
+	// Burst must be sent as MILLISECONDS for pps: ms = round(1000×1000/200000) = 5.
+	// (VPP folds it back to cb_bytes = ms × cir_kbps/8 = 1000 nominal-256B packets.)
+	if req.Infos.Cb != 5 {
+		t.Errorf("pps cb = %d ms, want 5 (1000 packets / 200000 pps)", req.Infos.Cb)
+	}
+}
+
+func TestCbMsForPps(t *testing.T) {
+	// ms = round(burst_packets × 1000 / cir_pps).
+	cases := []struct {
+		packets, pps, wantMs uint64
+	}{
+		{1_000, 200_000, 5},   // 1000/200000 s = 5 ms
+		{100, 5_000, 20},      // 100/5000 s = 20 ms
+		{0, 5_000, 0},   // no burst
+		{1_000, 0, 0},   // guard: cir 0 → 0 (malformed spec, no divide-by-zero)
+		{5, 2_000, 3},   // 5000/2000 = 2.5 → rounds to 3 (round-half-up)
+	}
+	for _, c := range cases {
+		if got := cbMsForPps(c.packets, c.pps); got != c.wantMs {
+			t.Errorf("cbMsForPps(%d,%d) = %d, want %d", c.packets, c.pps, got, c.wantMs)
+		}
 	}
 }
 

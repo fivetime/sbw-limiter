@@ -37,9 +37,18 @@ func toConfig(s model.PolicerSpec) (policer_types.PolicerConfig, error) {
 	if err != nil {
 		return policer_types.PolicerConfig{}, err
 	}
+	// Burst: VPP's token bucket is byte-denominated, but in PPS mode it reads the
+	// cb field as MILLISECONDS (xlate.c: cb_bytes = cb_ms × cir_kbps/8, with
+	// cir_kbps = pps×256×8/1000). So for pps we convert the packet burst to ms;
+	// the bucket then holds CommittedBurstPackets nominal-256B packets. For kbps
+	// the burst is bytes, passed straight through (T-803).
+	cb := s.CommittedBurstBytes
+	if s.RateType == model.RatePps {
+		cb = cbMsForPps(s.CommittedBurstPackets, s.CIR)
+	}
 	return policer_types.PolicerConfig{
 		Cir:           uint32(s.CIR),
-		Cb:            s.CommittedBurstBytes,
+		Cb:            cb,
 		Eir:           0,
 		Eb:            0,
 		RateType:      rate,
@@ -50,6 +59,18 @@ func toConfig(s model.PolicerSpec) (policer_types.PolicerConfig, error) {
 		ExceedAction:  policer_types.Sse2QosAction{Type: exceed},
 		ViolateAction: policer_types.Sse2QosAction{Type: exceed},
 	}, nil
+}
+
+// cbMsForPps converts a burst expressed in packets into the milliseconds VPP
+// expects for a pps policer: ms = round(burst_packets × 1000 / cir_pps). VPP then
+// computes cb_bytes = ms × cir_kbps/8 = burst_packets × 256, i.e. the bucket holds
+// that many nominal-256B packets. cirPps is the validated CIR (> 0); a zero guard
+// avoids a divide-by-zero on a malformed spec.
+func cbMsForPps(burstPackets, cirPps uint64) uint64 {
+	if cirPps == 0 {
+		return 0
+	}
+	return (burstPackets*1000 + cirPps/2) / cirPps
 }
 
 func rateType(r model.RateType) (policer_types.Sse2QosRateType, error) {
