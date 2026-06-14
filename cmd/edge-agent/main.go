@@ -251,6 +251,29 @@ func main() {
 		go birdApply.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // anchors+FlowSpec → BIRD
 	}
 
+	// Chaos hook (6.13): SIGUSR1 toggles forced data-plane-down, injecting a
+	// soft-death (the agent withdraws the canary + reports healthDead) WHILE VPP
+	// keeps forwarding — so the canary withdrawal reaches the controller's tap and
+	// the soft-death conjunction (canaryDown ∧ healthDead) trips an auto-failover.
+	// A real VPP outage cannot demo this here because the canary BGP rides through
+	// VPP and the hard PeerDown path fires first.
+	go func() {
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGUSR1)
+		forced := false
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ch:
+				forced = !forced
+				health.SetForcedDataPlaneDown(forced)
+				recon.Wake() // re-run health+canary now, not on the next timer tick
+				log.Warn("CHAOS: forced data-plane-down toggled (6.13 soft-death inject)", "forced", forced)
+			}
+		}
+	}()
+
 	// TODO(C-05 触发源 / B-04 audit): wire the BIRD route audit (agent.RouteAudit)
 	// + anchor reloader and controller-down/up fail-static signalling once the
 	// accounting checker is composed here.

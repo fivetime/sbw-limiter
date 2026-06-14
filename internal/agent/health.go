@@ -2,6 +2,7 @@ package agent
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fivetime/sbw-contract/model"
@@ -72,9 +73,25 @@ type HealthChecker struct {
 	// now is injectable for tests; defaults to time.Now().UnixMilli.
 	now func() int64
 
+	// forced is a CHAOS/TEST hook (6.13): when set, Observe overrides the report
+	// to HealthDataPlaneDown regardless of the real VPP/reconcile state. It lets a
+	// soft-death be injected WHILE VPP keeps forwarding — the only way to exercise
+	// the canary path end-to-end in a topology where the canary BGP rides through
+	// VPP (a real outage severs the canary path and trips the hard PeerDown path
+	// first). Toggled via SIGUSR1 in cmd/edge-agent; no normal path sets it.
+	forced atomic.Bool
+
 	mu   sync.Mutex
 	last model.HealthReport
 	seen bool
+}
+
+// SetForcedDataPlaneDown toggles the chaos hook (6.13): true makes every
+// subsequent Observe report HealthDataPlaneDown (soft-death injection); false
+// returns to real classification. Returns the new value.
+func (h *HealthChecker) SetForcedDataPlaneDown(on bool) bool {
+	h.forced.Store(on)
+	return on
 }
 
 // HealthOption configures a HealthChecker.
@@ -109,6 +126,10 @@ func (h *HealthChecker) Observe(desired model.EdgeDesiredState, res Result, reco
 		drift = h.fibDrift()
 	}
 	rep := Classify(h.edgeID, desired, h.live.Healthy(), res, reconcileErr, drift, h.now())
+	if h.forced.Load() {
+		rep.State = model.HealthDataPlaneDown
+		rep.Reason = "forced data-plane-down (chaos/test hook, 6.13)"
+	}
 	h.mu.Lock()
 	h.last = rep
 	h.seen = true
