@@ -49,6 +49,21 @@ type Config struct {
 	CanaryInclude string `json:"canary_include"` // agent-managed BIRD include path
 	CanaryPrefix  string `json:"canary_prefix"`  // /32 or /128
 	CanaryLC      string `json:"canary_lc"`      // "global:local1:local2"
+
+	// Metering export (T-1001): when MeteringEnable and the Kafka brokers/topic/
+	// creds are set, the agent reads VPP policer counters every MeteringInterval
+	// and pushes RAW CUMULATIVE samples to Kafka (→ ClickHouse → BSS). The system
+	// only collects + ships; BSS computes billing. Disabled = no metering export.
+	MeteringEnable   bool            `json:"metering_enable"`
+	MeteringInterval config.Duration `json:"metering_interval"` // §8.1 default 30s
+	VPPStatsSocket   string          `json:"vpp_stats_socket"`  // /run/vpp/stats.sock
+	KafkaBrokers     []string        `json:"kafka_brokers"`     // bootstrap host:port
+	KafkaTopic       string          `json:"kafka_topic"`       // default sbw.metering
+	KafkaSASLUser    string          `json:"kafka_sasl_user"`
+	KafkaSASLPass    string          `json:"kafka_sasl_pass"`
+	KafkaSASLMech    string          `json:"kafka_sasl_mechanism"` // default SCRAM-SHA-256
+	KafkaTLSCAFile   string          `json:"kafka_tls_ca_file"`
+	KafkaTLSInsecure bool            `json:"kafka_tls_insecure"` // test only
 }
 
 // DefaultConfig returns the edge-agent defaults from DESIGN.md §4/§5/§7.
@@ -60,6 +75,10 @@ func DefaultConfig() Config {
 		ReconcileInterval: config.Duration(60 * time.Second),
 		ReportInterval:    config.Duration(15 * time.Second),
 		MetricsListenAddr: ":9102",
+		MeteringInterval:  config.Duration(30 * time.Second),
+		VPPStatsSocket:    "/run/vpp/stats.sock",
+		KafkaTopic:        "sbw.metering",
+		KafkaSASLMech:     "SCRAM-SHA-256",
 	}
 }
 
@@ -116,6 +135,29 @@ func (c *Config) applyEnv() error {
 	c.CanaryInclude = config.String("CANARY_INCLUDE", c.CanaryInclude)
 	c.CanaryPrefix = config.String("CANARY_PREFIX", c.CanaryPrefix)
 	c.CanaryLC = config.String("CANARY_LC", c.CanaryLC)
+
+	me, err := config.Bool("METERING_ENABLE", c.MeteringEnable)
+	if err != nil {
+		return err
+	}
+	c.MeteringEnable = me
+	mi, err := config.DurationEnv("METERING_INTERVAL", c.MeteringInterval)
+	if err != nil {
+		return err
+	}
+	c.MeteringInterval = mi
+	c.VPPStatsSocket = config.String("VPP_STATS_SOCKET", c.VPPStatsSocket)
+	c.KafkaBrokers = config.Strings("METERING_KAFKA_BROKERS", c.KafkaBrokers)
+	c.KafkaTopic = config.String("METERING_KAFKA_TOPIC", c.KafkaTopic)
+	c.KafkaSASLUser = config.String("METERING_SASL_USER", c.KafkaSASLUser)
+	c.KafkaSASLPass = config.String("METERING_SASL_PASS", c.KafkaSASLPass)
+	c.KafkaSASLMech = config.String("METERING_SASL_MECHANISM", c.KafkaSASLMech)
+	c.KafkaTLSCAFile = config.String("METERING_TLS_CA", c.KafkaTLSCAFile)
+	ti, err := config.Bool("METERING_TLS_INSECURE", c.KafkaTLSInsecure)
+	if err != nil {
+		return err
+	}
+	c.KafkaTLSInsecure = ti
 	return nil
 }
 

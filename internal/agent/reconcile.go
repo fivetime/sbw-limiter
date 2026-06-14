@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/fivetime/sbw-contract/model"
@@ -86,6 +87,11 @@ type Reconciler struct {
 	log  *slog.Logger
 
 	polIdx map[string]uint32 // policer name → VPP index, learned on Add
+
+	// polSnap publishes a read-only copy of polIdx after each pass so the metering
+	// loop (T-1001) can map a policer's stats-segment index back to its pool with
+	// no lock on the reconcile hot path. atomic.Value holds map[string]uint32.
+	polSnap atomic.Value
 
 	// observers are notified after each reconcile pass (B-05): the reconcile is
 	// itself the dataplane-penetrating probe, so the soft-death health report is
@@ -204,7 +210,26 @@ func (r *Reconciler) Reconcile(desired model.EdgeDesiredState) (Result, error) {
 	} else {
 		res.PolicersActual, res.SessionsActual = pa, sa
 	}
+
+	// Publish the policer name→index map for the metering loop (T-1001). A fresh
+	// copy each pass; readers get a consistent, never-mutated snapshot.
+	snap := make(map[string]uint32, len(r.polIdx))
+	for name, idx := range r.polIdx {
+		snap[name] = idx
+	}
+	r.polSnap.Store(snap)
 	return res, nil
+}
+
+// PolicerIndexes returns a read-only snapshot of the policer name→VPP-index map
+// as of the last completed reconcile pass (T-1001). Lock-free; empty until the
+// first pass. The returned map must not be mutated.
+func (r *Reconciler) PolicerIndexes() map[string]uint32 {
+	v := r.polSnap.Load()
+	if v == nil {
+		return nil
+	}
+	return v.(map[string]uint32)
 }
 
 // countProgrammed re-reads VPP for the authoritative count of MANAGED policers

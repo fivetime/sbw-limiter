@@ -24,6 +24,7 @@ import (
 	"github.com/fivetime/sbw-limiter/internal/anchors"
 	"github.com/fivetime/sbw-limiter/internal/bird"
 	"github.com/fivetime/sbw-limiter/internal/grpcclient"
+	"github.com/fivetime/sbw-limiter/internal/kafkasink"
 	"github.com/fivetime/sbw-limiter/internal/metrics"
 	"github.com/fivetime/sbw-limiter/internal/vpp"
 )
@@ -161,8 +162,8 @@ func main() {
 			log.Error("invalid canary LC", "lc", cfg.CanaryLC, "err", err)
 			os.Exit(1)
 		}
-		advContent := renderCanary(cpfx, clc, true)  // protocol with the route
-		wdContent := renderCanary(cpfx, clc, false)  // protocol, no route = withdrawn
+		advContent := renderCanary(cpfx, clc, true) // protocol with the route
+		wdContent := renderCanary(cpfx, clc, false) // protocol, no route = withdrawn
 		cbc := bird.NewReconnecting(cfg.BIRDSocketPath, log)
 		defer func() { _ = cbc.Close() }()
 		// anchors.Applier is a generic "managed BIRD include" (atomic write + check
@@ -249,6 +250,28 @@ func main() {
 	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)        // uplink: health/capacity report (B-03)
 	if birdApply != nil {
 		go birdApply.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // anchors+FlowSpec → BIRD
+	}
+
+	// Metering export (T-1001): read VPP policer counters every interval and push
+	// raw cumulative samples to Kafka (→ ClickHouse → BSS). Telemetry decoupled
+	// from the control plane; a setup failure disables metering but never the agent.
+	if cfg.MeteringEnable && len(cfg.KafkaBrokers) > 0 {
+		if statsReader, err := vpp.NewStatsReader(cfg.VPPStatsSocket); err != nil {
+			log.Error("metering disabled: VPP stats connect failed", "err", err, "socket", cfg.VPPStatsSocket)
+		} else if sink, err := kafkasink.New(kafkasink.Config{
+			Brokers: cfg.KafkaBrokers, Topic: cfg.KafkaTopic,
+			Username: cfg.KafkaSASLUser, Password: cfg.KafkaSASLPass, Mechanism: cfg.KafkaSASLMech,
+			TLSCAFile: cfg.KafkaTLSCAFile, TLSInsecureSkipVerify: cfg.KafkaTLSInsecure,
+		}); err != nil {
+			log.Error("metering disabled: kafka sink init failed", "err", err)
+			_ = statsReader.Close()
+		} else {
+			met := agent.NewMetering(model.EdgeID(cfg.EdgeID), statsReader, recon.PolicerIndexes, sink,
+				agent.WithMeteringLogger(log))
+			go met.Run(ctx, cfg.MeteringInterval.Std())
+			log.Info("metering export started", "brokers", cfg.KafkaBrokers, "topic", cfg.KafkaTopic,
+				"interval", cfg.MeteringInterval.Std())
+		}
 	}
 
 	// Chaos hook (6.13): SIGUSR1 toggles forced data-plane-down, injecting a
