@@ -2,6 +2,7 @@ package agent
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/fivetime/sbw-contract/config"
@@ -29,6 +30,25 @@ type Config struct {
 	// (VPP-only deployments / tests).
 	BirdAnchorsInclude  string `json:"bird_anchors_include"`
 	BirdFlowspecInclude string `json:"bird_flowspec_include"`
+
+	// PolicerInterfaces names the VPP interfaces whose ingress carries pool
+	// traffic to be policed (the L node's lower leg facing R, §5.3 data plane).
+	// The reconciler attaches the policer-classify mask chain to each so that
+	// classified packets actually reach the shared-bucket policer; empty means
+	// no interface binding (classify tables exist but feed no traffic — control
+	// plane only / tests). Env POLICER_INTERFACES is comma-separated.
+	PolicerInterfaces []string `json:"policer_interfaces"`
+
+	// Canary (soft-death §4.7/6.13): when all three are set, the agent advertises
+	// CanaryPrefix tagged with CanaryLC via BIRD WHILE the data plane is healthy
+	// and WITHDRAWS it on HealthDataPlaneDown (re-advertises on recovery). The
+	// controller's RIB tap recognises the route by CanaryLC; its withdrawal
+	// (CanaryDown), conjoined with the agent's own healthDead report, trips
+	// soft-death failover — catching a dead data plane that BGP/heartbeat alone
+	// cannot see. Empty disables the canary (liveness falls back to PeerDown).
+	CanaryInclude string `json:"canary_include"` // agent-managed BIRD include path
+	CanaryPrefix  string `json:"canary_prefix"`  // /32 or /128
+	CanaryLC      string `json:"canary_lc"`      // "global:local1:local2"
 }
 
 // DefaultConfig returns the edge-agent defaults from DESIGN.md §4/§5/§7.
@@ -90,7 +110,24 @@ func (c *Config) applyEnv() error {
 	c.MetricsListenAddr = config.String("METRICS_LISTEN_ADDR", c.MetricsListenAddr)
 	c.BirdAnchorsInclude = config.String("BIRD_ANCHORS_INCLUDE", c.BirdAnchorsInclude)
 	c.BirdFlowspecInclude = config.String("BIRD_FLOWSPEC_INCLUDE", c.BirdFlowspecInclude)
+	if v := config.String("POLICER_INTERFACES", ""); v != "" {
+		c.PolicerInterfaces = splitCSV(v)
+	}
+	c.CanaryInclude = config.String("CANARY_INCLUDE", c.CanaryInclude)
+	c.CanaryPrefix = config.String("CANARY_PREFIX", c.CanaryPrefix)
+	c.CanaryLC = config.String("CANARY_LC", c.CanaryLC)
 	return nil
+}
+
+// splitCSV parses a comma-separated list, trimming spaces and dropping empties.
+func splitCSV(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // Validate checks the edge-agent config for startup-blocking errors.

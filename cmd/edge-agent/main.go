@@ -9,8 +9,11 @@ import (
 	"flag"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,6 +26,16 @@ import (
 	"github.com/fivetime/sbw-limiter/internal/grpcclient"
 	"github.com/fivetime/sbw-limiter/internal/metrics"
 	"github.com/fivetime/sbw-limiter/internal/vpp"
+)
+
+const (
+	// vppReconnectAttempts is effectively unbounded: keep retrying the VPP binary
+	// API across an arbitrarily long outage (crash + supervisor reglue + container
+	// restart) instead of govpp's 3-attempt default, which gives up in ~1.5s and
+	// leaves the agent permanently disconnected. At vppReconnectInterval each, this
+	// is centuries of retries — i.e. "until VPP comes back or the agent stops".
+	vppReconnectAttempts = 1 << 30
+	vppReconnectInterval = time.Second
 )
 
 func main() {
@@ -62,7 +75,15 @@ func main() {
 	defer stop()
 
 	// VPP data-plane connection — the agent reconciles desired state into it.
-	conn, err := vpp.Dial(ctx, cfg.VPPAPISocket)
+	// Reconnect effectively forever (not govpp's 3-attempt default): a VPP crash
+	// can be down for many seconds (supervisor + container restart) and the agent
+	// must keep retrying, then reinstall its rules on reconnect (Reconnects() →
+	// Reconciler.Reset, §5/§7). The logger is passed so reconnect/restart events
+	// are visible instead of discarded.
+	conn, err := vpp.Dial(ctx, cfg.VPPAPISocket,
+		vpp.WithReconnect(vppReconnectAttempts, vppReconnectInterval),
+		vpp.WithLogger(log),
+	)
 	if err != nil {
 		log.Error("vpp connect failed", "socket", cfg.VPPAPISocket, "err", err)
 		os.Exit(1)
@@ -75,6 +96,7 @@ func main() {
 	//        └────── Reporter ◀── HealthChecker ◀─┘ (observer)
 	store := agent.NewDesiredStore()
 	recon := agent.New(conn, log)
+	recon.SetPolicerInterfaces(cfg.PolicerInterfaces)
 	health := agent.NewHealthChecker(model.EdgeID(cfg.EdgeID), conn)
 	recon.AddObserver(health.Observe) // reconcile result drives soft-death health (B-05)
 
@@ -100,13 +122,15 @@ func main() {
 	// BIRD materialization (B-03 apply): only when the include paths are
 	// configured — anchors (/32 carriers to MX204) + egress FlowSpec (to R),
 	// applied with check+configure+rollback discipline.
+	//
+	// Use a self-reconnecting BIRD client: a BIRD restart (e.g. after a VPP crash
+	// recreates the lcp interfaces and the node supervisor restarts BIRD) kills
+	// the control socket, and a one-shot client would wedge on ErrClosed forever.
+	// The wrapper redials transparently on the next apply pass and re-pushes the
+	// includes. It dials lazily, so the agent can also start before BIRD is up.
 	var birdApply *agent.BirdApplier
 	if cfg.BirdAnchorsInclude != "" && cfg.BirdFlowspecInclude != "" {
-		bc, err := bird.Dial(cfg.BIRDSocketPath)
-		if err != nil {
-			log.Error("bird dial failed", "socket", cfg.BIRDSocketPath, "err", err)
-			os.Exit(1)
-		}
+		bc := bird.NewReconnecting(cfg.BIRDSocketPath, log)
 		defer func() { _ = bc.Close() }()
 		birdApply = agent.NewBirdApplier(
 			anchors.NewApplier(cfg.BirdAnchorsInclude, bc, anchors.WithLogger(log)),
@@ -117,6 +141,68 @@ func main() {
 			log.Error("bird include init failed", "err", err)
 			os.Exit(1)
 		}
+	}
+
+	// Canary (soft-death §4.7/6.13): advertise CanaryPrefix tagged with CanaryLC
+	// via BIRD while the data plane is healthy; withdraw it on HealthDataPlaneDown
+	// so the controller's RIB tap sees CanaryDown and (with the agent's own
+	// healthDead report) trips soft-death failover — catching a dead data plane
+	// that BGP/heartbeat alone cannot see. The canary IS a blackhole /32+large-
+	// community route = exactly a model.Anchor, so it reuses the anchors apply
+	// machinery (atomic write + check + reconfigure + rollback + skip-if-unchanged).
+	if cfg.CanaryInclude != "" && cfg.CanaryPrefix != "" && cfg.CanaryLC != "" {
+		cpfx, err := netip.ParsePrefix(cfg.CanaryPrefix)
+		if err != nil {
+			log.Error("invalid canary prefix", "prefix", cfg.CanaryPrefix, "err", err)
+			os.Exit(1)
+		}
+		clc, err := parseLC(cfg.CanaryLC)
+		if err != nil {
+			log.Error("invalid canary LC", "lc", cfg.CanaryLC, "err", err)
+			os.Exit(1)
+		}
+		advContent := renderCanary(cpfx, clc, true)  // protocol with the route
+		wdContent := renderCanary(cpfx, clc, false)  // protocol, no route = withdrawn
+		cbc := bird.NewReconnecting(cfg.BIRDSocketPath, log)
+		defer func() { _ = cbc.Close() }()
+		// anchors.Applier is a generic "managed BIRD include" (atomic write + check
+		// + configure + rollback + skip-if-unchanged); we feed it raw canary bytes
+		// via ApplyBytes (its Apply([]Anchor) would emit an "anchors4" protocol that
+		// collides with the real anchors include — the canary uses its own
+		// "canary4"/"canary6" protocol).
+		canaryApplier := anchors.NewApplier(cfg.CanaryInclude, cbc, anchors.WithLogger(log))
+		if err := canaryApplier.EnsureFileBytes(wdContent); err != nil {
+			log.Error("canary include init failed", "err", err)
+			os.Exit(1)
+		}
+		// Advertise once up front (assume healthy until a reconcile proves the
+		// data plane dead); the observer below self-corrects on the first pass.
+		if _, err := canaryApplier.ApplyBytes(advContent); err != nil {
+			log.Warn("canary initial advertise failed", "err", err)
+		}
+		// Health-driven toggle. Added AFTER health.Observe, so health.Last()
+		// reflects this pass. ApplyBytes skips reconfigure when content is
+		// unchanged, so BIRD is only touched on an actual healthy<->dead flip.
+		lastAdvertised := true
+		recon.AddObserver(func(_ model.EdgeDesiredState, _ agent.Result, _ error) {
+			advertised := true
+			if rep, ok := health.Last(); ok && rep.State == model.HealthDataPlaneDown {
+				advertised = false
+			}
+			content := advContent
+			if !advertised {
+				content = wdContent
+			}
+			if _, err := canaryApplier.ApplyBytes(content); err != nil {
+				log.Warn("canary apply failed", "advertised", advertised, "err", err)
+				return
+			}
+			if advertised != lastAdvertised {
+				log.Info("canary advertisement toggled", "advertised", advertised)
+				lastAdvertised = advertised
+			}
+		})
+		log.Info("canary enabled (soft-death)", "prefix", cpfx, "lc", cfg.CanaryLC, "include", cfg.CanaryInclude)
 	}
 
 	client, err := grpcclient.Dial(cfg.ControllerEndpoint, model.EdgeID(cfg.EdgeID),
@@ -174,4 +260,45 @@ func main() {
 	log.Info("edge-agent received shutdown signal; stopping")
 	// Give in-flight loops a moment to observe ctx cancellation before exit.
 	time.Sleep(100 * time.Millisecond)
+}
+
+// renderCanary builds the canary BIRD include: a static "canary4"/"canary6"
+// protocol that, when advertise is true, originates a single blackhole route for
+// pfx tagged with the canary large-community (the marker the controller's RIB
+// tap recognises). When advertise is false the protocol exists but holds no
+// route — i.e. the canary is withdrawn (CanaryDown at the tap). A dedicated
+// protocol name avoids colliding with the agent's anchors4/anchors6 protocols.
+func renderCanary(pfx netip.Prefix, lc model.LargeCommunity, advertise bool) []byte {
+	proto, channel, table := "canary4", "ipv4", "master4"
+	if pfx.Addr().Is6() {
+		proto, channel, table = "canary6", "ipv6", "master6"
+	}
+	var b strings.Builder
+	b.WriteString("# Managed by bwpool edge-agent — canary (soft-death §4.7). DO NOT EDIT.\n")
+	fmt.Fprintf(&b, "protocol static %s {\n", proto)
+	fmt.Fprintf(&b, "  %s { table %s; };\n", channel, table)
+	if advertise {
+		fmt.Fprintf(&b, "  route %s blackhole {\n", pfx)
+		fmt.Fprintf(&b, "    bgp_large_community.add((%d, %d, %d));\n", lc.GlobalAdmin, lc.LocalData1, lc.LocalData2)
+		b.WriteString("  };\n")
+	}
+	b.WriteString("}\n")
+	return []byte(b.String())
+}
+
+// parseLC parses a "global:local1:local2" large-community string (decimal).
+func parseLC(s string) (model.LargeCommunity, error) {
+	parts := strings.Split(s, ":")
+	if len(parts) != 3 {
+		return model.LargeCommunity{}, fmt.Errorf("want global:local1:local2, got %q", s)
+	}
+	var v [3]uint32
+	for i, p := range parts {
+		n, err := strconv.ParseUint(strings.TrimSpace(p), 10, 32)
+		if err != nil {
+			return model.LargeCommunity{}, fmt.Errorf("part %d (%q): %w", i, p, err)
+		}
+		v[i] = uint32(n)
+	}
+	return model.LargeCommunity{GlobalAdmin: v[0], LocalData1: v[1], LocalData2: v[2]}, nil
 }
