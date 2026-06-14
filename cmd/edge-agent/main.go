@@ -1,7 +1,6 @@
 // Command edge-agent runs on each edge: it subscribes to the controller's
-// desired state, materializes it into BIRD (anchors) and VPP (policer/classify/
-// ABF/uRPF) via the control socket and govpp, and reconciles every 60s.
-// See DESIGN.md §7.
+// desired state, materializes it into BIRD (anchors) and VPP (policer + classify)
+// via the control socket and govpp, and reconciles every 60s. See DESIGN.md §7.
 package main
 
 import (
@@ -266,9 +265,9 @@ func main() {
 			log.Error("metering disabled: kafka sink init failed", "err", err)
 			_ = statsReader.Close()
 		} else {
-			met := agent.NewMetering(model.EdgeID(cfg.EdgeID), statsReader, recon.PolicerIndexes, sink,
+			meter := agent.NewMetering(model.EdgeID(cfg.EdgeID), statsReader, recon.PolicerIndexes, sink,
 				agent.WithMeteringLogger(log))
-			go met.Run(ctx, cfg.MeteringInterval.Std())
+			go meter.Run(ctx, cfg.MeteringInterval.Std())
 			log.Info("metering export started", "brokers", cfg.KafkaBrokers, "topic", cfg.KafkaTopic,
 				"interval", cfg.MeteringInterval.Std())
 		}

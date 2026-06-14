@@ -90,11 +90,11 @@ func TestCbMsForPps(t *testing.T) {
 	cases := []struct {
 		packets, pps, wantMs uint64
 	}{
-		{1_000, 200_000, 5},   // 1000/200000 s = 5 ms
-		{100, 5_000, 20},      // 100/5000 s = 20 ms
-		{0, 5_000, 0},   // no burst
-		{1_000, 0, 0},   // guard: cir 0 → 0 (malformed spec, no divide-by-zero)
-		{5, 2_000, 3},   // 5000/2000 = 2.5 → rounds to 3 (round-half-up)
+		{1_000, 200_000, 5}, // 1000/200000 s = 5 ms
+		{100, 5_000, 20},    // 100/5000 s = 20 ms
+		{0, 5_000, 0},       // no burst
+		{1_000, 0, 0},       // guard: cir 0 → 0 (malformed spec, no divide-by-zero)
+		{5, 2_000, 3},       // 5000/2000 = 2.5 → rounds to 3 (round-half-up)
 	}
 	for _, c := range cases {
 		if got := cbMsForPps(c.packets, c.pps); got != c.wantMs {

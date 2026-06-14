@@ -7,7 +7,9 @@ import (
 	"github.com/fivetime/sbw-limiter/internal/vpp"
 )
 
-type fakeStats struct{ m map[uint32]vpp.PolicerCounters }
+type fakeStats struct {
+	m map[uint32]vpp.PolicerCounters
+}
 
 func (f fakeStats) ReadPolicers() (map[uint32]vpp.PolicerCounters, error) { return f.m, nil }
 
