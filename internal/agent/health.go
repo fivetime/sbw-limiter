@@ -35,6 +35,8 @@ func Classify(edgeID model.EdgeID, desired model.EdgeDesiredState, vppHealthy bo
 		VPPConnected:      vppHealthy,
 		PolicersDesired:   len(desired.Policers),
 		SessionsDesired:   len(desired.ClassifySessions),
+		PolicersActual:    res.PolicersActual,
+		SessionsActual:    res.SessionsActual,
 		RepairActions:     res.Total(),
 		FIBDrift:          fibDrift,
 	}

@@ -123,6 +123,38 @@ func TestReconcileClassifyDeletesOrphan(t *testing.T) {
 	}
 }
 
+// TestReconcileClassifyPrunesEmptiedMask: when the desired set drops EVERY
+// session of a mask (its last pool removed, or stale sessions inherited from a
+// VPP that outlived the agent), the mask's table is no longer visited by the
+// per-desired-mask loop — so its leftover sessions must be pruned by the
+// emptied-mask sweep, or they linger as orphans no re-push can heal (B-02).
+func TestReconcileClassifyPrunesEmptiedMask(t *testing.T) {
+	f := newFakeClassify()
+	r := newReconciler()
+	r.polIdx["pool200_in"] = 5
+	// Program two sessions on the ip4-dst-32 table.
+	_, _ = r.reconcileClassify(f, []model.ClassifySession{
+		member(200, "203.0.113.10/32"), member(200, "203.0.113.11/32"),
+	})
+	tbl := f.tables[model.MaskIP4Dst32]
+	if len(f.sessions[tbl]) != 2 {
+		t.Fatalf("setup: want 2 sessions, got %d", len(f.sessions[tbl]))
+	}
+
+	// Desired now empty (pool removed): the mask is absent from byMask, so the
+	// per-desired-mask loop skips its table — the sweep must still clear it.
+	c, err := r.reconcileClassify(f, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.deleted != 2 {
+		t.Fatalf("deleted = %d, want 2 (both orphans on emptied mask)", c.deleted)
+	}
+	if len(f.sessions[tbl]) != 0 {
+		t.Errorf("emptied-mask table must be pruned, %d sessions remain", len(f.sessions[tbl]))
+	}
+}
+
 func TestReconcileClassifyRepointsMovedMember(t *testing.T) {
 	f := newFakeClassify()
 	r := newReconciler()

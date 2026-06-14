@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"sort"
 	"time"
 
 	"github.com/fivetime/sbw-contract/model"
@@ -47,12 +48,25 @@ type Result struct {
 	SessionsAdded   int
 	SessionsDeleted int
 	SessionsMoved   int // re-pointed to a different pool policer
+
+	BindingsChanged int // policer-classify interface attach/detach (data plane)
+
+	// PolicersActual / SessionsActual are the AUTHORITATIVE VPP-programmed counts
+	// re-read at the END of a successful pass (managed policers; classify sessions
+	// summed across all mask tables) — not derived from the diff, so they catch
+	// state the desired-scoped diff never looked at (e.g. an orphan mask). They
+	// feed the agent's health report for the controller's three-number
+	// reconciliation (B-02). Left zero on a failed pass (the count is untrustworthy
+	// then; the report's DataPlaneDown state already says so).
+	PolicersActual int
+	SessionsActual int
 }
 
 // Empty reports whether the pass made no changes (steady state).
 func (r Result) Empty() bool {
 	return r.PolicersAdded == 0 && r.PolicersUpdated == 0 && r.PolicersDeleted == 0 &&
-		r.SessionsAdded == 0 && r.SessionsDeleted == 0 && r.SessionsMoved == 0
+		r.SessionsAdded == 0 && r.SessionsDeleted == 0 && r.SessionsMoved == 0 &&
+		r.BindingsChanged == 0
 }
 
 // Total is the number of data-plane operations this pass applied; 0 means the
@@ -61,7 +75,8 @@ func (r Result) Empty() bool {
 // self-healed locally this cycle (B-05, limiter §5.6).
 func (r Result) Total() int {
 	return r.PolicersAdded + r.PolicersUpdated + r.PolicersDeleted +
-		r.SessionsAdded + r.SessionsDeleted + r.SessionsMoved
+		r.SessionsAdded + r.SessionsDeleted + r.SessionsMoved +
+		r.BindingsChanged
 }
 
 // Reconciler converges VPP to the desired state. It tracks policer name→index
@@ -82,6 +97,17 @@ type Reconciler struct {
 	// interval later. Buffered+coalescing: extra wakes are dropped because the
 	// next pass reads the latest desired state anyway.
 	wake chan struct{}
+
+	// policerIfaces names the data interfaces whose ingress feeds the policer-
+	// classify chain (§5.3 data plane). Set once at startup from config.
+	policerIfaces []string
+}
+
+// SetPolicerInterfaces sets the data interfaces the reconciler binds the
+// policer-classify mask chain to (the L lower leg facing R). Call once before
+// Run; empty leaves classify tables unattached (control plane only).
+func (r *Reconciler) SetPolicerInterfaces(names []string) {
+	r.policerIfaces = names
 }
 
 // Wake requests an immediate reconcile pass (a fresh desired-state push arrived,
@@ -136,6 +162,16 @@ func (r *Reconciler) Reconcile(desired model.EdgeDesiredState) (Result, error) {
 	defer ch.Close()
 
 	var res Result
+	cl := vpp.NewClassify(ch)
+
+	// Lossless index re-learn (agent restart): recover each policer's index from
+	// the hit_next of an existing classify session that points at it, so
+	// reconcilePolicers needn't Delete+Add a correct policer just to relearn its
+	// index. A no-op once every desired policer's index is known (steady state).
+	if err := r.relearnPolicerIndexes(cl, desired.Policers, desired.ClassifySessions); err != nil {
+		return res, err
+	}
+
 	// Order matters: policers first (sessions reference their indexes), then
 	// classify sessions (which read r.polIdx for the hit target).
 	pr, err := r.reconcilePolicers(vpp.NewPolicers(ch), desired.Policers)
@@ -144,12 +180,238 @@ func (r *Reconciler) Reconcile(desired model.EdgeDesiredState) (Result, error) {
 	}
 	res.PolicersAdded, res.PolicersUpdated, res.PolicersDeleted = pr.added, pr.updated, pr.deleted
 
-	cr, err := r.reconcileClassify(vpp.NewClassify(ch), desired.ClassifySessions)
+	cr, err := r.reconcileClassify(cl, desired.ClassifySessions)
 	if err != nil {
 		return res, err
 	}
 	res.SessionsAdded, res.SessionsDeleted, res.SessionsMoved = cr.added, cr.deleted, cr.moved
+
+	// Data plane: attach the classify chain to the configured ingress
+	// interfaces so policed traffic actually flows through it (T-501).
+	bc, err := r.reconcileBindings(cl, vpp.NewInterfaces(ch))
+	if err != nil {
+		return res, err
+	}
+	res.BindingsChanged = bc
+
+	// Authoritative re-count of what VPP is now actually running, for the
+	// controller's three-number reconciliation (B-02). Read fresh rather than
+	// derived from the diff so it reflects true VPP state — including anything the
+	// desired-scoped diff above never enumerated. A count error is non-fatal: the
+	// data plane was reconciled fine, we just couldn't attest the totals this pass.
+	if pa, sa, err := countProgrammed(vpp.NewPolicers(ch), cl); err != nil {
+		r.log.Warn("reconcile: programmed-count attestation failed (B-02)", "err", err)
+	} else {
+		res.PolicersActual, res.SessionsActual = pa, sa
+	}
 	return res, nil
+}
+
+// countProgrammed re-reads VPP for the authoritative count of MANAGED policers
+// (name encodes a pool id) and of classify sessions summed across every mask
+// table. This is the "actual" side of the B-02 three-number audit; counting all
+// tables (not just desired masks) means an orphan session on an otherwise-empty
+// mask still shows up as a discrepancy rather than hiding.
+func countProgrammed(p policerReconciler, cl classifyReconciler) (policers, sessions int, err error) {
+	pols, err := p.Dump()
+	if err != nil {
+		return 0, 0, fmt.Errorf("agent: count policers: %w", err)
+	}
+	for _, a := range pols {
+		if _, _, err := model.ParsePolicerName(a.Name); err == nil {
+			policers++
+		}
+	}
+	tables, err := cl.FindTablesByMask()
+	if err != nil {
+		return 0, 0, fmt.Errorf("agent: count sessions: find tables: %w", err)
+	}
+	for _, table := range tables {
+		ss, err := cl.DumpSessions(table)
+		if err != nil {
+			return 0, 0, fmt.Errorf("agent: count sessions: dump: %w", err)
+		}
+		sessions += len(ss)
+	}
+	return policers, sessions, nil
+}
+
+// relearnPolicerIndexes recovers policer name→index mappings from the hit_next of
+// existing classify sessions, WITHOUT touching the policers (lossless). VPP's
+// policer_dump omits the index (PolicerDetails has no index field), so after an
+// agent restart (polIdx empty, VPP state intact) the only non-disruptive source
+// of a policer's index is a session already pointing at it — that session's
+// hit_next IS the index. This spares reconcilePolicers from re-creating a correct
+// policer (a brief policing gap + index churn) just to relearn it. Only fills
+// MISSING entries; skips the VPP dump entirely once every desired policer's index
+// is known (steady state). The re-create path remains the fallback for a policer
+// with no session to identify it.
+func (r *Reconciler) relearnPolicerIndexes(cl *vpp.Classify, policers []model.PolicerSpec, sessions []model.ClassifySession) error {
+	allKnown := true
+	for _, p := range policers {
+		if _, ok := r.polIdx[p.Name]; !ok {
+			allKnown = false
+			break
+		}
+	}
+	if allKnown {
+		return nil
+	}
+
+	tables, err := cl.FindTablesByMask()
+	if err != nil {
+		return fmt.Errorf("agent: relearn: find tables: %w", err)
+	}
+	actual := make(map[model.MaskKind]map[string]uint32, len(tables)) // mask → matchKey → hit_next
+	for mask, table := range tables {
+		ss, err := cl.DumpSessions(table)
+		if err != nil {
+			return fmt.Errorf("agent: relearn: dump sessions: %w", err)
+		}
+		m := make(map[string]uint32, len(ss))
+		for _, s := range ss {
+			m[hex.EncodeToString(s.Match)] = s.HitNextIndex
+		}
+		actual[mask] = m
+	}
+	for _, s := range sessions {
+		if _, known := r.polIdx[s.PolicerName]; known {
+			continue
+		}
+		key, err := vpp.SessionKey(s.Mask, s.Prefix)
+		if err != nil {
+			continue
+		}
+		if hit, ok := actual[s.Mask][hex.EncodeToString(key)]; ok {
+			r.polIdx[s.PolicerName] = hit
+			r.log.Info("reconcile: relearned policer index from classify session (lossless)",
+				"name", s.PolicerName, "index", hit)
+		}
+	}
+	return nil
+}
+
+// reconcileBindings attaches the policer-classify mask chain to each configured
+// data interface so pool traffic ingressing there is classified→policed (§5.3
+// data plane). Without it, classify tables exist but no interface feeds them, so
+// the shared-bucket policer never sees a packet. The head of each family's mask
+// chain is the attach point; if a family spans several mask tables they are
+// linked into one chain first. Idempotent: re-binds only on drift.
+func (r *Reconciler) reconcileBindings(cl *vpp.Classify, ifaces *vpp.Interfaces) (int, error) {
+	if len(r.policerIfaces) == 0 {
+		return 0, nil
+	}
+	tables, err := cl.FindTablesByMask()
+	if err != nil {
+		return 0, fmt.Errorf("agent: bindings: find tables: %w", err)
+	}
+	ip4Head, err := familyHead(cl, tables, model.FamilyIPv4)
+	if err != nil {
+		return 0, fmt.Errorf("agent: bindings: ip4 chain: %w", err)
+	}
+	ip6Head, err := familyHead(cl, tables, model.FamilyIPv6)
+	if err != nil {
+		return 0, fmt.Errorf("agent: bindings: ip6 chain: %w", err)
+	}
+
+	bound4, err := bindingMap(cl, model.FamilyIPv4)
+	if err != nil {
+		return 0, err
+	}
+	bound6, err := bindingMap(cl, model.FamilyIPv6)
+	if err != nil {
+		return 0, err
+	}
+
+	idxByName, err := ifaces.IndexMap(r.policerIfaces...)
+	if err != nil {
+		return 0, fmt.Errorf("agent: bindings: %w", err)
+	}
+
+	var changed int
+	for _, name := range r.policerIfaces {
+		sw := idxByName[name]
+		c4 := tableOr(bound4, sw)
+		c6 := tableOr(bound6, sw)
+		if c4 == ip4Head && c6 == ip6Head {
+			continue // already attached to the right chain heads
+		}
+		if ip4Head == vpp.NoTable && ip6Head == vpp.NoTable {
+			// Nothing desired: detach the chain currently bound (pool destroyed).
+			if err := cl.SetPolicerInterface(sw, c4, c6, false); err != nil {
+				return changed, fmt.Errorf("agent: bindings: detach %s: %w", name, err)
+			}
+			r.log.Info("reconcile: detached policer-classify", "iface", name, "swifindex", sw)
+		} else {
+			if err := cl.SetPolicerInterface(sw, ip4Head, ip6Head, true); err != nil {
+				return changed, fmt.Errorf("agent: bindings: attach %s: %w", name, err)
+			}
+			r.log.Info("reconcile: attached policer-classify", "iface", name,
+				"swifindex", sw, "ip4table", ip4Head, "ip6table", ip6Head)
+		}
+		changed++
+	}
+	return changed, nil
+}
+
+// familyHead returns the head mask table for a family, linking that family's
+// tables into a single串查 chain (head→…→none) when more than one exists.
+// Returns vpp.NoTable when the family has no tables.
+func familyHead(cl *vpp.Classify, tables map[model.MaskKind]uint32, fam model.Family) (uint32, error) {
+	var ts []uint32
+	for mask, t := range tables {
+		if maskFamily(mask) == fam {
+			ts = append(ts, t)
+		}
+	}
+	if len(ts) == 0 {
+		return vpp.NoTable, nil
+	}
+	if len(ts) == 1 {
+		return ts[0], nil // AddTable already sets next_table_index = none
+	}
+	sort.Slice(ts, func(i, j int) bool { return ts[i] < ts[j] })
+	for i := 0; i < len(ts)-1; i++ {
+		if err := cl.LinkTable(ts[i], ts[i+1]); err != nil {
+			return vpp.NoTable, err
+		}
+	}
+	if err := cl.LinkTable(ts[len(ts)-1], vpp.NoTable); err != nil {
+		return vpp.NoTable, err
+	}
+	return ts[0], nil
+}
+
+// maskFamily reports the address family a classify mask kind operates on.
+func maskFamily(m model.MaskKind) model.Family {
+	switch m {
+	case model.MaskIP6Dst128, model.MaskIP6Src128:
+		return model.FamilyIPv6
+	default:
+		return model.FamilyIPv4
+	}
+}
+
+// bindingMap reads the current policer-classify interface→table bindings for a
+// family into a lookup keyed by sw_if_index.
+func bindingMap(cl *vpp.Classify, fam model.Family) (map[uint32]uint32, error) {
+	att, err := cl.DumpPolicerClassify(fam)
+	if err != nil {
+		return nil, fmt.Errorf("agent: bindings: dump %s: %w", fam, err)
+	}
+	m := make(map[uint32]uint32, len(att))
+	for _, a := range att {
+		m[a.SwIfIndex] = a.TableIndex
+	}
+	return m, nil
+}
+
+// tableOr returns the table bound to sw, or vpp.NoTable if unbound.
+func tableOr(m map[uint32]uint32, sw uint32) uint32 {
+	if t, ok := m[sw]; ok {
+		return t
+	}
+	return vpp.NoTable
 }
 
 type policerCounts struct{ added, updated, deleted int }
@@ -239,6 +501,33 @@ func (r *Reconciler) reconcileClassify(cl classifyReconciler, desired []model.Cl
 			}
 		}
 	}
+
+	// Prune EMPTIED-MASK tables: the byMask loop only visits masks the desired set
+	// still uses, so a mask table whose pools were all removed (e.g. the last IPv6
+	// pool deleted, or stale sessions a restarted agent inherited from VPP) is
+	// never enumerated and its sessions linger as orphans forever — a program drift
+	// no re-push can heal (B-02 surfaced exactly this). Every session on a table
+	// with no desired sessions of its mask is an orphan, so delete them all.
+	for mask, table := range tables {
+		if _, desiredMask := byMask[mask]; desiredMask {
+			continue // visited above
+		}
+		actual, err := cl.DumpSessions(table)
+		if err != nil {
+			return c, err
+		}
+		if len(actual) == 0 {
+			continue
+		}
+		for _, s := range actual {
+			if err := cl.DelSessionByKey(table, mask, s.Match); err != nil {
+				return c, err
+			}
+			c.deleted++
+		}
+		r.log.Info("reconcile: pruned orphan classify sessions on emptied mask",
+			"mask", mask, "table", table, "pruned", len(actual))
+	}
 	return c, nil
 }
 
@@ -293,24 +582,29 @@ func (r *Reconciler) reconcilePolicers(p policerReconciler, desired []model.Poli
 			r.log.Info("reconcile: added policer", "name", name, "index", idx)
 			continue
 		}
-		if policerDrifted(spec, cur) {
-			idx, known := r.polIdx[name]
-			if !known {
-				// Index unknown (e.g. after an agent restart): re-create by name
-				// to converge. The index changes, so classify-session
-				// reconciliation (later in this pass) re-points members.
-				if err := p.DeleteByName(name); err != nil {
-					return c, err
-				}
-				newIdx, err := p.Add(spec)
-				if err != nil {
-					return c, err
-				}
-				r.polIdx[name] = newIdx
-				c.updated++
-				r.log.Warn("reconcile: re-created drifted policer (index unknown)", "name", name, "index", newIdx)
-				continue
+		// Present in VPP. We need its index — VPP's policer dump omits it
+		// (PolicerDetails has no index field) and classify sessions hit it by
+		// index. If the index is unknown — the agent restarted while VPP kept
+		// its policers, so polIdx is empty but the policer already exists, drift
+		// or not — re-create by name to relearn it. The index changes, so
+		// classify-session reconciliation (later this pass) re-points members.
+		// Without this, a CORRECT (non-drifted) policer leaves polIdx empty and
+		// every reconcileClassify fails "unknown policer" → false DataPlaneDown.
+		idx, known := r.polIdx[name]
+		if !known {
+			if err := p.DeleteByName(name); err != nil {
+				return c, err
 			}
+			newIdx, err := p.Add(spec)
+			if err != nil {
+				return c, err
+			}
+			r.polIdx[name] = newIdx
+			c.updated++
+			r.log.Warn("reconcile: re-created policer to relearn index (agent restart)", "name", name, "index", newIdx)
+			continue
+		}
+		if policerDrifted(spec, cur) {
 			if err := p.Update(idx, spec); err != nil {
 				return c, err
 			}
