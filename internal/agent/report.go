@@ -10,7 +10,7 @@ import (
 
 // This file is the L-side of the controller⇄agent boundary frozen by S-04
 // (limiter §4.3). The agent depends only on these interfaces; the transport
-// (Redpanda regular / gRPC urgent, controller-side T-704/705) implements them.
+// (unified gRPC, controller-side T-704/705) implements them.
 //
 //	DOWNLINK (controller→agent): the transport pushes desired state into the
 //	  *DesiredStore (Accept / ControllerUp / ControllerDown, T-505); the
