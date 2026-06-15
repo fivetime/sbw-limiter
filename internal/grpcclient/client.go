@@ -28,6 +28,11 @@ type DesiredFunc func(model.EdgeDesiredState)
 // raw JSON payload is passed through for the agent to interpret.
 type DirectiveFunc func(kind rpc.Directive_Kind, generation uint64, payload []byte)
 
+// CovererFunc receives this agent's coverer assignment (DESIGN-liveness §10,
+// L-06): on the Register response (initial homing) and on every REHOME directive
+// (coverage moved). The homing director uses it to (re)connect to the primary.
+type CovererFunc func(model.CovererAssignment)
+
 // Client is the agent's connection to the controller.
 type Client struct {
 	conn *grpc.ClientConn
@@ -36,6 +41,7 @@ type Client struct {
 
 	onDesired   DesiredFunc
 	onDirective DirectiveFunc
+	onCoverers  CovererFunc
 	backoff     time.Duration
 	log         *slog.Logger
 }
@@ -48,6 +54,10 @@ func WithDesired(fn DesiredFunc) Option { return func(c *Client) { c.onDesired =
 
 // WithDirective wires the failover/urgent directive handler.
 func WithDirective(fn DirectiveFunc) Option { return func(c *Client) { c.onDirective = fn } }
+
+// WithCoverers wires the coverer-assignment handler (homing, L-06): called on the
+// Register response and on every REHOME directive.
+func WithCoverers(fn CovererFunc) Option { return func(c *Client) { c.onCoverers = fn } }
 
 // WithBackoff sets the reconnect backoff (default 1s).
 func WithBackoff(d time.Duration) Option { return func(c *Client) { c.backoff = d } }
@@ -93,6 +103,16 @@ func (c *Client) Register(ctx context.Context, capacityBps uint64) error {
 		return fmt.Errorf("grpcclient: registration rejected (controller schema %d, agent %d)",
 			resp.SchemaVersion, model.SchemaVersion)
 	}
+	// Surface the coverer assignment so the homing director can connect to the
+	// primary (L-06). Empty when sharding is off — the agent stays where it is.
+	if len(resp.Coverers) > 0 && c.onCoverers != nil {
+		var a model.CovererAssignment
+		if err := json.Unmarshal(resp.Coverers, &a); err != nil {
+			c.log.Error("bad coverers in register response", "err", err)
+		} else {
+			c.onCoverers(a)
+		}
+	}
 	return nil
 }
 
@@ -123,6 +143,12 @@ func (c *Client) Run(ctx context.Context) {
 	}
 }
 
+// SubscribePass runs ONE subscribe stream to completion (stream end or ctx
+// cancel). The homing director (L-06) drives passes itself so it can react to
+// each disconnect — re-home to a new primary or fall back to another coverer —
+// instead of Run's blind same-endpoint reconnect.
+func (c *Client) SubscribePass(ctx context.Context) error { return c.subscribeOnce(ctx) }
+
 func (c *Client) subscribeOnce(ctx context.Context) error {
 	stream, err := c.svc.Subscribe(ctx, &rpc.SubscribeRequest{EdgeId: string(c.edge)})
 	if err != nil {
@@ -151,6 +177,16 @@ func (c *Client) dispatch(d *rpc.Directive) {
 		}
 		if c.onDesired != nil {
 			c.onDesired(st)
+		}
+	case rpc.Directive_REHOME:
+		// Coverage moved (L-06): re-home to the new primary, keep the fallbacks.
+		var a model.CovererAssignment
+		if err := json.Unmarshal(d.Payload, &a); err != nil {
+			c.log.Error("bad REHOME payload", "err", err)
+			return
+		}
+		if c.onCoverers != nil {
+			c.onCoverers(a)
 		}
 	default:
 		if c.onDirective != nil {

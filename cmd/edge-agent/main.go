@@ -23,6 +23,7 @@ import (
 	"github.com/fivetime/sbw-limiter/internal/anchors"
 	"github.com/fivetime/sbw-limiter/internal/bird"
 	"github.com/fivetime/sbw-limiter/internal/grpcclient"
+	"github.com/fivetime/sbw-limiter/internal/homing"
 	"github.com/fivetime/sbw-limiter/internal/kafkasink"
 	"github.com/fivetime/sbw-limiter/internal/metrics"
 	"github.com/fivetime/sbw-limiter/internal/vpp"
@@ -205,29 +206,32 @@ func main() {
 		log.Info("canary enabled (soft-death)", "prefix", cpfx, "lc", cfg.CanaryLC, "include", cfg.CanaryInclude)
 	}
 
-	client, err := grpcclient.Dial(cfg.ControllerEndpoint, model.EdgeID(cfg.EdgeID),
-		grpcclient.WithDesired(func(st model.EdgeDesiredState) {
-			if store.Accept(st) {
-				recon.Wake() // apply a fresh push now, not on the next timer tick (T-705)
-				if birdApply != nil {
-					birdApply.Wake()
-				}
+	// Controller connection via the homing director (L-06): the agent boots from
+	// the bootstrap endpoint set, Registers on any one, and is told its primary +
+	// fallback coverers; it homes onto the primary (reports + subscribes there) and
+	// re-homes on a REHOME push, falling back to another coverer if the primary is
+	// unreachable. With sharding off the controller returns no coverers and the
+	// agent simply stays on its single endpoint. The director is the ReportSink.
+	onDesired := func(st model.EdgeDesiredState) {
+		if store.Accept(st) {
+			recon.Wake() // apply a fresh push now, not on the next timer tick (T-705)
+			if birdApply != nil {
+				birdApply.Wake()
 			}
-		}),
-		grpcclient.WithLogger(log),
-	)
-	if err != nil {
-		log.Error("controller dial failed", "endpoint", cfg.ControllerEndpoint, "err", err)
-		os.Exit(1)
+		}
 	}
-	defer func() { _ = client.Close() }()
-
-	// Announce this edge + its NIC capacity (controller turns it into tokens). A
-	// transient failure here is non-fatal: client.Run re-subscribes, and the next
-	// reconcile/report cadence proceeds; registration is idempotent server-side.
-	if err := client.Register(ctx, cfg.CapacityBps); err != nil {
-		log.Warn("initial register failed; will proceed and rely on resubscribe", "err", err)
+	dial := func(endpoint string, onCov grpcclient.CovererFunc) (homing.Conn, error) {
+		c, err := grpcclient.Dial(endpoint, model.EdgeID(cfg.EdgeID),
+			grpcclient.WithDesired(onDesired),
+			grpcclient.WithCoverers(onCov),
+			grpcclient.WithLogger(log),
+		)
+		if err != nil {
+			return nil, err
+		}
+		return c, nil
 	}
+	director := homing.New(cfg.Bootstrap(), cfg.CapacityBps, dial, homing.WithLogger(log))
 
 	// Prometheus /metrics (T-1003).
 	if cfg.MetricsListenAddr != "" {
@@ -244,9 +248,9 @@ func main() {
 	}
 
 	// Start the loops. Each blocks until ctx is cancelled.
-	go client.Run(ctx)                                            // downlink: subscribe + dispatch desired state
+	go director.Run(ctx)                                          // downlink: home onto primary coverer, subscribe + dispatch (L-06)
 	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // converge VPP to desired every interval
-	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)        // uplink: health/capacity report (B-03)
+	go reporter.Run(ctx, cfg.ReportInterval.Std(), director)      // uplink: health/capacity report to current coverer (B-03)
 	if birdApply != nil {
 		go birdApply.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // anchors+FlowSpec → BIRD
 	}

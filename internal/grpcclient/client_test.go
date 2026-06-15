@@ -19,12 +19,13 @@ import (
 // sbw-controller, a different module).
 type fakeServer struct {
 	rpc.UnimplementedAgentServiceServer
-	mu      sync.Mutex
-	regEdge string
-	regCap  uint64
-	reports []model.EdgeReport
-	pushCh  chan *rpc.Directive
-	subbed  chan struct{}
+	mu       sync.Mutex
+	regEdge  string
+	regCap   uint64
+	reports  []model.EdgeReport
+	coverers []byte // JSON model.CovererAssignment returned by Register
+	pushCh   chan *rpc.Directive
+	subbed   chan struct{}
 }
 
 func newFakeServer() *fakeServer {
@@ -34,8 +35,9 @@ func newFakeServer() *fakeServer {
 func (f *fakeServer) Register(_ context.Context, req *rpc.RegisterRequest) (*rpc.RegisterResponse, error) {
 	f.mu.Lock()
 	f.regEdge, f.regCap = req.EdgeId, req.CapacityBps
+	cov := f.coverers
 	f.mu.Unlock()
-	return &rpc.RegisterResponse{SchemaVersion: model.SchemaVersion, Accepted: true}, nil
+	return &rpc.RegisterResponse{SchemaVersion: model.SchemaVersion, Accepted: true, Coverers: cov}, nil
 }
 
 func (f *fakeServer) Subscribe(_ *rpc.SubscribeRequest, stream rpc.AgentService_SubscribeServer) error {
@@ -150,5 +152,58 @@ func TestSendReport(t *testing.T) {
 	defer f.mu.Unlock()
 	if len(f.reports) != 1 || f.reports[0].EdgeID != "edge-2" || f.reports[0].Health.State != model.HealthDegraded {
 		t.Errorf("server reports = %+v", f.reports)
+	}
+}
+
+func TestRegisterSurfacesCoverers(t *testing.T) {
+	f := newFakeServer()
+	a := model.CovererAssignment{EdgeID: "edge-2", Coverers: []model.Coverer{
+		{ControllerID: "ctrl-a", GRPCEndpoint: "a:1791", Primary: true},
+		{ControllerID: "ctrl-b", GRPCEndpoint: "b:1791"},
+	}}
+	f.coverers, _ = json.Marshal(a)
+
+	got := make(chan model.CovererAssignment, 1)
+	c := dialFake(t, f, "edge-2", WithCoverers(func(x model.CovererAssignment) { got <- x }))
+	if err := c.Register(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case x := <-got:
+		if p, ok := x.Primary(); !ok || p.GRPCEndpoint != "a:1791" {
+			t.Errorf("primary = %+v, want a:1791", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("coverers not surfaced from Register")
+	}
+}
+
+func TestRehomeDirectiveSurfacesCoverers(t *testing.T) {
+	f := newFakeServer()
+	got := make(chan model.CovererAssignment, 1)
+	c := dialFake(t, f, "edge-2",
+		WithCoverers(func(x model.CovererAssignment) { got <- x }),
+		WithBackoff(10*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+
+	select {
+	case <-f.subbed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not subscribe")
+	}
+	a := model.CovererAssignment{EdgeID: "edge-2", Coverers: []model.Coverer{{ControllerID: "ctrl-z", GRPCEndpoint: "z:1791", Primary: true}}}
+	payload, _ := json.Marshal(a)
+	f.pushCh <- &rpc.Directive{Kind: rpc.Directive_REHOME, Payload: payload}
+
+	select {
+	case x := <-got:
+		if p, ok := x.Primary(); !ok || p.GRPCEndpoint != "z:1791" {
+			t.Errorf("rehome primary = %+v, want z:1791", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("REHOME directive did not surface coverers")
 	}
 }

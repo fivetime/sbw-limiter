@@ -15,14 +15,18 @@ import (
 type Config struct {
 	Log logx.Config `json:"log"`
 
-	EdgeID             string          `json:"edge_id"`
-	CapacityBps        uint64          `json:"capacity_bps"`        // NIC line rate; controller sells capacity×90% (§4.1)
-	BIRDSocketPath     string          `json:"bird_socket_path"`    // §4: /run/bird.ctl
-	VPPAPISocket       string          `json:"vpp_api_socket"`      // §5: govpp binary API
-	ControllerEndpoint string          `json:"controller_endpoint"` // desired-state source
-	ReconcileInterval  config.Duration `json:"reconcile_interval"`  // §7: 60s
-	ReportInterval     config.Duration `json:"report_interval"`     // B-03 uplink cadence
-	MetricsListenAddr  string          `json:"metrics_listen_addr"` // Prometheus /metrics; empty disables (T-1003)
+	EdgeID             string `json:"edge_id"`
+	CapacityBps        uint64 `json:"capacity_bps"`        // NIC line rate; controller sells capacity×90% (§4.1)
+	BIRDSocketPath     string `json:"bird_socket_path"`    // §4: /run/bird.ctl
+	VPPAPISocket       string `json:"vpp_api_socket"`      // §5: govpp binary API
+	ControllerEndpoint string `json:"controller_endpoint"` // desired-state source (single / bootstrap)
+	// ControllerEndpoints is the bootstrap set for controller sharding (L-06): the
+	// agent connects to any one, Registers, and is told its primary/fallback
+	// coverers to home onto. Empty → [ControllerEndpoint] (single-controller mode).
+	ControllerEndpoints []string        `json:"controller_endpoints"`
+	ReconcileInterval   config.Duration `json:"reconcile_interval"`  // §7: 60s
+	ReportInterval      config.Duration `json:"report_interval"`     // B-03 uplink cadence
+	MetricsListenAddr   string          `json:"metrics_listen_addr"` // Prometheus /metrics; empty disables (T-1003)
 
 	// BIRD materialization (B-03 apply): the two agent-managed include files the
 	// main bird.conf includes. BOTH set (with BIRDSocketPath) enables the BIRD
@@ -107,6 +111,7 @@ func (c *Config) applyEnv() error {
 	c.BIRDSocketPath = config.String("BIRD_SOCKET", c.BIRDSocketPath)
 	c.VPPAPISocket = config.String("VPP_API_SOCKET", c.VPPAPISocket)
 	c.ControllerEndpoint = config.String("CONTROLLER_ENDPOINT", c.ControllerEndpoint)
+	c.ControllerEndpoints = config.Strings("CONTROLLER_ENDPOINTS", c.ControllerEndpoints)
 
 	capBps, err := config.Uint64("CAPACITY_BPS", c.CapacityBps)
 	if err != nil {
@@ -173,6 +178,19 @@ func splitCSV(s string) []string {
 }
 
 // Validate checks the edge-agent config for startup-blocking errors.
+// Bootstrap returns the controller endpoints the homing director boots from:
+// ControllerEndpoints if set, else the single ControllerEndpoint. Empty only when
+// neither is configured.
+func (c Config) Bootstrap() []string {
+	if len(c.ControllerEndpoints) > 0 {
+		return c.ControllerEndpoints
+	}
+	if c.ControllerEndpoint != "" {
+		return []string{c.ControllerEndpoint}
+	}
+	return nil
+}
+
 func (c Config) Validate() error {
 	if c.EdgeID == "" {
 		return fmt.Errorf("agent config: edge_id must be set (BWPOOL_EDGE_ID or config file)")
