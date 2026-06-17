@@ -31,6 +31,7 @@ func Classify(edgeID model.EdgeID, desired model.EdgeDesiredState, vppHealthy bo
 	rep := model.HealthReport{
 		EdgeID:            edgeID,
 		GenerationApplied: desired.Generation,
+		AppliedVersion:    desired.DesiredVersion, // L-07: echo the per-edge content version the controller stamped
 		ObservedAtUnixMs:  nowMs,
 		VPPConnected:      vppHealthy,
 		PolicersDesired:   len(desired.Policers),
