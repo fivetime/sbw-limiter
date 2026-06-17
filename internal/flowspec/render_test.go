@@ -27,10 +27,13 @@ protocol static flowspec4 {
     bgp_ext_community.add((generic, 0x81080a00, 0x00050000));
   };
 }
+protocol static flowspec6 {
+  flow6 { table flowtab6; };
+}
 `
 
 func TestRenderGolden(t *testing.T) {
-	out, err := Render([]model.FlowRedirect{fr("10.20.0.0/24"), fr("10.0.0.0/24")}, netip.MustParseAddr("10.0.0.5"))
+	out, err := Render([]model.FlowRedirect{fr("10.20.0.0/24"), fr("10.0.0.0/24")}, netip.MustParseAddr("10.0.0.5"), netip.Addr{})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -42,7 +45,7 @@ func TestRenderGolden(t *testing.T) {
 func TestRenderDeterministicUnderShuffle(t *testing.T) {
 	base := []model.FlowRedirect{fr("10.0.0.0/24"), fr("10.20.0.0/24"), fr("10.1.2.0/24"), fr("203.0.113.5/32")}
 	nh := netip.MustParseAddr("10.0.0.5")
-	want, err := Render(base, nh)
+	want, err := Render(base, nh, netip.Addr{})
 	if err != nil {
 		t.Fatalf("Render: %v", err)
 	}
@@ -50,7 +53,7 @@ func TestRenderDeterministicUnderShuffle(t *testing.T) {
 	for i := 0; i < 20; i++ {
 		shuf := append([]model.FlowRedirect(nil), base...)
 		r.Shuffle(len(shuf), func(a, b int) { shuf[a], shuf[b] = shuf[b], shuf[a] })
-		got, err := Render(shuf, nh)
+		got, err := Render(shuf, nh, netip.Addr{})
 		if err != nil {
 			t.Fatalf("Render shuffle: %v", err)
 		}
@@ -63,15 +66,15 @@ func TestRenderDeterministicUnderShuffle(t *testing.T) {
 func TestRenderEmptyEmitsProtocol(t *testing.T) {
 	// Empty set must still emit the protocol block so the export filter's name
 	// resolves. No next-hop needed when there are no redirects.
-	out, err := Render(nil, netip.Addr{})
+	out, err := Render(nil, netip.Addr{}, netip.Addr{})
 	if err != nil {
 		t.Fatalf("Render(nil): %v", err)
 	}
 	s := string(out)
-	if !strings.Contains(s, "protocol static flowspec4 {") {
-		t.Errorf("empty render missing protocol block:\n%s", s)
+	if !strings.Contains(s, "protocol static flowspec4 {") || !strings.Contains(s, "protocol static flowspec6 {") {
+		t.Errorf("empty render must emit both protocol blocks:\n%s", s)
 	}
-	if strings.Contains(s, "route flow4") {
+	if strings.Contains(s, "route flow4") || strings.Contains(s, "route flow6") {
 		t.Errorf("empty render should have no routes:\n%s", s)
 	}
 }
@@ -84,18 +87,62 @@ func TestRenderRejectsBadInput(t *testing.T) {
 		nextHop   netip.Addr
 	}{
 		{"host bits set", []model.FlowRedirect{fr("10.20.0.1/24")}, nh},
-		{"ipv6 source", []model.FlowRedirect{{SrcPrefix: netip.MustParsePrefix("2001:db8::/64")}}, nh},
+		{"v6 source no v6 next-hop", []model.FlowRedirect{{SrcPrefix: netip.MustParsePrefix("2001:db8::5/128")}}, nh},
 		{"duplicate", []model.FlowRedirect{fr("10.20.0.0/24"), fr("10.20.0.0/24")}, nh},
 		{"missing next-hop", []model.FlowRedirect{fr("10.20.0.0/24")}, netip.Addr{}},
-		{"ipv6 next-hop", []model.FlowRedirect{fr("10.20.0.0/24")}, netip.MustParseAddr("2001:db8::1")},
+		{"v6 next-hop for v4 source", []model.FlowRedirect{fr("10.20.0.0/24")}, netip.MustParseAddr("2001:db8::1")},
 		{"invalid prefix", []model.FlowRedirect{{SrcPrefix: netip.Prefix{}}}, nh},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if _, err := Render(c.redirects, c.nextHop); err == nil {
+			if _, err := Render(c.redirects, c.nextHop, netip.Addr{}); err == nil {
 				t.Errorf("expected error for %s, got nil", c.name)
 			}
 		})
+	}
+}
+
+// A v6 redirect renders the flowspec6 block with the RFC 5701 IPv6
+// address-specific redirect EC (i6ec(0xc00b, <v6 next-hop>, 0)).
+func TestRenderV6FlowSpec(t *testing.T) {
+	nh6 := netip.MustParseAddr("2001:db8:2::1")
+	out, err := Render([]model.FlowRedirect{{SrcPrefix: netip.MustParsePrefix("2001:db8::5/128")}}, netip.Addr{}, nh6)
+	if err != nil {
+		t.Fatalf("Render v6: %v", err)
+	}
+	s := string(out)
+	if !strings.Contains(s, "protocol static flowspec6 {") || !strings.Contains(s, "flow6 { table flowtab6; };") {
+		t.Errorf("missing flowspec6 block:\n%s", s)
+	}
+	if !strings.Contains(s, "route flow6 { src 2001:db8::5/128; }") {
+		t.Errorf("missing flow6 route:\n%s", s)
+	}
+	if !strings.Contains(s, "bgp_ipv6_ext_community.add(i6ec(0xc00b, 2001:db8:2::1, 0));") {
+		t.Errorf("missing/incorrect v6 redirect EC:\n%s", s)
+	}
+	// No v4 routes when there are no v4 members.
+	if strings.Contains(s, "route flow4") {
+		t.Errorf("v6-only render should have no flow4 routes:\n%s", s)
+	}
+}
+
+// A mixed v4+v6 redirect set renders both blocks with their respective ECs.
+func TestRenderMixedV4V6(t *testing.T) {
+	out, err := Render(
+		[]model.FlowRedirect{fr("10.20.0.0/24"), {SrcPrefix: netip.MustParsePrefix("2001:db8::5/128")}},
+		netip.MustParseAddr("10.0.0.5"), netip.MustParseAddr("2001:db8:2::1"))
+	if err != nil {
+		t.Fatalf("Render mixed: %v", err)
+	}
+	s := string(out)
+	if !strings.Contains(s, "route flow4 { src 10.20.0.0/24; }") {
+		t.Errorf("missing flow4 route:\n%s", s)
+	}
+	if !strings.Contains(s, "route flow6 { src 2001:db8::5/128; }") {
+		t.Errorf("missing flow6 route:\n%s", s)
+	}
+	if !strings.Contains(s, "bgp_ipv6_ext_community.add(i6ec(0xc00b, 2001:db8:2::1, 0));") {
+		t.Errorf("missing v6 redirect EC:\n%s", s)
 	}
 }
 

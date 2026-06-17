@@ -9,6 +9,7 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"net/netip"
 	"time"
 
 	"github.com/fivetime/sbw-contract/model"
@@ -60,7 +61,7 @@ func (b *BirdApplier) EnsureFiles() error {
 	if err := b.anchors.EnsureFile(); err != nil {
 		return err
 	}
-	empty, err := flowspec.Render(nil, model.EdgeDesiredState{}.RedirectNextHop)
+	empty, err := flowspec.Render(nil, netip.Addr{}, netip.Addr{})
 	if err != nil {
 		return err
 	}
@@ -82,7 +83,7 @@ func (b *BirdApplier) applyOnce(st model.EdgeDesiredState) error {
 	if _, err := b.anchors.Apply(st.Anchors); err != nil {
 		return err
 	}
-	flowContent, err := flowspec.Render(st.FlowRedirects, st.RedirectNextHop)
+	flowContent, err := flowspec.Render(st.FlowRedirects, st.RedirectNextHop, st.RedirectNextHopV6)
 	if err != nil {
 		return err
 	}
