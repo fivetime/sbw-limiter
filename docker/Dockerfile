@@ -1,0 +1,53 @@
+# syntax=docker/dockerfile:1.7
+###############################################################################
+# sbw-limiter / edge-agent — the L-node agent. Talks to VPP (govpp) over
+# /run/vpp/api.sock and to bird over /run/bird.ctl PURELY via sockets — it does
+# NOT shell out to vppctl/birdc, so it needs NEITHER bird NOR VPP binaries in its
+# image. The ONLY external command it runs is `ip route` (iproute2), for the
+# three-way route-count drift check (T-502). So: static Go binary + iproute2.
+# NOT based on the bird-vpp image.
+#
+# Co-location is a DEPLOYMENT concern, not an image one: run this beside the VPP
+# (and bird) it drives, sharing /run/vpp (+ the bird socket) via a volume — e.g.
+# the same k8s pod (VPP + bird + agent containers) or the compose below.
+#
+# go.mod replace github.com/fivetime/sbw-contract => ../sbw-contract → clone it.
+###############################################################################
+FROM golang:1.25-alpine AS builder
+
+ARG LIMITER_REPO=github.com/fivetime/sbw-limiter
+ARG LIMITER_REF=main
+ARG CONTRACT_REPO=github.com/fivetime/sbw-contract
+ARG CONTRACT_REF=main
+ARG GH_TOKEN=""
+ARG VERSION=dev
+
+RUN apk add --no-cache git ca-certificates
+WORKDIR /src
+RUN set -eux; \
+    auth=""; [ -n "$GH_TOKEN" ] && auth="x-access-token:${GH_TOKEN}@"; \
+    git clone --depth 1 -b "$LIMITER_REF"  "https://${auth}${LIMITER_REPO}.git"  sbw-limiter; \
+    git clone --depth 1 -b "$CONTRACT_REF" "https://${auth}${CONTRACT_REPO}.git" sbw-contract
+
+WORKDIR /src/sbw-limiter
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    CGO_ENABLED=0 go build -trimpath \
+      -ldflags="-s -w -X main.version=${VERSION}" \
+      -o /out/edge-agent ./cmd/edge-agent
+
+###############################################################################
+# runtime — alpine + iproute2 (the `ip route` dep) + CA certs. No bird/VPP.
+###############################################################################
+FROM alpine:3.23
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="sbw-edge-agent" \
+      org.opencontainers.image.description="Shared-bandwidth-pool L-node agent (VPP policer/classify + bird FlowSpec, socket-driven)" \
+      org.opencontainers.image.source="https://github.com/fivetime/sbw-limiter" \
+      org.opencontainers.image.version="${VERSION}"
+
+RUN apk add --no-cache iproute2 ca-certificates
+COPY --from=builder /out/edge-agent /usr/local/bin/edge-agent
+# metrics 9102 (edge_id-labelled). Config is via BWPOOL_* env (see compose).
+EXPOSE 9102
+ENTRYPOINT ["/usr/local/bin/edge-agent"]

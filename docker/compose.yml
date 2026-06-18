@@ -1,0 +1,54 @@
+# Local smoke: VPP + edge-agent co-located (sharing /run/vpp). Shows the agent
+# image connecting to VPP over the api.sock — the "same node, shared socket"
+# deployment model (NOT image inheritance). The agent then dials the controller
+# (set CONTROLLER_ENDPOINTS to a running sbw-controller); without it the agent just
+# keeps retrying, which is the correct fail-static behaviour.
+#
+#   CONTROLLER_ENDPOINTS=host.docker.internal:1791 docker compose up --build
+#
+# A full L node also runs bird (for the anchor/FlowSpec render side); this compose
+# covers the VPP/policer half. For the faithful topology see sbw-contract/lab.
+name: sbw-edge-agent
+
+services:
+  vpp:
+    image: ghcr.io/fivetime/vpp:master
+    privileged: true
+    command: ["/usr/bin/vpp", "-c", "/etc/vpp/startup.conf"]
+    volumes:
+      - ./vpp-startup.conf:/etc/vpp/startup.conf:ro
+      - run:/run/vpp
+    healthcheck:
+      test: ["CMD-SHELL", "test -S /run/vpp/api.sock"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  edge-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        LIMITER_REF: main
+    # image: ghcr.io/fivetime/sbw-edge-agent:latest   # once published by CI
+    depends_on:
+      vpp:
+        condition: service_healthy
+    # share VPP's netns so govpp + (a real deployment's) taps see the same stack
+    network_mode: "service:vpp"
+    volumes:
+      - run:/run/vpp
+    environment:
+      BWPOOL_EDGE_ID: edge-1
+      BWPOOL_VPP_API_SOCKET: /run/vpp/api.sock
+      BWPOOL_CAPACITY_BPS: "1000000000"
+      BWPOOL_REPORT_INTERVAL: 2s
+      BWPOOL_LOG_FORMAT: text
+      # point at a running controller (e.g. the sbw-controller compose on the host)
+      BWPOOL_CONTROLLER_ENDPOINTS: ${CONTROLLER_ENDPOINTS:-host.docker.internal:1791}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  run:
