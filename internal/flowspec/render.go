@@ -1,7 +1,7 @@
 // Package flowspec renders the agent-managed BIRD include that originates the
 // home edge's egress-homing FlowSpec (B-01, limiter §3.2): for each home member
-// source prefix, a flow4 route carrying an RFC 8955 redirect-to-IPv4 ext-
-// community pointing at this edge. The include is exported (by the L→R BGP
+// source prefix, a flow4/flow6 route carrying a redirect-to-IP ext-community
+// pointing at this edge. The include is exported (by the L→R BGP
 // session, export filter) to every R, which materializes it as a VPP ABF
 // redirect (project A). This replaces the old L-side ABF (S-02).
 //
@@ -14,10 +14,12 @@
 // so the names referenced by the L→R export filter exist unconditionally (mirrors
 // anchors §4.4).
 //
-// Both families are covered: a v4 source carries the RFC 8955 redirect-to-IPv4
-// ext-community (type 0x81 sub 0x08, the target in the 8-byte EC); a v6 source
-// carries the RFC 5701 IPv6 address-specific redirect EC (20-byte, the target in
-// the IPv6 global-admin field), since no 8-byte EC can hold a v6 address.
+// Both families use the redirect-to-IP action of draft-ietf-idr-flowspec-redirect-ip
+// (IESG-approved / RFC Editor queue; IANA-allocated; the FlowSpec framework itself
+// is RFC 8955/8956 but those do NOT define redirect-to-IP). A v4 source carries an
+// IPv4-Address-Specific EC (type 0x01 sub 0x0c, target in the 8-byte EC); a v6 source
+// carries an IPv6-Address-Specific EC (0x000c, 20-byte, target in the IPv6 global-
+// admin field), since no 8-byte EC can hold a v6 address.
 package flowspec
 
 import (
@@ -44,12 +46,16 @@ const Table4 = "flowtab4"
 const Protocol6 = "flowspec6"
 const Table6 = "flowtab6"
 
-// redirectI6ECTypeSubtype is the RFC 5701 IPv6 address-specific EC type (0xc0,
-// transitive) + sub-type (0x0b, redirect) that R/vppfdp recognizes as redirect-
-// to-IPv6: the IPv6 address is the global-admin field, local-admin is 0. This
+// redirectI6ECTypeSubtype is the standard redirect-to-IPv6 codepoint from
+// draft-ietf-idr-flowspec-redirect-ip (IESG-approved, in the RFC Editor queue;
+// IANA-allocated): transitive IPv6-address-specific EC type 0x00 (RFC 5701) +
+// sub-type 0x0c → the 2-byte type/subtype 0x000c. The 16-byte global-admin is the
+// redirect target IPv6; local-admin is 0 here (C=0 = redirect, not copy). The
 // codepoint lives at the originator (here) and the consumer (vppfdp), NOT in BIRD
-// core — BIRD's RFC 5701 EC support is generic and application-agnostic.
-const redirectI6ECTypeSubtype = 0xc00b
+// core — BIRD's RFC 5701 EC support is generic and application-agnostic. (The
+// FlowSpec framework itself is RFC 8955/8956; redirect-to-IP is the one action
+// those RFCs do NOT define — only this draft does.)
+const redirectI6ECTypeSubtype = 0x000c
 
 const header = `# Managed by sbw-limiter edge-agent — DO NOT EDIT (rendered, B-01).
 # Egress-homing FlowSpec (limiter §3.2): "source ∈ home member → redirect to
@@ -82,8 +88,8 @@ func Render(redirects []model.FlowRedirect, nextHop, nextHop6 netip.Addr) ([]byt
 	var b strings.Builder
 	b.WriteString(header)
 
-	// flowspec4: RFC 8955 redirect-to-IPv4 ext-community (shared next-hop, computed
-	// once). Always emitted so the L→R export filter name exists.
+	// flowspec4: redirect-to-IPv4 ext-community (draft-ietf-idr-flowspec-redirect-ip;
+	// shared next-hop, computed once). Always emitted so the L→R export filter exists.
 	var hi, lo uint32
 	if len(v4) > 0 {
 		hi, lo = redirectIP4ExtCommunity(nextHop)
@@ -97,8 +103,8 @@ func Render(redirects []model.FlowRedirect, nextHop, nextHop6 netip.Addr) ([]byt
 	}
 	b.WriteString("}\n")
 
-	// flowspec6: RFC 5701 IPv6 address-specific redirect EC (the target IPv6 in the
-	// global-admin field). Always emitted.
+	// flowspec6: redirect-to-IPv6 EC (draft-ietf-idr-flowspec-redirect-ip, 0x000c;
+	// the target IPv6 in the global-admin field). Always emitted.
 	fmt.Fprintf(&b, "protocol static %s {\n", Protocol6)
 	fmt.Fprintf(&b, "  flow6 { table %s; };\n", Table6)
 	for _, p := range v6 {
@@ -139,16 +145,18 @@ func collectSrcs(redirects []model.FlowRedirect, wantV6 bool) ([]netip.Prefix, e
 	return srcs, nil
 }
 
-// redirectIP4ExtCommunity encodes an RFC 8955 redirect-to-IPv4 transitive
-// ext-community (type 0x81, sub-type 0x08) for nextHop into its two 32-bit
-// halves, as BIRD's `(generic, hi, lo)` form. The 8 bytes are
-// [0x81, 0x08, a, b, c, d, 0x00, 0x00] where a.b.c.d = nextHop. project A's
-// vppfdp parser consumes exactly this (A-05b): e.g. 10.0.0.5 → 0x81080a00,
-// 0x00050000. nextHop must be IPv4 (callers validate).
+// redirectIP4ExtCommunity encodes the standard redirect-to-IPv4 transitive
+// ext-community from draft-ietf-idr-flowspec-redirect-ip (type 0x01 IPv4-Address-
+// Specific, sub-type 0x0c) for nextHop into its two 32-bit halves, as BIRD's
+// `(generic, hi, lo)` form. The 8 bytes are [0x01, 0x0c, a, b, c, d, 0x00, 0x00]
+// where a.b.c.d = nextHop (global-admin) and the trailing 0x0000 is the local-admin
+// with C=0 (redirect, not copy). vppfdp consumes exactly this: e.g. 10.0.0.5 →
+// 0x010c0a00, 0x00050000. NOT RFC 8955's rt-redirect (sub 0x08 → redirect-to-VRF),
+// which is a different action. nextHop must be IPv4 (callers validate).
 func redirectIP4ExtCommunity(nextHop netip.Addr) (hi, lo uint32) {
 	b4 := nextHop.As4()
 	ip := binary.BigEndian.Uint32(b4[:])
-	hi = 0x81080000 | (ip >> 16)
+	hi = 0x010c0000 | (ip >> 16)
 	lo = (ip & 0xffff) << 16
 	return hi, lo
 }

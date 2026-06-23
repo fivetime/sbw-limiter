@@ -21,10 +21,10 @@ const goldenTwo = `# Managed by sbw-limiter edge-agent — DO NOT EDIT (rendered
 protocol static flowspec4 {
   flow4 { table flowtab4; };
   route flow4 { src 10.0.0.0/24; } {
-    bgp_ext_community.add((generic, 0x81080a00, 0x00050000));
+    bgp_ext_community.add((generic, 0x010c0a00, 0x00050000));
   };
   route flow4 { src 10.20.0.0/24; } {
-    bgp_ext_community.add((generic, 0x81080a00, 0x00050000));
+    bgp_ext_community.add((generic, 0x010c0a00, 0x00050000));
   };
 }
 protocol static flowspec6 {
@@ -103,7 +103,7 @@ func TestRenderRejectsBadInput(t *testing.T) {
 }
 
 // A v6 redirect renders the flowspec6 block with the RFC 5701 IPv6
-// address-specific redirect EC (i6ec(0xc00b, <v6 next-hop>, 0)).
+// address-specific redirect EC (i6ec(0x000c, <v6 next-hop>, 0)).
 func TestRenderV6FlowSpec(t *testing.T) {
 	nh6 := netip.MustParseAddr("2001:db8:2::1")
 	out, err := Render([]model.FlowRedirect{{SrcPrefix: netip.MustParsePrefix("2001:db8::5/128")}}, netip.Addr{}, nh6)
@@ -117,7 +117,7 @@ func TestRenderV6FlowSpec(t *testing.T) {
 	if !strings.Contains(s, "route flow6 { src 2001:db8::5/128; }") {
 		t.Errorf("missing flow6 route:\n%s", s)
 	}
-	if !strings.Contains(s, "bgp_ipv6_ext_community.add(i6ec(0xc00b, 2001:db8:2::1, 0));") {
+	if !strings.Contains(s, "bgp_ipv6_ext_community.add(i6ec(0x000c, 2001:db8:2::1, 0));") {
 		t.Errorf("missing/incorrect v6 redirect EC:\n%s", s)
 	}
 	// No v4 routes when there are no v4 members.
@@ -141,23 +141,23 @@ func TestRenderMixedV4V6(t *testing.T) {
 	if !strings.Contains(s, "route flow6 { src 2001:db8::5/128; }") {
 		t.Errorf("missing flow6 route:\n%s", s)
 	}
-	if !strings.Contains(s, "bgp_ipv6_ext_community.add(i6ec(0xc00b, 2001:db8:2::1, 0));") {
+	if !strings.Contains(s, "bgp_ipv6_ext_community.add(i6ec(0x000c, 2001:db8:2::1, 0));") {
 		t.Errorf("missing v6 redirect EC:\n%s", s)
 	}
 }
 
 func TestRedirectExtCommunityEncoding(t *testing.T) {
-	// Cross-check against project A's proven A-05b values and the RFC 8955
-	// type-0x81 sub-0x08 layout [0x81,0x08,a,b,c,d,0,0].
+	// Cross-check against project A's proven A-05b values and the draft-ietf-idr-flowspec-redirect-ip
+	// type-0x01 sub-0x0c layout [0x01,0x0c,a,b,c,d,0,0].
 	cases := []struct {
 		ip     string
 		hi, lo uint32
 	}{
-		{"10.0.0.5", 0x81080a00, 0x00050000},
-		{"10.0.0.6", 0x81080a00, 0x00060000},
-		{"0.0.0.0", 0x81080000, 0x00000000},
-		{"255.255.255.255", 0x8108ffff, 0xffff0000},
-		{"192.0.2.1", 0x8108c000, 0x02010000},
+		{"10.0.0.5", 0x010c0a00, 0x00050000},
+		{"10.0.0.6", 0x010c0a00, 0x00060000},
+		{"0.0.0.0", 0x010c0000, 0x00000000},
+		{"255.255.255.255", 0x010cffff, 0xffff0000},
+		{"192.0.2.1", 0x010cc000, 0x02010000},
 	}
 	for _, c := range cases {
 		hi, lo := redirectIP4ExtCommunity(netip.MustParseAddr(c.ip))
