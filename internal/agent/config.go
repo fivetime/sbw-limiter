@@ -177,7 +177,6 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// Validate checks the edge-agent config for startup-blocking errors.
 // Bootstrap returns the controller endpoints the homing director boots from:
 // ControllerEndpoints if set, else the single ControllerEndpoint. Empty only when
 // neither is configured.
@@ -191,6 +190,7 @@ func (c Config) Bootstrap() []string {
 	return nil
 }
 
+// Validate checks the edge-agent config for startup-blocking errors.
 func (c Config) Validate() error {
 	if c.EdgeID == "" {
 		return fmt.Errorf("agent config: edge_id must be set (BWPOOL_EDGE_ID or config file)")

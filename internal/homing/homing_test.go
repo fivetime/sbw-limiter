@@ -17,7 +17,6 @@ type fakeConn struct {
 	endpoint  string
 	onCov     grpcclient.CovererFunc
 	assignOn  func(endpoint string) (model.CovererAssignment, bool) // what Register reports
-	dialErr   error
 	mu        sync.Mutex
 	reports   int
 	registers int
