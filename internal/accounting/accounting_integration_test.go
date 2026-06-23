@@ -82,11 +82,16 @@ func TestRealThreeWayAccounting(t *testing.T) {
 	}
 	waitMirror(t, vppctl, "203.0.113.0/24")
 
-	// Calibrate the baseline gap at the healthy steady state — the VPP FIB sits
-	// structurally above the kernel main table (connected/local/receive entries),
-	// so Linux − VPP is a stable negative number, not zero.
+	// The trigger is the BIRD↔VPP mirror. This is a route-B linux_nl test with no
+	// BIRD process, but in route B BIRD mirrors the kernel (BIRD → kernel → VPP),
+	// so a route in the kernel is a route in BIRD: aliasing the BIRD leg to the
+	// Linux counter faithfully simulates BIRD ≈ kernel, and a netlink loss (route
+	// in kernel+BIRD, missing from VPP) shows up as BIRD running ahead of VPP.
+	// Calibrate the baseline at the healthy steady state — the VPP FIB sits
+	// structurally above (connected/local/receive entries), so the gap is a stable
+	// negative number, not zero.
 	chk := Checker{
-		BIRD:  NewBirdCounter(func() (uint64, error) { return 0, nil }), // no BIRD here; trigger keys on the mirror drift
+		BIRD:  linux, // route B: BIRD mirrors the kernel
 		Linux: linux,
 		VPP:   vpp,
 	}
@@ -98,7 +103,7 @@ func TestRealThreeWayAccounting(t *testing.T) {
 	chk.Tolerance = 1 // a single un-mirrored route must break it
 	lc, _ := linux.Count(ctx)
 	vcnt, _ := vpp.Count(ctx)
-	t.Logf("healthy: linux=%d vpp=%d baseline-gap=%d", lc, vcnt, baseline)
+	t.Logf("healthy: bird≈linux=%d vpp=%d baseline-gap=%d", lc, vcnt, baseline)
 	if lc < uint64(len(mirrored)) || vcnt < uint64(len(mirrored)) {
 		t.Fatalf("counts too low to be real (linux=%d vpp=%d)", lc, vcnt)
 	}
