@@ -13,6 +13,7 @@
 //     before the FIB. BIRD has it, VPP lacks it.
 //   - route A (BIRD → vppfib → VPP, kernel dropped, §1.2): a vppfib
 //     materialization miss drops it before the FIB. BIRD has it, VPP lacks it.
+//
 // Either way the end-to-end failure shows up as BIRD running ahead of VPP, so
 // comparing BIRD↔VPP catches both without caring which path is deployed.
 //
@@ -29,6 +30,7 @@
 //     per-address /32 receive entries, the default) that BIRD's RIB doesn't.
 //   - BIRD's RIB holds the anchors (krt_export filters them out of the kernel,
 //     §4.2) that the FIB doesn't.
+//
 // So at a healthy steady state BIRD − VPP is a stable offset (anchors minus the
 // FIB's connected/local surplus), not zero. An absolute tolerance on the raw gap
 // is therefore wrong; the signal is DRIFT from that calibrated BaselineGap. A
