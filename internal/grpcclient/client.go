@@ -24,6 +24,12 @@ import (
 // DesiredFunc receives a desired-state push (wire it to DesiredStore.Accept).
 type DesiredFunc func(model.EdgeDesiredState)
 
+// DeltaFunc receives an incremental DESIRED_DELTA push (the hot path): the agent
+// applies just the touched pools in O(delta). Gap detection (delta.BaseGeneration
+// vs the agent's last-applied generation) lives in the handler, which drops a
+// gapped delta and relies on the controller's full DESIRED_STATE resync.
+type DeltaFunc func(model.EdgeDesiredDelta)
+
 // DirectiveFunc receives a non-desired-state directive (failover/urgent); the
 // raw JSON payload is passed through for the agent to interpret.
 type DirectiveFunc func(kind rpc.Directive_Kind, generation uint64, payload []byte)
@@ -40,6 +46,7 @@ type Client struct {
 	edge model.EdgeID
 
 	onDesired   DesiredFunc
+	onDelta     DeltaFunc
 	onDirective DirectiveFunc
 	onCoverers  CovererFunc
 	backoff     time.Duration
@@ -51,6 +58,9 @@ type Option func(*Client)
 
 // WithDesired wires the desired-state handler (DesiredStore.Accept).
 func WithDesired(fn DesiredFunc) Option { return func(c *Client) { c.onDesired = fn } }
+
+// WithDelta wires the incremental DESIRED_DELTA handler (the hot path).
+func WithDelta(fn DeltaFunc) Option { return func(c *Client) { c.onDelta = fn } }
 
 // WithDirective wires the failover/urgent directive handler.
 func WithDirective(fn DirectiveFunc) Option { return func(c *Client) { c.onDirective = fn } }
@@ -177,6 +187,23 @@ func (c *Client) dispatch(d *rpc.Directive) {
 		}
 		if c.onDesired != nil {
 			c.onDesired(st)
+		}
+	case rpc.Directive_DESIRED_DELTA:
+		// Hot path: an incremental per-pool change. Unmarshal and hand to the delta
+		// handler, which does gap detection (BaseGeneration vs last-applied) and
+		// applies just the touched pools in O(delta). A gapped/divergent delta is
+		// dropped there; the controller resends a full DESIRED_STATE resync.
+		var delta model.EdgeDesiredDelta
+		if err := json.Unmarshal(d.Payload, &delta); err != nil {
+			c.log.Error("bad desired-delta payload", "err", err)
+			return
+		}
+		if delta.SchemaVersion != model.SchemaVersion {
+			c.log.Error("desired-delta schema mismatch", "got", delta.SchemaVersion, "want", model.SchemaVersion)
+			return
+		}
+		if c.onDelta != nil {
+			c.onDelta(delta)
 		}
 	case rpc.Directive_REHOME:
 		// Coverage moved (L-06): re-home to the new primary, keep the fallbacks.

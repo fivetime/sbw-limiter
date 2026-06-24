@@ -63,6 +63,78 @@ func (s *DesiredStore) Accept(state model.EdgeDesiredState) bool {
 	return true
 }
 
+// Merge folds an incremental EdgeDesiredDelta into the held desired state so the
+// full-reconcile backstop and the bird/flowspec appliers keep seeing a complete,
+// current EdgeDesiredState (the delta hot path mutates VPP directly; this keeps the
+// in-memory desired view in lockstep). For each pool it REPLACES that pool's
+// contribution — its Policers, ClassifySessions, Anchors and FlowRedirects — then
+// applies the delta's redirect next-hops, removes the Removed pools' contributions,
+// and bumps Generation/DesiredVersion to the delta's. It returns the held state's
+// ClassifySessions AS THEY WERE BEFORE the merge (the apply path needs them to know
+// which members a replaced/removed pool must have torn down) and ok=false if there
+// is no held state yet (a delta with no base is a gap — the caller resyncs).
+//
+// Safe for concurrent use; mutates under the write lock like Accept.
+func (s *DesiredStore) Merge(delta model.EdgeDesiredDelta) (prevSessions []model.ClassifySession, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.haveState {
+		return nil, false // no base to merge onto — the caller must resync
+	}
+	prev := append([]model.ClassifySession(nil), s.state.ClassifySessions...)
+
+	// Pools touched by this delta (upserted or removed); their old contribution is
+	// dropped wholesale, then upserts re-add theirs. A pool is identified in each
+	// resource by its pool id (policer/session PoolID; anchors/flowredirects are
+	// per-pool only on the home edge but carry no pool id — they are replaced as the
+	// union of the touched pools' fragments, matching how the controller renders).
+	touched := map[model.PoolID]struct{}{}
+	for _, up := range delta.Upserts {
+		touched[up.PoolID] = struct{}{}
+	}
+	for _, id := range delta.Removed {
+		touched[id] = struct{}{}
+	}
+
+	// Drop touched pools' policers and sessions from the held state.
+	s.state.Policers = filterOutPools(s.state.Policers, touched, func(p model.PolicerSpec) model.PoolID { return p.PoolID })
+	s.state.ClassifySessions = filterOutPools(s.state.ClassifySessions, touched, func(c model.ClassifySession) model.PoolID { return c.PoolID })
+
+	// Re-add each upserted pool's contribution.
+	for _, up := range delta.Upserts {
+		s.state.Policers = append(s.state.Policers, up.Policers...)
+		s.state.ClassifySessions = append(s.state.ClassifySessions, up.ClassifySessions...)
+		s.state.Anchors = append(s.state.Anchors, up.Anchors...)
+		s.state.FlowRedirects = append(s.state.FlowRedirects, up.FlowRedirects...)
+		if up.RedirectNextHop.IsValid() {
+			s.state.RedirectNextHop = up.RedirectNextHop
+		}
+		if up.RedirectNextHopV6.IsValid() {
+			s.state.RedirectNextHopV6 = up.RedirectNextHopV6
+		}
+	}
+
+	s.state.Generation = delta.Generation
+	if delta.DesiredVersion != 0 {
+		s.state.DesiredVersion = delta.DesiredVersion
+	}
+	s.healthy = true
+	s.lastTouch = s.now()
+	return prev, true
+}
+
+// filterOutPools returns xs with every element whose pool id is in drop removed.
+func filterOutPools[T any](xs []T, drop map[model.PoolID]struct{}, poolOf func(T) model.PoolID) []T {
+	out := xs[:0:0]
+	for _, x := range xs {
+		if _, gone := drop[poolOf(x)]; gone {
+			continue
+		}
+		out = append(out, x)
+	}
+	return out
+}
+
 // ControllerDown records that the controller became unreachable. The held state
 // is untouched — that is the whole point: the next reconcile still converges to
 // it.

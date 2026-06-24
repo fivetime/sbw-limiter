@@ -117,6 +117,10 @@ func main() {
 		agent.WithCapacity(func() model.CapacityReport {
 			return model.CapacityReport{NICCapacityBps: cfg.CapacityBps}
 		}),
+		// Installed pool-set hash: the controller compares it against its expected
+		// set to detect drift and trigger a full DESIRED_STATE resync (the
+		// report-driven backstop to the controller-driven delta hot path).
+		agent.WithPoolHash(recon.InstalledPoolHash),
 		agent.WithReporterLogger(log),
 	)
 
@@ -220,9 +224,39 @@ func main() {
 			}
 		}
 	}
+	// Delta hot path (the agent is hands, not brain): apply just the touched pools in
+	// O(delta) instead of re-reconciling the whole edge. onDelta runs ON the reconcile
+	// goroutine (SubmitDelta enqueues; SetDeltaApplier wires this), so it is mutually
+	// exclusive with the full Reconcile and may safely touch the VPP channel + polIdx.
+	//
+	// GAP DETECTION: a delta builds on BaseGeneration; if that ≠ the agent's last-
+	// applied generation, a push was missed/coalesced and applying onto a divergent
+	// base would silently corrupt state. We DROP it and rely on the controller's full
+	// DESIRED_STATE resync (it sends one on the hash mismatch the next report surfaces).
+	recon.SetDeltaApplier(func(delta model.EdgeDesiredDelta) {
+		if base := recon.LastAppliedGeneration(); delta.BaseGeneration != base {
+			log.Warn("desired-delta gap; dropping and awaiting full resync",
+				"base_generation", delta.BaseGeneration, "last_applied", base,
+				"delta_generation", delta.Generation)
+			return // controller resyncs a full DESIRED_STATE on the hash mismatch
+		}
+		prev, ok := store.Merge(delta) // mutate the held state in lockstep with VPP
+		if !ok {
+			log.Warn("desired-delta with no base state; dropping (cold start, awaiting full state)",
+				"delta_generation", delta.Generation)
+			return
+		}
+		if _, err := recon.ApplyDelta(delta, prev); err != nil {
+			log.Error("desired-delta apply failed; full reconcile backstop will heal", "err", err)
+		}
+		if birdApply != nil {
+			birdApply.Wake() // a removed/added pool may change anchors/flowspec
+		}
+	})
 	dial := func(endpoint string, onCov grpcclient.CovererFunc) (homing.Conn, error) {
 		c, err := grpcclient.Dial(endpoint, model.EdgeID(cfg.EdgeID),
 			grpcclient.WithDesired(onDesired),
+			grpcclient.WithDelta(recon.SubmitDelta), // hot path: queue deltas to the reconcile goroutine
 			grpcclient.WithCoverers(onCov),
 			grpcclient.WithLogger(log),
 		)

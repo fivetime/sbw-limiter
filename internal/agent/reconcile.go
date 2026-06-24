@@ -104,9 +104,36 @@ type Reconciler struct {
 	// next pass reads the latest desired state anyway.
 	wake chan struct{}
 
+	// deltaQ carries incremental DESIRED_DELTA pushes to the single reconcile
+	// goroutine, where they are applied in O(delta) (the hot path) mutually exclusive
+	// with the full Reconcile — both touch polIdx and a VPP channel, so they must not
+	// run concurrently. The transport's dispatch goroutine only enqueues; the Run
+	// loop drains and applies via onDelta. Buffered so a burst of pushes is not lost.
+	deltaQ chan model.EdgeDesiredDelta
+
+	// onDelta applies one queued delta from the reconcile goroutine: gap-detect
+	// against lastGen, merge into the held desired state, and apply just the touched
+	// pools (wired by main to DesiredStore.Merge + ApplyDelta). On a gap it requests
+	// a full resync instead of applying. nil → deltas are ignored (delta path off).
+	onDelta func(model.EdgeDesiredDelta)
+
 	// policerIfaces names the data interfaces whose ingress feeds the policer-
 	// classify chain (§5.3 data plane). Set once at startup from config.
 	policerIfaces []string
+
+	// lastGen is the generation of the most recently applied desired state (full
+	// reconcile OR delta merge). The DESIRED_DELTA hot path's gap detection compares
+	// a delta's BaseGeneration against this: a mismatch means the agent missed an
+	// update and must NOT apply the delta onto a divergent base (it drops it and
+	// relies on the controller's full DESIRED_STATE resync). Read/written only from
+	// the single reconcile goroutine (Reconcile / ApplyDelta), so no lock is needed.
+	lastGen uint64
+
+	// poolHash caches the installed pool-set hash (model.PoolSetHash over the
+	// distinct pool ids materialized in polIdx) recomputed after each apply, so the
+	// report builder can read it lock-free. The controller compares it against its
+	// own view to detect drift and trigger a resync (the report-driven backstop).
+	poolHash atomic.Uint64
 }
 
 // SetPolicerInterfaces sets the data interfaces the reconciler binds the
@@ -145,7 +172,27 @@ func New(conn *vpp.Conn, log *slog.Logger) *Reconciler {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Reconciler{conn: conn, log: log, polIdx: map[string]uint32{}, wake: make(chan struct{}, 1)}
+	return &Reconciler{conn: conn, log: log, polIdx: map[string]uint32{},
+		wake: make(chan struct{}, 1), deltaQ: make(chan model.EdgeDesiredDelta, 64)}
+}
+
+// SetDeltaApplier wires the hot-path delta handler invoked from the reconcile
+// goroutine for each queued DESIRED_DELTA (DesiredStore.Merge + ApplyDelta, with
+// gap detection). Call once before Run. Without it, SubmitDelta is a no-op.
+func (r *Reconciler) SetDeltaApplier(fn func(model.EdgeDesiredDelta)) { r.onDelta = fn }
+
+// SubmitDelta enqueues an incremental delta for the reconcile goroutine to apply
+// in O(delta) (the hot path). Called from the transport's dispatch goroutine.
+// Non-blocking: if the queue is full the delta is dropped and the next full
+// reconcile + the controller's hash-mismatch resync heal any divergence (the
+// backstop), so a buffer overrun degrades to the safe slow path rather than blocks.
+func (r *Reconciler) SubmitDelta(d model.EdgeDesiredDelta) {
+	select {
+	case r.deltaQ <- d:
+	default:
+		r.log.Warn("delta queue full; dropping (resync backstop will heal)",
+			"generation", d.Generation, "base", d.BaseGeneration)
+	}
 }
 
 // Reset drops in-memory caches that a VPP restart invalidates. The policer
@@ -218,8 +265,53 @@ func (r *Reconciler) Reconcile(desired model.EdgeDesiredState) (Result, error) {
 		snap[name] = idx
 	}
 	r.polSnap.Store(snap)
+
+	// The full reconcile is the drift backstop: it has just made VPP match desired,
+	// so adopt this generation as the apply baseline (delta gap detection) and
+	// recompute the installed pool-set hash the report attests (B-02 / hash drift).
+	r.lastGen = desired.Generation
+	r.recomputePoolHash()
 	return res, nil
 }
+
+// recomputePoolHash recomputes and caches the installed pool-set hash from the
+// distinct pool ids currently materialized (polIdx keys → model.ParsePolicerName),
+// with model.PoolSetHash — the SAME function the controller computes over its
+// expected set, so equality means converged and a mismatch is the authoritative
+// drift signal that triggers a full resync. Called from the reconcile goroutine
+// after every apply (full reconcile or delta merge).
+func (r *Reconciler) recomputePoolHash() {
+	seen := make(map[model.PoolID]struct{}, len(r.polIdx))
+	ids := make([]model.PoolID, 0, len(r.polIdx))
+	for name := range r.polIdx {
+		pool, _, err := model.ParsePolicerName(name)
+		if err != nil {
+			continue // unmanaged name (shouldn't be in polIdx, but be defensive)
+		}
+		if _, dup := seen[pool]; dup {
+			continue
+		}
+		seen[pool] = struct{}{}
+		ids = append(ids, pool)
+	}
+	r.poolHash.Store(model.PoolSetHash(ids))
+}
+
+// InstalledPoolHash returns the hash of the pool-set currently materialized in
+// the data plane, as of the last completed apply (full reconcile or delta merge).
+// It is model.PoolSetHash over the distinct pool ids in polIdx — the controller
+// computes the same hash over its expected set and triggers a full DESIRED_STATE
+// resync on a mismatch (the report-driven drift backstop; the hot path stays the
+// controller's PushDelta). Lock-free; 0 before the first apply.
+func (r *Reconciler) InstalledPoolHash() uint64 {
+	return r.poolHash.Load()
+}
+
+// LastAppliedGeneration returns the generation of the most recently applied
+// desired state (full reconcile or delta merge). The delta hot path's gap
+// detection compares a delta's BaseGeneration against it. Read from the reconcile
+// goroutine.
+func (r *Reconciler) LastAppliedGeneration() uint64 { return r.lastGen }
 
 // PolicerIndexes returns a read-only snapshot of the policer name→VPP-index map
 // as of the last completed reconcile pass (T-1001). Lock-free; empty until the
@@ -677,6 +769,13 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration, provider D
 			// A fresh desired-state push: apply now (failover/urgent) rather than
 			// waiting up to a full interval (T-705 / §5).
 			r.runOnce(provider)
+		case d := <-r.deltaQ:
+			// Hot path: apply an incremental delta in O(delta) on this (the only)
+			// reconcile goroutine, mutually exclusive with the full pass. The handler
+			// gap-detects and either applies the touched pools or requests a resync.
+			if r.onDelta != nil {
+				r.onDelta(d)
+			}
 		case <-reconnects:
 			// VPP restarted (or the link flapped): the data plane lost our
 			// rules. Drop stale index caches and reinstall immediately rather

@@ -39,6 +39,13 @@ type CapacityFunc func() model.CapacityReport
 // MeteringFunc reports per-pool policer accounting (T-1001). nil → no metering.
 type MeteringFunc func() []model.PoolMetering
 
+// PoolHashFunc reports the hash of the pool-set the agent currently has
+// materialized in its data plane (model.PoolSetHash over the installed pool ids).
+// *Reconciler.InstalledPoolHash satisfies it. The controller compares this against
+// its own expected-set hash to detect drift and trigger a full DESIRED_STATE resync
+// (the report-driven backstop). nil → the report carries 0 (no attestation).
+type PoolHashFunc func() uint64
+
 // Reporter assembles the agent's EdgeReport uplink (B-03) from the soft-death
 // health (B-05) plus capacity/metering sources, and sends it periodically.
 type Reporter struct {
@@ -46,6 +53,7 @@ type Reporter struct {
 	health   HealthSource
 	capacity CapacityFunc
 	metering MeteringFunc
+	poolHash PoolHashFunc
 	now      func() int64
 	log      *slog.Logger
 }
@@ -58,6 +66,10 @@ func WithCapacity(fn CapacityFunc) ReporterOption { return func(r *Reporter) { r
 
 // WithMetering wires the per-pool metering source (T-1001).
 func WithMetering(fn MeteringFunc) ReporterOption { return func(r *Reporter) { r.metering = fn } }
+
+// WithPoolHash wires the installed pool-set hash source (reconciler.InstalledPoolHash):
+// the report carries it so the controller can detect drift and resync.
+func WithPoolHash(fn PoolHashFunc) ReporterOption { return func(r *Reporter) { r.poolHash = fn } }
 
 // WithReporterClock overrides the timestamp source (tests).
 func WithReporterClock(now func() int64) ReporterOption { return func(r *Reporter) { r.now = now } }
@@ -100,6 +112,9 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	}
 	if r.metering != nil {
 		rep.Metering = r.metering()
+	}
+	if r.poolHash != nil {
+		rep.InstalledPoolHash = r.poolHash()
 	}
 	return rep, true
 }

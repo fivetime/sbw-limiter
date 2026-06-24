@@ -123,6 +123,55 @@ func TestRunDispatchesDesiredState(t *testing.T) {
 	}
 }
 
+func TestRunDispatchesDesiredDelta(t *testing.T) {
+	f := newFakeServer()
+	got := make(chan model.EdgeDesiredDelta, 1)
+	c := dialFake(t, f, "edge-2",
+		WithDelta(func(d model.EdgeDesiredDelta) { got <- d }),
+		WithBackoff(10*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+	<-f.subbed
+
+	delta := model.EdgeDesiredDelta{
+		SchemaVersion: model.SchemaVersion, EdgeID: "edge-2",
+		Generation: 12, BaseGeneration: 11,
+		Removed: []model.PoolID{200},
+	}
+	payload, _ := json.Marshal(delta)
+	f.pushCh <- &rpc.Directive{Kind: rpc.Directive_DESIRED_DELTA, Generation: 12, Payload: payload}
+
+	select {
+	case d := <-got:
+		if d.Generation != 12 || d.BaseGeneration != 11 || len(d.Removed) != 1 || d.Removed[0] != 200 {
+			t.Errorf("dispatched delta = %+v", d)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("desired-delta not dispatched")
+	}
+}
+
+func TestRunRejectsDeltaSchemaMismatch(t *testing.T) {
+	f := newFakeServer()
+	called := make(chan struct{}, 1)
+	c := dialFake(t, f, "edge-2",
+		WithDelta(func(model.EdgeDesiredDelta) { called <- struct{}{} }),
+		WithBackoff(10*time.Millisecond))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.Run(ctx)
+	<-f.subbed
+	bad, _ := json.Marshal(model.EdgeDesiredDelta{SchemaVersion: 999, EdgeID: "edge-2"})
+	f.pushCh <- &rpc.Directive{Kind: rpc.Directive_DESIRED_DELTA, Payload: bad}
+	select {
+	case <-called:
+		t.Error("schema-mismatch delta must not be dispatched")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
 func TestRunRejectsSchemaMismatch(t *testing.T) {
 	f := newFakeServer()
 	called := make(chan struct{}, 1)
