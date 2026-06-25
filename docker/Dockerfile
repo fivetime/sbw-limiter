@@ -24,7 +24,14 @@ ARG VERSION=dev
 
 RUN apk add --no-cache git ca-certificates
 WORKDIR /src
+# CACHEBUST (set to the commit SHA in CI) forces this clone layer to re-run on every
+# build. Without it the gha cache freezes `git clone -b main` at its first run, so new
+# commits to main never reach the image even though it gets a fresh sha-<commit> tag —
+# the binary stays frozen while the tag lies. Referencing $CACHEBUST in the RUN makes
+# the layer's cache key depend on it, so a per-commit value re-clones the latest source.
+ARG CACHEBUST=0
 RUN set -eux; \
+    echo "cachebust ${CACHEBUST}"; \
     auth=""; [ -n "$GH_TOKEN" ] && auth="x-access-token:${GH_TOKEN}@"; \
     git clone --depth 1 -b "$LIMITER_REF"  "https://${auth}${LIMITER_REPO}.git"  sbw-limiter; \
     git clone --depth 1 -b "$CONTRACT_REF" "https://${auth}${CONTRACT_REPO}.git" sbw-contract
