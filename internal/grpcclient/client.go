@@ -77,7 +77,18 @@ func WithLogger(l *slog.Logger) Option { return func(c *Client) { c.log = l } }
 
 // Dial connects to the controller at addr for the given edge id.
 func Dial(addr string, edge model.EdgeID, opts ...Option) (*Client, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// The controller's full DESIRED_STATE resync (sent when the per-edge push buffer
+	// overflows under a bulk create) is ONE message carrying every member homed to this
+	// edge. At scale that exceeds gRPC's 4 MB default recv cap → the stream errors → the
+	// agent re-homes in a loop and NEVER applies the members (the data plane stays empty,
+	// the controller logs delivery-loss). Raise the per-message recv limit so large
+	// resyncs get through (512 MB ≈ a few million members/edge).
+	// TODO(scale): CHUNK the DESIRED_STATE resync instead of relying on an ever-larger
+	// single message — a 10M-member edge would still blow past any fixed cap.
+	conn, err := grpc.NewClient(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(512<<20)),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("grpcclient: dial %s: %w", addr, err)
 	}
