@@ -51,6 +51,34 @@ type Client struct {
 	onCoverers  CovererFunc
 	backoff     time.Duration
 	log         *slog.Logger
+
+	// chunkAsm reassembles a chunked full DESIRED_STATE (DESIRED_STATE_CHUNK). It is
+	// owned by the single dispatch goroutine (the Recv loop), so it needs no lock. A
+	// chunk buffer is per-stream: a new subscribeOnce starts a fresh stream and a
+	// reconnect/re-home means the controller re-sends the full snapshot anyway, so the
+	// reassembler is reset on each subscribeOnce.
+	chunkAsm chunkAssembler
+}
+
+// chunkAssembler buffers the fragments of ONE chunked full-state snapshot until its
+// Last chunk arrives, then merges them into a single EdgeDesiredState applied through
+// the SAME path as a plain DESIRED_STATE. It supersedes by Epoch: a chunk for a NEWER
+// epoch discards the partially-buffered older one (latest-Epoch-wins); a chunk for an
+// OLDER epoch is dropped. It NEVER applies a partial — if Last never arrives (stream
+// break mid-snapshot) the buffer is simply discarded and the agent keeps its last good
+// applied state; the controller's anti-drift backstop re-resyncs with a new Epoch.
+type chunkAssembler struct {
+	epoch  uint64 // epoch currently being assembled (0 = none)
+	active bool   // a snapshot is in progress
+	bySeq  map[uint32]model.EdgeDesiredStateChunk
+}
+
+// reset discards any partially-buffered snapshot (called per new stream, and after a
+// completed snapshot is applied).
+func (a *chunkAssembler) reset() {
+	a.epoch = 0
+	a.active = false
+	a.bySeq = nil
 }
 
 // Option configures a Client.
@@ -83,8 +111,12 @@ func Dial(addr string, edge model.EdgeID, opts ...Option) (*Client, error) {
 	// agent re-homes in a loop and NEVER applies the members (the data plane stays empty,
 	// the controller logs delivery-loss). Raise the per-message recv limit so large
 	// resyncs get through (512 MB ≈ a few million members/edge).
-	// TODO(scale): CHUNK the DESIRED_STATE resync instead of relying on an ever-larger
-	// single message — a 10M-member edge would still blow past any fixed cap.
+	//
+	// The full DESIRED_STATE resync is now CHUNKED (DESIRED_STATE_CHUNK): a snapshot
+	// over the controller's chunk threshold is streamed as a sequence of small
+	// fragments the agent reassembles (acceptChunk), so a 10M-member edge no longer
+	// needs an ever-larger single message. This 512 MB cap is kept purely as a safety
+	// net — individual chunks are far smaller (target ≤32 MB).
 	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(512<<20)),
@@ -175,6 +207,9 @@ func (c *Client) subscribeOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// A fresh stream means the controller re-sends the full snapshot; abandon any
+	// partial chunk buffer from a broken prior stream (no partial is ever applied).
+	c.chunkAsm.reset()
 	for {
 		d, err := stream.Recv()
 		if err != nil {
@@ -199,6 +234,17 @@ func (c *Client) dispatch(d *rpc.Directive) {
 		if c.onDesired != nil {
 			c.onDesired(st)
 		}
+	case rpc.Directive_DESIRED_STATE_CHUNK:
+		// One fragment of a chunked FULL snapshot. Buffer by Epoch; on Last, MERGE into
+		// one EdgeDesiredState and apply it through the SAME path as a plain
+		// DESIRED_STATE (onDesired), so VPP + bird get the identical assembled state and
+		// the agent echoes the SAME Generation. Never apply a partial.
+		var ch model.EdgeDesiredStateChunk
+		if err := json.Unmarshal(d.Payload, &ch); err != nil {
+			c.log.Error("bad desired-state-chunk payload", "err", err)
+			return
+		}
+		c.acceptChunk(ch)
 	case rpc.Directive_DESIRED_DELTA:
 		// Hot path: an incremental per-pool change. Unmarshal and hand to the delta
 		// handler, which does gap detection (BaseGeneration vs last-applied) and
@@ -230,6 +276,73 @@ func (c *Client) dispatch(d *rpc.Directive) {
 		if c.onDirective != nil {
 			c.onDirective(d.Kind, d.Generation, d.Payload)
 		}
+	}
+}
+
+// acceptChunk buffers one DESIRED_STATE_CHUNK fragment and, on its Last chunk,
+// assembles + applies the full snapshot. Runs on the single dispatch goroutine, so
+// the assembler needs no lock.
+//
+// Epoch supersession (latest-wins):
+//   - newer Epoch  → discard the partially-buffered older snapshot and start fresh
+//     (a newer full resync supersedes an abandoned partial — the controller starts a
+//     new Epoch when it abandons a sequence on buffer-full).
+//   - older Epoch  → drop the chunk (a late straggler from a superseded snapshot).
+//   - same Epoch   → accumulate by Seq (dedup; a re-sent Seq overwrites identically).
+//
+// On Last: reassemble in Seq order and hand the full state to onDesired — the EXACT
+// SAME apply path as a plain DESIRED_STATE (DesiredStore.Accept → reconcile → echo
+// Generation). If Last never arrives the buffer is just left until a newer Epoch or a
+// new stream resets it; no partial is ever applied.
+func (c *Client) acceptChunk(ch model.EdgeDesiredStateChunk) {
+	a := &c.chunkAsm
+	switch {
+	case !a.active || ch.Epoch > a.epoch:
+		// New (or first) snapshot — supersede any older partial.
+		if a.active && ch.Epoch > a.epoch {
+			c.log.Warn("superseding partial chunked snapshot",
+				"old_epoch", a.epoch, "new_epoch", ch.Epoch, "buffered", len(a.bySeq))
+		}
+		a.epoch = ch.Epoch
+		a.active = true
+		a.bySeq = map[uint32]model.EdgeDesiredStateChunk{}
+	case ch.Epoch < a.epoch:
+		// Straggler from a superseded snapshot — drop it.
+		c.log.Warn("dropping chunk for stale epoch", "epoch", ch.Epoch, "current", a.epoch)
+		return
+	}
+	a.bySeq[ch.Seq] = ch
+
+	if !ch.Last {
+		return
+	}
+	// Last arrived: we expect Seq 0..lastSeq all present (the controller pushes them in
+	// order on one stream). If any are missing the snapshot is incomplete — DO NOT apply
+	// a partial; keep the last good state and await a fresh resync (new Epoch / new
+	// stream). Missing seqs only happen if the wire reordered/lost a frame, which gRPC's
+	// ordered stream does not do silently, but we guard anyway.
+	lastSeq := ch.Seq
+	ordered := make([]model.EdgeDesiredStateChunk, 0, lastSeq+1)
+	for i := uint32(0); i <= lastSeq; i++ {
+		frag, ok := a.bySeq[i]
+		if !ok {
+			c.log.Error("chunked snapshot missing fragment; not applying partial",
+				"epoch", a.epoch, "missing_seq", i, "last_seq", lastSeq)
+			a.reset()
+			return
+		}
+		ordered = append(ordered, frag)
+	}
+
+	st := model.AssembleChunks(ordered)
+	a.reset()
+
+	if st.SchemaVersion != model.SchemaVersion {
+		c.log.Error("assembled desired-state schema mismatch", "got", st.SchemaVersion, "want", model.SchemaVersion)
+		return
+	}
+	if c.onDesired != nil {
+		c.onDesired(st) // identical apply path + echoed Generation as a plain DESIRED_STATE
 	}
 }
 

@@ -3,6 +3,7 @@ package grpcclient
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net"
 	"sync"
 	"testing"
@@ -14,6 +15,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 )
+
+func discardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
 // fakeServer is a minimal controller for client tests (the real one lives in
 // sbw-controller, a different module).
@@ -254,5 +257,119 @@ func TestRehomeDirectiveSurfacesCoverers(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("REHOME directive did not surface coverers")
+	}
+}
+
+// chunkState builds an EdgeDesiredState with n policers (member-bearing entries) at
+// the given generation.
+func chunkState(gen uint64, n int) model.EdgeDesiredState {
+	st := model.EdgeDesiredState{SchemaVersion: model.SchemaVersion, EdgeID: "edge-2", Generation: gen, DesiredVersion: 3}
+	for i := 0; i < n; i++ {
+		st.Policers = append(st.Policers, model.PolicerSpec{
+			Name: "p", PoolID: model.PoolID(i), Direction: model.DirectionIngress,
+			Type: model.Policer1R2C, RateType: model.RateKbps, CIR: uint64(i),
+			ConformAction: model.PolicerTransmit, ExceedAction: model.PolicerDrop,
+		})
+	}
+	return st
+}
+
+// TestAcceptChunkReassembles feeds the chunked fragments of a full snapshot to the
+// client's reassembler and asserts onDesired receives the byte-identical full state
+// with the snapshot Generation preserved (echo semantics).
+func TestAcceptChunkReassembles(t *testing.T) {
+	var got *model.EdgeDesiredState
+	c := &Client{onDesired: func(s model.EdgeDesiredState) { got = &s }, log: discardLogger()}
+
+	want := chunkState(100, 50)
+	chunks := model.SplitDesiredState(want, 8) // 50/8 → 7 chunks
+	if len(chunks) <= 1 {
+		t.Fatal("expected multiple chunks")
+	}
+	for _, ch := range chunks {
+		c.acceptChunk(ch)
+	}
+	if got == nil {
+		t.Fatal("onDesired not called after Last chunk")
+	}
+	if got.Generation != want.Generation {
+		t.Fatalf("echoed generation %d != %d", got.Generation, want.Generation)
+	}
+	gj, _ := json.Marshal(*got)
+	wj, _ := json.Marshal(want)
+	if string(gj) != string(wj) {
+		t.Fatalf("reassembled state != original")
+	}
+}
+
+// TestAcceptChunkNoPartialOnMissingLast asserts that without a Last chunk NO state is
+// applied — the agent keeps its last good state.
+func TestAcceptChunkNoPartialOnMissingLast(t *testing.T) {
+	calls := 0
+	c := &Client{onDesired: func(model.EdgeDesiredState) { calls++ }, log: discardLogger()}
+	chunks := model.SplitDesiredState(chunkState(100, 50), 8)
+	for _, ch := range chunks[:len(chunks)-1] { // feed all but the Last chunk
+		c.acceptChunk(ch)
+	}
+	if calls != 0 {
+		t.Fatalf("applied a partial snapshot (%d calls) without Last", calls)
+	}
+}
+
+// TestAcceptChunkSupersedesByEpoch asserts a newer Epoch arriving mid-sequence
+// discards the older partial and only the NEW snapshot is applied, with the new
+// generation.
+func TestAcceptChunkSupersedesByEpoch(t *testing.T) {
+	var got *model.EdgeDesiredState
+	c := &Client{onDesired: func(s model.EdgeDesiredState) { got = &s }, log: discardLogger()}
+
+	oldChunks := model.SplitDesiredState(chunkState(100, 50), 8)
+	// Feed the old snapshot's first two fragments (partial, no Last).
+	c.acceptChunk(oldChunks[0])
+	c.acceptChunk(oldChunks[1])
+
+	// A newer Epoch arrives in full — it must supersede the partial.
+	newWant := chunkState(200, 30)
+	for _, ch := range model.SplitDesiredState(newWant, 8) {
+		c.acceptChunk(ch)
+	}
+	if got == nil {
+		t.Fatal("newer snapshot not applied")
+	}
+	if got.Generation != 200 {
+		t.Fatalf("applied generation %d, want 200 (newer epoch)", got.Generation)
+	}
+	if len(got.Policers) != 30 {
+		t.Fatalf("applied %d policers, want 30 (old partial must not leak in)", len(got.Policers))
+	}
+	wj, _ := json.Marshal(newWant)
+	gj, _ := json.Marshal(*got)
+	if string(gj) != string(wj) {
+		t.Fatal("superseding reassembly != new snapshot")
+	}
+}
+
+// TestAcceptChunkDropsStaleEpoch asserts a straggler chunk for an OLDER epoch is
+// dropped and does not corrupt the in-progress newer snapshot.
+func TestAcceptChunkDropsStaleEpoch(t *testing.T) {
+	var got *model.EdgeDesiredState
+	c := &Client{onDesired: func(s model.EdgeDesiredState) { got = &s }, log: discardLogger()}
+
+	newWant := chunkState(200, 20)
+	newChunks := model.SplitDesiredState(newWant, 8)
+	oldChunks := model.SplitDesiredState(chunkState(100, 20), 8)
+
+	c.acceptChunk(newChunks[0]) // start epoch 200
+	c.acceptChunk(oldChunks[0]) // stale epoch 100 straggler — must be dropped
+	for _, ch := range newChunks[1:] {
+		c.acceptChunk(ch)
+	}
+	if got == nil || got.Generation != 200 {
+		t.Fatalf("stale straggler corrupted the snapshot: %+v", got)
+	}
+	gj, _ := json.Marshal(*got)
+	wj, _ := json.Marshal(newWant)
+	if string(gj) != string(wj) {
+		t.Fatal("stale straggler leaked into reassembly")
 	}
 }
