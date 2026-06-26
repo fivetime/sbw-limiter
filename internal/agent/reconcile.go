@@ -187,17 +187,6 @@ func New(conn *vpp.Conn, log *slog.Logger) *Reconciler {
 		wake: make(chan struct{}, 1), deltaQ: make(chan model.EdgeDesiredDelta, 64)}
 }
 
-// SetClassifySizing overrides the per-table classify (nbuckets, memory_size); 0 keeps
-// the auto-tuned value. For tests / explicit control. Call before Run.
-func (r *Reconciler) SetClassifySizing(nbuckets, memSize uint32) {
-	if nbuckets != 0 {
-		r.classifyNbuckets = nbuckets
-	}
-	if memSize != 0 {
-		r.classifyMem = memSize
-	}
-}
-
 // SetDeltaApplier wires the hot-path delta handler invoked from the reconcile
 // goroutine for each queued DESIRED_DELTA (DesiredStore.Merge + ApplyDelta, with
 // gap detection). Call once before Run. Without it, SubmitDelta is a no-op.

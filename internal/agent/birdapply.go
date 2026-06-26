@@ -25,8 +25,6 @@ type BirdApplier struct {
 	flow    *anchors.Applier // the egress FlowSpec include (flowspec4 block)
 	log     *slog.Logger
 	wake    chan struct{}
-
-	observers []func(model.EdgeDesiredState, error)
 }
 
 // NewBirdApplier wires the two appliers (built by the caller over one
@@ -49,12 +47,6 @@ func (b *BirdApplier) Wake() {
 	}
 }
 
-// AddObserver registers a callback invoked after each apply pass with the
-// desired state it applied and any error (metrics / health).
-func (b *BirdApplier) AddObserver(fn func(model.EdgeDesiredState, error)) {
-	b.observers = append(b.observers, fn)
-}
-
 // EnsureFiles initializes both include files if absent (empty renders), so the
 // main bird.conf's `include` lines are satisfiable before the first push.
 func (b *BirdApplier) EnsureFiles() error {
@@ -72,11 +64,7 @@ func (b *BirdApplier) EnsureFiles() error {
 // (ingress carriers), then the FlowSpec include (egress homing). Both appliers
 // skip no-op content, so steady-state passes don't touch BIRD.
 func (b *BirdApplier) ApplyOnce(st model.EdgeDesiredState) error {
-	err := b.applyOnce(st)
-	for _, fn := range b.observers {
-		fn(st, err)
-	}
-	return err
+	return b.applyOnce(st)
 }
 
 func (b *BirdApplier) applyOnce(st model.EdgeDesiredState) error {

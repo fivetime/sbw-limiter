@@ -54,9 +54,6 @@ func New(edge model.EdgeID) *Metrics {
 	return m
 }
 
-// Registry exposes the underlying registry (tests).
-func (m *Metrics) Registry() *prometheus.Registry { return m.reg }
-
 // Handler is the /metrics exposition handler.
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{})

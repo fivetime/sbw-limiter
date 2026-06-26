@@ -40,8 +40,6 @@ type Feed struct {
 	flows   map[netip.Prefix]struct{}
 	nextHop netip.Addr
 	resync  bool
-
-	observers []func(model.EdgeDesiredState, error)
 }
 
 // NewFeed wires a Feed over a fresh Client for the api socket path.
@@ -66,12 +64,6 @@ func (f *Feed) Wake() {
 	case f.wake <- struct{}{}:
 	default:
 	}
-}
-
-// AddObserver registers a callback invoked after each pass with the state it fed
-// and any error (metrics / health), mirroring BirdApplier.AddObserver.
-func (f *Feed) AddObserver(fn func(model.EdgeDesiredState, error)) {
-	f.observers = append(f.observers, fn)
 }
 
 // Run feeds on a timer and on Wake until ctx is cancelled, pulling state from
@@ -99,10 +91,7 @@ func (f *Feed) pass(provider Provider) {
 	if !ok {
 		return
 	}
-	err := f.apply(st)
-	for _, fn := range f.observers {
-		fn(st, err)
-	}
+	_ = f.apply(st)
 }
 
 func (f *Feed) apply(st model.EdgeDesiredState) error {

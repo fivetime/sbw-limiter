@@ -90,9 +90,6 @@ func WithDesired(fn DesiredFunc) Option { return func(c *Client) { c.onDesired =
 // WithDelta wires the incremental DESIRED_DELTA handler (the hot path).
 func WithDelta(fn DeltaFunc) Option { return func(c *Client) { c.onDelta = fn } }
 
-// WithDirective wires the failover/urgent directive handler.
-func WithDirective(fn DirectiveFunc) Option { return func(c *Client) { c.onDirective = fn } }
-
 // WithCoverers wires the coverer-assignment handler (homing, L-06): called on the
 // Register response and on every REHOME directive.
 func WithCoverers(fn CovererFunc) Option { return func(c *Client) { c.onCoverers = fn } }

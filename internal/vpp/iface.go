@@ -52,22 +52,6 @@ func (i *Interfaces) List() ([]Interface, error) {
 // interfaceFlagAdminUp is IF_STATUS_API_FLAG_ADMIN_UP (bit 0).
 const interfaceFlagAdminUp = 1
 
-// Index resolves one interface name to its sw_if_index. It errors if the name
-// is not present (the agent should treat that as a misconfiguration or a
-// not-yet-created interface and retry on the next reconcile).
-func (i *Interfaces) Index(name string) (uint32, error) {
-	list, err := i.List()
-	if err != nil {
-		return 0, err
-	}
-	for _, iface := range list {
-		if iface.Name == name {
-			return iface.SwIfIndex, nil
-		}
-	}
-	return 0, fmt.Errorf("vpp: interface %q not found", name)
-}
-
 // IndexMap resolves several names at once, returning a name→index map. Missing
 // names are reported together.
 func (i *Interfaces) IndexMap(names ...string) (map[string]uint32, error) {
