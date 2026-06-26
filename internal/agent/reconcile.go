@@ -88,6 +88,11 @@ type Reconciler struct {
 
 	polIdx map[string]uint32 // policer name → VPP index, learned on Add
 
+	// classifyNbuckets/classifyMem size each VPP classify mask table, auto-tuned from
+	// the node memory budget (cgroup/RAM, see classifysizing.go) so different-sized
+	// k8s nodes self-size. 0 → AddTable's legacy 4096/16 MiB default.
+	classifyNbuckets, classifyMem uint32
+
 	// polSnap publishes a read-only copy of polIdx after each pass so the metering
 	// loop (T-1001) can map a policer's stats-segment index back to its pool with
 	// no lock on the reconcile hot path. atomic.Value holds map[string]uint32.
@@ -172,8 +177,25 @@ func New(conn *vpp.Conn, log *slog.Logger) *Reconciler {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	nb, mem := classifyAutoSizing()
+	log.Info("classify table auto-sizing",
+		"nbuckets", nb, "memory_size_mb", mem>>20,
+		"memory_budget_mb", memoryBudget()>>20,
+		"note", "per VPP classify mask table; BWPOOL_CLASSIFY_MEMBERS / BWPOOL_CLASSIFY_MEM_PCT override")
 	return &Reconciler{conn: conn, log: log, polIdx: map[string]uint32{},
+		classifyNbuckets: nb, classifyMem: mem,
 		wake: make(chan struct{}, 1), deltaQ: make(chan model.EdgeDesiredDelta, 64)}
+}
+
+// SetClassifySizing overrides the per-table classify (nbuckets, memory_size); 0 keeps
+// the auto-tuned value. For tests / explicit control. Call before Run.
+func (r *Reconciler) SetClassifySizing(nbuckets, memSize uint32) {
+	if nbuckets != 0 {
+		r.classifyNbuckets = nbuckets
+	}
+	if memSize != 0 {
+		r.classifyMem = memSize
+	}
 }
 
 // SetDeltaApplier wires the hot-path delta handler invoked from the reconcile
@@ -572,7 +594,7 @@ func (r *Reconciler) reconcileClassify(cl classifyReconciler, desired []model.Cl
 	for mask, wants := range byMask {
 		table, ok := tables[mask]
 		if !ok {
-			table, err = cl.AddTable(vpp.TableSpec{Mask: mask})
+			table, err = cl.AddTable(vpp.TableSpec{Mask: mask, Nbuckets: r.classifyNbuckets, MemorySize: r.classifyMem})
 			if err != nil {
 				return c, err
 			}
