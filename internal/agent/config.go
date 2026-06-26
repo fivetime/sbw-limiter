@@ -35,6 +35,13 @@ type Config struct {
 	BirdAnchorsInclude  string `json:"bird_anchors_include"`
 	BirdFlowspecInclude string `json:"bird_flowspec_include"`
 
+	// BirdFeedMode selects how anchors + egress flowspec reach BIRD: "api" streams
+	// them incrementally to the bird-vpp `api` proto over BirdAPISocket (no
+	// configure — DESIGN-bird-api.md); anything else uses the legacy include-file +
+	// `birdc configure` path (BirdAnchorsInclude/BirdFlowspecInclude).
+	BirdFeedMode  string `json:"bird_feed_mode"`
+	BirdAPISocket string `json:"bird_api_socket"` // api proto socket; default /run/bird/api.sock
+
 	// PolicerInterfaces names the VPP interfaces whose ingress carries pool
 	// traffic to be policed (the L node's lower leg facing R, §5.3 data plane).
 	// The reconciler attaches the policer-classify mask chain to each so that
@@ -76,6 +83,7 @@ func DefaultConfig() Config {
 		Log:               logx.Config{Level: "info", Format: logx.FormatJSON},
 		BIRDSocketPath:    "/run/bird.ctl",
 		VPPAPISocket:      "/run/vpp/api.sock",
+		BirdAPISocket:     "/run/bird/api.sock",
 		ReconcileInterval: config.Duration(60 * time.Second),
 		ReportInterval:    config.Duration(15 * time.Second),
 		MetricsListenAddr: ":9102",
@@ -134,6 +142,8 @@ func (c *Config) applyEnv() error {
 	c.MetricsListenAddr = config.String("METRICS_LISTEN_ADDR", c.MetricsListenAddr)
 	c.BirdAnchorsInclude = config.String("BIRD_ANCHORS_INCLUDE", c.BirdAnchorsInclude)
 	c.BirdFlowspecInclude = config.String("BIRD_FLOWSPEC_INCLUDE", c.BirdFlowspecInclude)
+	c.BirdFeedMode = config.String("BIRD_FEED", c.BirdFeedMode)
+	c.BirdAPISocket = config.String("BIRD_API_SOCKET", c.BirdAPISocket)
 	if v := config.String("POLICER_INTERFACES", ""); v != "" {
 		c.PolicerInterfaces = splitCSV(v)
 	}

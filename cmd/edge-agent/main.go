@@ -22,6 +22,7 @@ import (
 	"github.com/fivetime/sbw-limiter/internal/agent"
 	"github.com/fivetime/sbw-limiter/internal/anchors"
 	"github.com/fivetime/sbw-limiter/internal/bird"
+	"github.com/fivetime/sbw-limiter/internal/birdfeed"
 	"github.com/fivetime/sbw-limiter/internal/grpcclient"
 	"github.com/fivetime/sbw-limiter/internal/homing"
 	"github.com/fivetime/sbw-limiter/internal/kafkasink"
@@ -134,7 +135,15 @@ func main() {
 	// The wrapper redials transparently on the next apply pass and re-pushes the
 	// includes. It dials lazily, so the agent can also start before BIRD is up.
 	var birdApply *agent.BirdApplier
-	if cfg.BirdAnchorsInclude != "" && cfg.BirdFlowspecInclude != "" {
+	var feed *birdfeed.Feed
+	if cfg.BirdFeedMode == "api" {
+		// New path (DESIGN-bird-api.md): stream anchors + egress flowspec incrementally
+		// to bird-vpp's `api` proto over the socket, no full-file `birdc configure`.
+		// Lazy connect; (re)connect triggers a HELLO+EOR resync, the proto's grace
+		// window covers brief reconnects without flapping the routes.
+		feed = birdfeed.NewFeed(cfg.BirdAPISocket, log)
+		log.Info("bird control plane via api socket (incremental feed)", "socket", cfg.BirdAPISocket)
+	} else if cfg.BirdAnchorsInclude != "" && cfg.BirdFlowspecInclude != "" {
 		bc := bird.NewReconnecting(cfg.BIRDSocketPath, log)
 		defer func() { _ = bc.Close() }()
 		birdApply = agent.NewBirdApplier(
@@ -145,6 +154,15 @@ func main() {
 		if err := birdApply.EnsureFiles(); err != nil {
 			log.Error("bird include init failed", "err", err)
 			os.Exit(1)
+		}
+	}
+	// Wake whichever bird materializer is active (a fresh push / pool change applies now).
+	birdWake := func() {
+		if feed != nil {
+			feed.Wake()
+		}
+		if birdApply != nil {
+			birdApply.Wake()
 		}
 	}
 
@@ -219,9 +237,7 @@ func main() {
 	onDesired := func(st model.EdgeDesiredState) {
 		if store.Accept(st) {
 			recon.Wake() // apply a fresh push now, not on the next timer tick (T-705)
-			if birdApply != nil {
-				birdApply.Wake()
-			}
+			birdWake()
 		}
 	}
 	// Delta hot path (the agent is hands, not brain): apply just the touched pools in
@@ -249,9 +265,7 @@ func main() {
 		if _, err := recon.ApplyDelta(delta, prev); err != nil {
 			log.Error("desired-delta apply failed; full reconcile backstop will heal", "err", err)
 		}
-		if birdApply != nil {
-			birdApply.Wake() // a removed/added pool may change anchors/flowspec
-		}
+		birdWake() // a removed/added pool may change anchors/flowspec
 	})
 	dial := func(endpoint string, onCov grpcclient.CovererFunc) (homing.Conn, error) {
 		c, err := grpcclient.Dial(endpoint, model.EdgeID(cfg.EdgeID),
@@ -285,8 +299,10 @@ func main() {
 	go director.Run(ctx)                                          // downlink: home onto primary coverer, subscribe + dispatch (L-06)
 	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // converge VPP to desired every interval
 	go reporter.Run(ctx, cfg.ReportInterval.Std(), director)      // uplink: health/capacity report to current coverer (B-03)
-	if birdApply != nil {
-		go birdApply.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // anchors+FlowSpec → BIRD
+	if feed != nil {
+		go feed.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // anchors+FlowSpec → bird api proto (incremental)
+	} else if birdApply != nil {
+		go birdApply.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // anchors+FlowSpec → BIRD (legacy configure)
 	}
 
 	// Metering export (T-1001): read VPP policer counters every interval and push
