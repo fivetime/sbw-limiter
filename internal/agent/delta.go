@@ -266,7 +266,7 @@ func (r *Reconciler) upsertPoolSessions(cl classifyReconciler, pool model.PoolID
 	for keyHex, w := range wantByKey {
 		table, ok := tables[w.mask]
 		if !ok {
-			table, err = cl.AddTable(vpp.TableSpec{Mask: w.mask})
+			table, err = cl.AddTable(vpp.TableSpec{Mask: w.mask, Nbuckets: r.classifyNbuckets, MemorySize: r.classifyMem})
 			if err != nil {
 				return added, deleted, moved, err
 			}
