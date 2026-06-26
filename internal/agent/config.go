@@ -15,11 +15,16 @@ import (
 type Config struct {
 	Log logx.Config `json:"log"`
 
-	EdgeID             string `json:"edge_id"`
-	CapacityBps        uint64 `json:"capacity_bps"`        // NIC line rate; controller sells capacity×90% (§4.1)
-	BIRDSocketPath     string `json:"bird_socket_path"`    // §4: /run/bird.ctl
-	VPPAPISocket       string `json:"vpp_api_socket"`      // §5: govpp binary API
-	ControllerEndpoint string `json:"controller_endpoint"` // desired-state source (single / bootstrap)
+	EdgeID         string `json:"edge_id"`
+	CapacityBps    uint64 `json:"capacity_bps"`     // NIC line rate; controller sells capacity×90% (§4.1)
+	BIRDSocketPath string `json:"bird_socket_path"` // §4: /run/bird.ctl
+	VPPAPISocket   string `json:"vpp_api_socket"`   // §5: govpp binary API
+	// VPPHealthTimeout bounds how long govpp waits for a VPP health-probe reply
+	// before counting a failure. govpp's 250ms default is too tight at scale (a
+	// VPP busy building classify sessions answers ControlPing late → false
+	// NotResponding → reconnect/reinstall storm); 2s tolerates the busy window.
+	VPPHealthTimeout   config.Duration `json:"vpp_health_timeout"`
+	ControllerEndpoint string          `json:"controller_endpoint"` // desired-state source (single / bootstrap)
 	// ControllerEndpoints is the bootstrap set for controller sharding (L-06): the
 	// agent connects to any one, Registers, and is told its primary/fallback
 	// coverers to home onto. Empty → [ControllerEndpoint] (single-controller mode).
@@ -83,6 +88,7 @@ func DefaultConfig() Config {
 		Log:               logx.Config{Level: "info", Format: logx.FormatJSON},
 		BIRDSocketPath:    "/run/bird.ctl",
 		VPPAPISocket:      "/run/vpp/api.sock",
+		VPPHealthTimeout:  config.Duration(2 * time.Second),
 		BirdAPISocket:     "/run/bird/api.sock",
 		ReconcileInterval: config.Duration(60 * time.Second),
 		ReportInterval:    config.Duration(15 * time.Second),
@@ -118,6 +124,11 @@ func (c *Config) applyEnv() error {
 	c.EdgeID = config.String("EDGE_ID", c.EdgeID)
 	c.BIRDSocketPath = config.String("BIRD_SOCKET", c.BIRDSocketPath)
 	c.VPPAPISocket = config.String("VPP_API_SOCKET", c.VPPAPISocket)
+	vht, err := config.DurationEnv("VPP_HEALTH_TIMEOUT", c.VPPHealthTimeout)
+	if err != nil {
+		return err
+	}
+	c.VPPHealthTimeout = vht
 	c.ControllerEndpoint = config.String("CONTROLLER_ENDPOINT", c.ControllerEndpoint)
 	c.ControllerEndpoints = config.Strings("CONTROLLER_ENDPOINTS", c.ControllerEndpoints)
 

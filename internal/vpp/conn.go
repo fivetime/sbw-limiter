@@ -50,11 +50,12 @@ type Conn struct {
 type Option func(*config)
 
 type config struct {
-	attempts   int
-	interval   time.Duration
-	log        *slog.Logger
-	compatMsgs []govppapi.Message
-	readyWait  time.Duration
+	attempts      int
+	interval      time.Duration
+	log           *slog.Logger
+	compatMsgs    []govppapi.Message
+	readyWait     time.Duration
+	healthTimeout time.Duration
 }
 
 // WithReconnect sets the reconnect attempt count and interval.
@@ -67,6 +68,18 @@ func WithLogger(l *slog.Logger) Option { return func(c *config) { c.log = l } }
 
 // WithReadyTimeout bounds how long Connect waits for the first healthy connect.
 func WithReadyTimeout(d time.Duration) Option { return func(c *config) { c.readyWait = d } }
+
+// WithHealthCheck overrides govpp's health-probe reply timeout. govpp's default
+// (250ms) is too tight at scale: a VPP busy installing classify sessions can take
+// >250ms to answer a ControlPing, which govpp falsely reads as NotResponding →
+// disconnect/reconnect → handleEvent signals a full data-plane reinstall (T-503)
+// → VPP gets busier → more false timeouts: a self-reinforcing reinstall storm
+// that also drops the controller gRPC subscription. A real VPP crash breaks the
+// socket and is still detected immediately, independent of this timeout. 0 keeps
+// govpp's default.
+func WithHealthCheck(replyTimeout time.Duration) Option {
+	return func(c *config) { c.healthTimeout = replyTimeout }
+}
 
 // Dial connects to VPP's binary-API socket (e.g. /run/vpp/api.sock).
 func Dial(ctx context.Context, socketPath string, opts ...Option) (*Conn, error) {
@@ -86,6 +99,13 @@ func Connect(ctx context.Context, a adapter.VppAPI, opts ...Option) (*Conn, erro
 	}
 	for _, o := range opts {
 		o(&cfg)
+	}
+
+	// govpp's health-probe tunables are process-global; set before AsyncConnect
+	// starts the health-check loop that reads them. The 250ms default reply
+	// timeout is too tight at scale (see WithHealthCheck).
+	if cfg.healthTimeout > 0 {
+		core.HealthCheckReplyTimeout = cfg.healthTimeout
 	}
 
 	conn, events, err := core.AsyncConnect(a, cfg.attempts, cfg.interval)
