@@ -20,9 +20,11 @@ type Config struct {
 	BIRDSocketPath string `json:"bird_socket_path"` // §4: /run/bird.ctl
 	VPPAPISocket   string `json:"vpp_api_socket"`   // §5: govpp binary API
 	// VPPHealthTimeout bounds how long govpp waits for a VPP health-probe reply
-	// before counting a failure. govpp's 250ms default is too tight at scale (a
-	// VPP busy building classify sessions answers ControlPing late → false
-	// NotResponding → reconnect/reinstall storm); 2s tolerates the busy window.
+	// before counting a failure. With the phase model (DESIGN-liveness §4.1) the
+	// ControlPing NO LONGER owns data-plane liveness — the socket (real death) and
+	// the L4 worker loops (engine) do — so this is set high to NEUTER the probe: it
+	// must not false-disconnect a busy VPP (which triggered the reinstall storm). A
+	// real crash still breaks the socket and is caught immediately, independent of it.
 	VPPHealthTimeout   config.Duration `json:"vpp_health_timeout"`
 	ControllerEndpoint string          `json:"controller_endpoint"` // desired-state source (single / bootstrap)
 	// ControllerEndpoints is the bootstrap set for controller sharding (L-06): the
@@ -57,7 +59,8 @@ type Config struct {
 
 	// Canary (soft-death §4.7/6.13): when all three are set, the agent advertises
 	// CanaryPrefix tagged with CanaryLC via BIRD WHILE the data plane is healthy
-	// and WITHDRAWS it on HealthDataPlaneDown (re-advertises on recovery). The
+	// and WITHDRAWS it when SoftDead — the link down OR a Degraded/Dead phase
+	// (§4.1) — re-advertising on recovery. The
 	// controller's RIB tap recognises the route by CanaryLC; its withdrawal
 	// (CanaryDown), conjoined with the agent's own healthDead report, trips
 	// soft-death failover — catching a dead data plane that BGP/heartbeat alone
@@ -88,7 +91,7 @@ func DefaultConfig() Config {
 		Log:               logx.Config{Level: "info", Format: logx.FormatJSON},
 		BIRDSocketPath:    "/run/bird.ctl",
 		VPPAPISocket:      "/run/vpp/api.sock",
-		VPPHealthTimeout:  config.Duration(2 * time.Second),
+		VPPHealthTimeout:  config.Duration(30 * time.Second),
 		BirdAPISocket:     "/run/bird/api.sock",
 		ReconcileInterval: config.Duration(60 * time.Second),
 		ReportInterval:    config.Duration(15 * time.Second),

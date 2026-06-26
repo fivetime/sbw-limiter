@@ -84,6 +84,11 @@ type HealthChecker struct {
 	// first). Toggled via SIGUSR1 in cmd/edge-agent; no normal path sets it.
 	forced atomic.Bool
 
+	// phase, when set, is the layered data-plane liveness tracker (DESIGN-liveness
+	// §4.1): Observe feeds it the pass's apply progress and stamps the resulting
+	// phase into the report. nil on a pre-phase build.
+	phase *PhaseTracker
+
 	mu   sync.Mutex
 	last model.HealthReport
 	seen bool
@@ -111,6 +116,13 @@ func WithClock(now func() int64) HealthOption {
 	return func(h *HealthChecker) { h.now = now }
 }
 
+// WithPhase wires the layered data-plane liveness tracker (§4.1): each Observe
+// feeds it the pass's apply progress (desired-actual pending + error) and stamps
+// the resulting phase into the report.
+func WithPhase(pt *PhaseTracker) HealthOption {
+	return func(h *HealthChecker) { h.phase = pt }
+}
+
 // NewHealthChecker builds a checker for edgeID observing the data-plane link
 // live (a *vpp.Conn).
 func NewHealthChecker(edgeID model.EdgeID, live Liveness, opts ...HealthOption) *HealthChecker {
@@ -132,6 +144,13 @@ func (h *HealthChecker) Observe(desired model.EdgeDesiredState, res Result, reco
 	if h.forced.Load() {
 		rep.State = model.HealthDataPlaneDown
 		rep.Reason = "forced data-plane-down (chaos/test hook, 6.13)"
+	}
+	if h.phase != nil {
+		// Outstanding deltas this pass = how far installed trails desired (≥0). The
+		// phase tracker turns this + the socket + L4 engine into Reconciling/Ready/…
+		pending := max(0, rep.PolicersDesired-rep.PolicersActual) + max(0, rep.SessionsDesired-rep.SessionsActual)
+		h.phase.SetApplyState(pending, reconcileErr)
+		rep.Phase = h.phase.Phase()
 	}
 	h.mu.Lock()
 	h.last = rep

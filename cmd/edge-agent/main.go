@@ -100,7 +100,21 @@ func main() {
 	store := agent.NewDesiredStore()
 	recon := agent.New(conn, log)
 	recon.SetPolicerInterfaces(cfg.PolicerInterfaces)
-	health := agent.NewHealthChecker(model.EdgeID(cfg.EdgeID), conn)
+
+	// Layered data-plane liveness (DESIGN-liveness §4.1): an L4 engine-liveness probe
+	// over the VPP stats segment feeds a phase tracker, so the report tells a busy VPP
+	// (Reconciling) from a dead one (Degraded/Dead) instead of racing the ControlPing.
+	// A missing stats segment just disables L4 wedge detection — the phase still tracks
+	// the socket (real death) + apply progress.
+	var phaseTracker *agent.PhaseTracker
+	if sr, serr := vpp.NewStatsReader(cfg.VPPStatsSocket); serr != nil {
+		log.Warn("phase: VPP stats connect failed; L4 engine-wedge detection disabled", "err", serr, "socket", cfg.VPPStatsSocket)
+		phaseTracker = agent.NewPhaseTracker(conn, nil)
+	} else {
+		defer sr.Close()
+		phaseTracker = agent.NewPhaseTracker(conn, vpp.NewEngineLiveness(sr, 3)) // wedged after 3 frozen samples
+	}
+	health := agent.NewHealthChecker(model.EdgeID(cfg.EdgeID), conn, agent.WithPhase(phaseTracker))
 	recon.AddObserver(health.Observe) // reconcile result drives soft-death health (B-05)
 
 	// Observability (T-1003): the metrics observer runs AFTER health.Observe, so
@@ -210,7 +224,11 @@ func main() {
 		lastAdvertised := true
 		recon.AddObserver(func(_ model.EdgeDesiredState, _ agent.Result, _ error) {
 			advertised := true
-			if rep, ok := health.Last(); ok && rep.State == model.HealthDataPlaneDown {
+			// Withdraw on SoftDead (now phase-aware, §4.1): the data-plane link down,
+			// OR a Degraded phase (wedged worker / erroring applies) the ControlPing is
+			// blind to. This is the BGP half of the canary∧healthDead conjunction; the
+			// gRPC half (SoftDead in the report) tracks the same predicate.
+			if rep, ok := health.Last(); ok && rep.SoftDead() {
 				advertised = false
 			}
 			content := advContent
@@ -300,6 +318,18 @@ func main() {
 	go director.Run(ctx)                                          // downlink: home onto primary coverer, subscribe + dispatch (L-06)
 	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // converge VPP to desired every interval
 	go reporter.Run(ctx, cfg.ReportInterval.Std(), director)      // uplink: health/capacity report to current coverer (B-03)
+	go func() {                                                   // L4 engine + socket probe: faster than the reconcile pass so a worker wedge / socket loss surfaces in seconds (§4.1)
+		t := time.NewTicker(3 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				phaseTracker.Tick()
+			}
+		}
+	}()
 	if feed != nil {
 		go feed.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // anchors+FlowSpec → bird api proto (incremental)
 	} else if birdApply != nil {
