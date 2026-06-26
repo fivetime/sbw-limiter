@@ -101,19 +101,13 @@ func main() {
 	recon := agent.New(conn, log)
 	recon.SetPolicerInterfaces(cfg.PolicerInterfaces)
 
-	// Layered data-plane liveness (DESIGN-liveness §4.1): an L4 engine-liveness probe
-	// over the VPP stats segment feeds a phase tracker, so the report tells a busy VPP
-	// (Reconciling) from a dead one (Degraded/Dead) instead of racing the ControlPing.
-	// A missing stats segment just disables L4 wedge detection — the phase still tracks
-	// the socket (real death) + apply progress.
-	var phaseTracker *agent.PhaseTracker
-	if sr, serr := vpp.NewStatsReader(cfg.VPPStatsSocket); serr != nil {
-		log.Warn("phase: VPP stats connect failed; L4 engine-wedge detection disabled", "err", serr, "socket", cfg.VPPStatsSocket)
-		phaseTracker = agent.NewPhaseTracker(conn, nil, log)
-	} else {
-		defer sr.Close()
-		phaseTracker = agent.NewPhaseTracker(conn, vpp.NewEngineLiveness(sr, 3), log) // wedged after 3 frozen samples
-	}
+	// Layered data-plane liveness (DESIGN-liveness §4.1): a phase tracker over the VPP
+	// socket (real death) + apply progress, so the report tells a busy VPP (Reconciling)
+	// from a dead one (Degraded/Dead) instead of racing the ControlPing. It deliberately
+	// does NOT read the L4 engine loop counter — an adaptive VPP sleeps when idle so the
+	// loops freeze, which a probe misreads as a wedge (verify-proven); "worker really
+	// forwarding" can't be told passively (§4.1.6).
+	phaseTracker := agent.NewPhaseTracker(conn, log)
 	health := agent.NewHealthChecker(model.EdgeID(cfg.EdgeID), conn, agent.WithPhase(phaseTracker))
 	recon.AddObserver(health.Observe) // reconcile result drives soft-death health (B-05)
 
