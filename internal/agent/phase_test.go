@@ -46,7 +46,7 @@ func (p *phaseEng) Stalled() ([]int, error) { return p.wedged, p.err }
 func TestPhaseTracker(t *testing.T) {
 	conn := &phaseConn{up: false}
 	eng := &phaseEng{}
-	pt := NewPhaseTracker(conn, eng)
+	pt := NewPhaseTracker(conn, eng, nil)
 
 	if pt.Phase() != model.PhasePending {
 		t.Fatalf("initial phase = %q, want Pending", pt.Phase())
@@ -88,7 +88,7 @@ func TestPhaseTracker(t *testing.T) {
 // nil engine probe must be safe (no L4 wedge detection) and never wedge.
 func TestPhaseTrackerNilEngine(t *testing.T) {
 	conn := &phaseConn{up: true}
-	pt := NewPhaseTracker(conn, nil)
+	pt := NewPhaseTracker(conn, nil, nil)
 	pt.SetApplyState(0, nil)
 	if p := pt.Tick(); p != model.PhaseReady {
 		t.Fatalf("nil engine, synced = %q, want Ready", p)

@@ -31,6 +31,7 @@ type Metrics struct {
 	sessionsDesired prometheus.Gauge
 	generation      prometheus.Gauge // last applied desired-state generation
 	frozen          prometheus.Gauge // 1 when fail-static frozen (controller unreachable)
+	dataPlanePhase  prometheus.Gauge // §4.1: 0 Ready,1 Reconciling,2 Pending,3 Degraded,4 Dead,-1 unknown
 }
 
 // New builds a Metrics for one edge over a fresh registry. edge is added as a
@@ -51,6 +52,7 @@ func New(edge model.EdgeID) *Metrics {
 	m.sessionsDesired = f.gauge("sbw_agent_classify_sessions_desired", "Classify sessions in the current desired state.")
 	m.generation = f.gauge("sbw_agent_desired_generation", "Last applied desired-state generation.")
 	m.frozen = f.gauge("sbw_agent_controller_frozen", "1 when fail-static frozen (controller unreachable, holding last state).")
+	m.dataPlanePhase = f.gauge("sbw_agent_dataplane_phase", "Data-plane liveness phase (DESIGN-liveness §4.1): 0 Ready, 1 Reconciling, 2 Pending, 3 Degraded, 4 Dead, -1 unknown.")
 	return m
 }
 
@@ -83,6 +85,34 @@ func (m *Metrics) RecordHealth(r model.HealthReport) {
 	m.sessionsDesired.Set(float64(r.SessionsDesired))
 	m.generation.Set(float64(r.GenerationApplied))
 	m.vppConnected.Set(boolGauge(r.VPPConnected))
+}
+
+// RecordPhase folds the current data-plane liveness phase into the gauge. Driven by
+// the phase probe ticker (more frequent than a reconcile pass).
+func (m *Metrics) RecordPhase(p model.DataPlanePhase) {
+	if m == nil {
+		return
+	}
+	m.dataPlanePhase.Set(phaseCode(p))
+}
+
+// phaseCode maps a phase to a numeric gauge value (higher = worse): Ready 0,
+// Reconciling 1, Pending 2, Degraded 3, Dead 4, unknown/empty -1.
+func phaseCode(p model.DataPlanePhase) float64 {
+	switch p {
+	case model.PhaseReady:
+		return 0
+	case model.PhaseReconciling:
+		return 1
+	case model.PhasePending:
+		return 2
+	case model.PhaseDegraded:
+		return 3
+	case model.PhaseDead:
+		return 4
+	default:
+		return -1
+	}
 }
 
 // RecordDesiredStatus folds the DesiredStore's fail-static snapshot into gauges.

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"log/slog"
 	"sync"
 
 	"github.com/fivetime/sbw-contract/model"
@@ -54,6 +55,7 @@ func ComputePhase(in PhaseInputs) model.DataPlanePhase {
 type PhaseTracker struct {
 	conn Liveness
 	eng  engineProbe // may be nil → no L4 wedge detection
+	log  *slog.Logger
 
 	mu            sync.Mutex
 	everConnected bool
@@ -69,19 +71,28 @@ func (pt *PhaseTracker) recomputeLocked() {
 	if up {
 		pt.everConnected = true
 	}
-	pt.phase = ComputePhase(PhaseInputs{
+	next := ComputePhase(PhaseInputs{
 		SocketUp:      up,
 		EverConnected: pt.everConnected,
 		Pending:       pt.pending,
 		ApplyErr:      pt.applyErr,
 		WedgedWorkers: pt.wedged,
 	})
+	if next != pt.phase {
+		pt.log.Info("data-plane phase", "from", pt.phase, "to", next,
+			"socket_up", up, "pending", pt.pending, "wedged_workers", pt.wedged, "apply_err", pt.applyErr)
+	}
+	pt.phase = next
 }
 
 // NewPhaseTracker builds a tracker over the VPP connection liveness and an optional
-// L4 engine probe (nil to disable wedge detection).
-func NewPhaseTracker(conn Liveness, eng engineProbe) *PhaseTracker {
-	return &PhaseTracker{conn: conn, eng: eng, phase: model.PhasePending}
+// L4 engine probe (nil to disable wedge detection). log (nil → discard) records
+// every phase transition.
+func NewPhaseTracker(conn Liveness, eng engineProbe, log *slog.Logger) *PhaseTracker {
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	return &PhaseTracker{conn: conn, eng: eng, log: log, phase: model.PhasePending}
 }
 
 // SetApplyState records the latest reconcile pass outcome (pending = desired-actual

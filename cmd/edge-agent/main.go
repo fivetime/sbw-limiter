@@ -109,10 +109,10 @@ func main() {
 	var phaseTracker *agent.PhaseTracker
 	if sr, serr := vpp.NewStatsReader(cfg.VPPStatsSocket); serr != nil {
 		log.Warn("phase: VPP stats connect failed; L4 engine-wedge detection disabled", "err", serr, "socket", cfg.VPPStatsSocket)
-		phaseTracker = agent.NewPhaseTracker(conn, nil)
+		phaseTracker = agent.NewPhaseTracker(conn, nil, log)
 	} else {
 		defer sr.Close()
-		phaseTracker = agent.NewPhaseTracker(conn, vpp.NewEngineLiveness(sr, 3)) // wedged after 3 frozen samples
+		phaseTracker = agent.NewPhaseTracker(conn, vpp.NewEngineLiveness(sr, 3), log) // wedged after 3 frozen samples
 	}
 	health := agent.NewHealthChecker(model.EdgeID(cfg.EdgeID), conn, agent.WithPhase(phaseTracker))
 	recon.AddObserver(health.Observe) // reconcile result drives soft-death health (B-05)
@@ -326,7 +326,7 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				phaseTracker.Tick()
+				met.RecordPhase(phaseTracker.Tick())
 			}
 		}
 	}()
