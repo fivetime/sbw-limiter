@@ -97,15 +97,29 @@ func (s *DesiredStore) Merge(delta model.EdgeDesiredDelta) (prevSessions []model
 		touched[id] = struct{}{}
 	}
 
-	// Member prefixes of the touched pools, captured from the CURRENT classify sessions
-	// BEFORE they are filtered. Anchors/FlowRedirects carry no pool id, so a touched pool's
-	// anchors are identified by its members' prefixes (an anchor is a member's host route; a
-	// flow-redirect its source prefix) — letting us REPLACE them on merge instead of
-	// accumulating duplicate /32 advertisements (the bug: BIRD/FlowSpec duplicate steering).
+	// Member prefixes of the touched pools, identifying their Anchors/FlowRedirects
+	// (which carry no pool id) so we REPLACE rather than accumulate duplicate /32-/128
+	// advertisements (the bug: BIRD/FlowSpec duplicate steering). Two sources, UNIONED,
+	// because either alone has a hole:
+	//   (1) the CURRENT classify sessions of the touched pools — covers a member being
+	//       REMOVED, whose old anchor must drop even though the upsert no longer lists it;
+	//   (2) the upserts' OWN anchors/flow-redirects — covers the case where a touched
+	//       pool's classify session is ABSENT from the held state at merge time (a
+	//       full-state-resync vs in-flight-delta dual-path race), where (1) alone misses
+	//       the prefix and the re-added anchor DUPLICATES the held one ("anchors:
+	//       duplicate anchor prefix ..." — fails the whole BIRD configure).
 	touchedPrefixes := map[netip.Prefix]struct{}{}
 	for _, c := range s.state.ClassifySessions {
 		if _, ok := touched[c.PoolID]; ok {
 			touchedPrefixes[c.Prefix] = struct{}{}
+		}
+	}
+	for _, up := range delta.Upserts {
+		for _, a := range up.Anchors {
+			touchedPrefixes[a.Prefix] = struct{}{}
+		}
+		for _, f := range up.FlowRedirects {
+			touchedPrefixes[f.SrcPrefix] = struct{}{}
 		}
 	}
 

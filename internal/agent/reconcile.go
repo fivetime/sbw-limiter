@@ -134,6 +134,16 @@ type Reconciler struct {
 	// the single reconcile goroutine (Reconcile / ApplyDelta), so no lock is needed.
 	lastGen uint64
 
+	// appliedNonEmpty / pendingEmpty implement the reconcile-to-empty guard: a desired
+	// state that suddenly collapses to EMPTY right after a non-empty one was applied is
+	// treated as SUSPECT (a transient desired-state drop — a VPP reconnect/resync race
+	// or an in-flight delta that momentarily emptied the store) and its teardown is
+	// deferred ONE pass; the live policers/sessions are deleted as "orphans" only if the
+	// empty state PERSISTS (a real "all pools deleted"). Without this one bad pass
+	// blackholes every pool. Reconcile-goroutine-only, like lastGen, so no lock.
+	appliedNonEmpty bool
+	pendingEmpty    bool
+
 	// poolHash caches the installed pool-set hash (model.PoolSetHash over the
 	// distinct pool ids materialized in polIdx) recomputed after each apply, so the
 	// report builder can read it lock-free. The controller compares it against its
@@ -229,6 +239,19 @@ func (r *Reconciler) Reset() {
 // Reconcile drives VPP to match desired in one pass. It opens a fresh channel,
 // reconciles each resource, and reports what changed.
 func (r *Reconciler) Reconcile(desired model.EdgeDesiredState) (Result, error) {
+	// Reconcile-to-empty guard: defer the teardown on the FIRST pass whose desired
+	// state collapses to empty right after a non-empty one was applied — a transient
+	// drop would otherwise delete live policers/sessions as orphans and blackhole real
+	// pools. Act only once the empty state persists (see appliedNonEmpty/pendingEmpty).
+	desiredEmpty := len(desired.Policers) == 0 && len(desired.ClassifySessions) == 0
+	if desiredEmpty && r.appliedNonEmpty && !r.pendingEmpty {
+		r.pendingEmpty = true
+		r.log.Warn("reconcile: desired collapsed to empty after non-empty — deferring teardown one pass (suspected transient drop)",
+			"generation", desired.Generation)
+		return Result{}, nil
+	}
+	r.pendingEmpty = false
+
 	ch, err := r.conn.Channel()
 	if err != nil {
 		return Result{}, fmt.Errorf("agent: reconcile: %w", err)
@@ -291,6 +314,7 @@ func (r *Reconciler) Reconcile(desired model.EdgeDesiredState) (Result, error) {
 	// so adopt this generation as the apply baseline (delta gap detection) and
 	// recompute the installed pool-set hash the report attests (B-02 / hash drift).
 	r.lastGen = desired.Generation
+	r.appliedNonEmpty = !desiredEmpty
 	r.recomputePoolHash()
 	return res, nil
 }

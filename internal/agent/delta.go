@@ -197,6 +197,19 @@ func (r *Reconciler) deletePoolSessions(cl classifyReconciler, sessions []model.
 // touches (typically one or two), not the whole edge — so the cost is bounded by the
 // pool's masks/members, not N. prev is the pool's pre-delta members (the teardown
 // record for members no longer desired).
+// sessionMapKey namespaces a session's VPP match key by its mask. The SAME /128
+// address under different masks — notably ip6-dst-128 (ingress) vs ip6-src-128
+// (egress) of one member — produces a BYTE-IDENTICAL VPP match key (vpp.SessionKey
+// encodes only the masked address, dropping the mask/direction). An un-namespaced
+// desired map therefore collides a member's ingress and egress sessions: the second
+// overwrites the first, so only ONE mask's table is ever created — v6 ingress ended
+// up with no dst table at all and its traffic went unpoliced/uncounted. The VPP
+// match bytes are unchanged; this is purely the in-memory map key. (The full
+// reconcile path was already immune: it nests its desired map by mask.)
+func sessionMapKey(mask model.MaskKind, keyHex string) string {
+	return mask.String() + "\x00" + keyHex
+}
+
 func (r *Reconciler) upsertPoolSessions(cl classifyReconciler, pool model.PoolID, prev, next []model.ClassifySession) (added, deleted, moved int, err error) {
 	tables, err := cl.FindTablesByMask()
 	if err != nil {
@@ -220,7 +233,7 @@ func (r *Reconciler) upsertPoolSessions(cl classifyReconciler, pool model.PoolID
 		if err != nil {
 			return added, deleted, moved, err
 		}
-		wantByKey[hex.EncodeToString(key)] = want{s.Mask, s.Prefix, idx}
+		wantByKey[sessionMapKey(s.Mask, hex.EncodeToString(key))] = want{s.Mask, s.Prefix, idx}
 		masks[s.Mask] = struct{}{}
 	}
 
@@ -230,7 +243,7 @@ func (r *Reconciler) upsertPoolSessions(cl classifyReconciler, pool model.PoolID
 		if err != nil {
 			return added, deleted, moved, err
 		}
-		if _, keep := wantByKey[hex.EncodeToString(key)]; keep {
+		if _, keep := wantByKey[sessionMapKey(s.Mask, hex.EncodeToString(key))]; keep {
 			continue // still desired; handled below (add-or-move)
 		}
 		table, ok := tables[s.Mask]
@@ -257,7 +270,7 @@ func (r *Reconciler) upsertPoolSessions(cl classifyReconciler, pool model.PoolID
 			return added, deleted, moved, fmt.Errorf("agent: delta: dump sessions: %w", err)
 		}
 		for _, s := range ss {
-			actualHit[hex.EncodeToString(s.Match)] = s.HitNextIndex
+			actualHit[sessionMapKey(mask, hex.EncodeToString(s.Match))] = s.HitNextIndex
 		}
 	}
 
