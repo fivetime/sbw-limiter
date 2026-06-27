@@ -49,7 +49,7 @@
 - `policer_interfaces` / `BWPOOL_POLICER_INTERFACES`：需要挂 policer-classify chain 的 VPP 接口。
 - `metrics_listen_addr` / `BWPOOL_METRICS_LISTEN_ADDR`：Prometheus `/metrics`。
 - `canary_include`、`canary_prefix`、`canary_lc`：软死 canary 配置。
-- `metering_enable` 和 `METERING_*` 环境变量：Kafka 计量外送配置。
+- `metering_enable` 和 `BWPOOL_METERING_*` 环境变量：Kafka 计量外送配置。
 
 示例配置在 [configs/agent.example.json](configs/agent.example.json)。
 
