@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # Regenerate the VPP binary-API Go bindings under internal/binapi/ (T-204).
 #
-# Bindings are generated from a VPP source tree's .api files, pinned to the
-# version the edge runs (DESIGN.md §1: VPP 26.06 / stable/2606). The generated
-# code is committed (vendored), so this script is run only when bumping VPP or
-# adding a plugin — not in CI.
+# Bindings are generated from a VPP source tree's .api files, for the version the
+# edge runs (DESIGN.md §1: ghcr.io/fivetime/vpp:master = FDio/vpp master). The
+# generated code is committed (vendored), so this script is run only when bumping
+# VPP or adding a plugin — not in CI.
 #
 # Usage:
 #   VPP_SRC=/path/to/vpp scripts/gen-binapi.sh
 #
-# Requirements: python3 + ply (VPP's vppapigen), and binapi-generator:
-#   go install go.fd.io/govpp/cmd/binapi-generator@v0.12.0
+# Requirements: python3 + ply (VPP's vppapigen), and binapi-generator at the same
+# version as go.mod's go.fd.io/govpp (currently v0.13.0):
+#   go install go.fd.io/govpp/cmd/binapi-generator@v0.13.0
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VPP_SRC="${VPP_SRC:?set VPP_SRC to the VPP source tree (stable/2606)}"
+VPP_SRC="${VPP_SRC:?set VPP_SRC to the VPP source tree (FDio/vpp master)}"
 PREFIX="github.com/fivetime/sbw-limiter/internal/binapi"
 OUT="internal/binapi"
 

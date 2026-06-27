@@ -6,7 +6,7 @@ require (
 	github.com/fivetime/sbw-contract v0.0.0
 	github.com/prometheus/client_golang v1.16.0
 	github.com/twmb/franz-go v1.21.3
-	go.fd.io/govpp v0.12.0
+	go.fd.io/govpp v0.13.0
 	google.golang.org/grpc v1.79.3
 )
 
