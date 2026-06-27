@@ -12,24 +12,16 @@ import (
 )
 
 // Classify materializes the six fixed classify mask tables and their member
-// sessions (T-403/T-404, DESIGN.md §5.2/§5.3). The classify runs as the ip4/ip6-
-// policer-classify INPUT feature on the ip4/ip6-unicast arc, which reads from the
-// L3 (IP) header — VPP's canonical `classify table mask l3 ip{4,6} {src,dst}` — so
-// the address offset is the IP-header field offset with NO Ethernet (L2) header:
+// sessions (T-403/T-404, DESIGN.md §5.2/§5.3). The mask/match byte layout is
+// derived from first principles and verified byte-identical against real VPP:
 //
-//	absStart = ipFieldOffset                   // address offset within the L3 (IP) header
+//	absStart = ethHdr(14) + ipFieldOffset      // where the address sits in the packet
 //	skip_n_vectors  = absStart / 16            // VPP skips leading all-zero 16B vectors
 //	match_n_vectors = absEnd/16 - skip + 1     // 16B vectors spanning the address
 //
 // The TABLE mask is the match portion only (mask_len == match_n_vectors*16);
-// the SESSION match is the full buffer ((skip+match)*16) with the address at its
-// L3 offset (VPP masks the key on insert). NOTE: an earlier layout added a 14-byte
-// Ethernet header (ethHdr+ipFieldOffset). That was WRONG for the lcp-tap data
-// interfaces (the policer-classify arc sees the L3 header, not L2): the v6 classify
-// session never matched real traffic (hits=0, ingress rate stayed 0). It went
-// unnoticed because no test ever flooded real transit traffic through the policer
-// (the v4 e2e only asserts policer install/remove). The v6 ingress dataplane e2e
-// exposed it; matching VPP's `l3` mask (skip computed from ipFieldOffset) fixes it.
+// the SESSION match is the full buffer ((skip+match)*16) with the address at
+// its absolute packet offset (VPP masks the key on insert).
 type Classify struct {
 	ch govppapi.Channel
 }
@@ -37,7 +29,10 @@ type Classify struct {
 // NewClassify wraps a channel for classify operations.
 func NewClassify(ch govppapi.Channel) *Classify { return &Classify{ch: ch} }
 
-const vec = 16 // one u32x4 classify vector
+const (
+	ethHdrLen = 14 // Ethernet header consumed before the IP header
+	vec       = 16 // one u32x4 classify vector
+)
 
 // maskSpec describes a fixed mask kind in packet terms.
 type maskSpec struct {
@@ -83,7 +78,7 @@ func (s maskSpec) addrField() (fieldOffset, addrLen int) {
 // of the matched address.
 func (s maskSpec) layout() (skip, match, absStart, absEnd int) {
 	fieldOff, addrLen := s.addrField()
-	absStart = fieldOff // L3 (IP-header) offset — the policer-classify arc reads from L3
+	absStart = ethHdrLen + fieldOff
 	absEnd = absStart + addrLen - 1
 	skip = absStart / vec
 	match = absEnd/vec - skip + 1

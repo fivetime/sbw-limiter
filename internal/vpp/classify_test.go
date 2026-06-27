@@ -8,11 +8,9 @@ import (
 	"github.com/fivetime/sbw-contract/model"
 )
 
-// The expected skip/match/mask values are the L3 (IP-header) layout VPP's
-// policer-classify input feature reads — `classify table mask l3 ip{4,6}
-// {src,dst}` (no Ethernet/L2 offset). They must stay byte-identical so tables
-// dedupe and dumps verify. (The earlier values added a 14-byte Ethernet header;
-// that layout dumped fine but never matched real traffic — see classify.go.)
+// The expected skip/match/mask values were measured from real VPP 26.06
+// (`show classify tables verbose`) and must stay byte-identical so tables
+// dedupe and dumps verify.
 func TestTableMaskLayouts(t *testing.T) {
 	cases := []struct {
 		mask    model.MaskKind
@@ -20,12 +18,12 @@ func TestTableMaskLayouts(t *testing.T) {
 		match   uint32
 		maskHex string // match-only mask bytes (match*16)
 	}{
-		{model.MaskIP4Dst32, 1, 1, "ffffffff000000000000000000000000"},
-		{model.MaskIP4Dst24, 1, 1, "ffffff00000000000000000000000000"},
-		{model.MaskIP4Src32, 0, 1, "000000000000000000000000ffffffff"},
-		{model.MaskIP4Src24, 0, 1, "000000000000000000000000ffffff00"},
-		{model.MaskIP6Dst128, 1, 2, "0000000000000000ffffffffffffffffffffffffffffffff0000000000000000"},
-		{model.MaskIP6Src128, 0, 2, "0000000000000000ffffffffffffffffffffffffffffffff0000000000000000"},
+		{model.MaskIP4Dst32, 1, 2, "0000000000000000000000000000ffffffff0000000000000000000000000000"},
+		{model.MaskIP4Dst24, 1, 2, "0000000000000000000000000000ffffff000000000000000000000000000000"},
+		{model.MaskIP4Src32, 1, 1, "00000000000000000000ffffffff0000"},
+		{model.MaskIP4Src24, 1, 1, "00000000000000000000ffffff000000"},
+		{model.MaskIP6Dst128, 2, 2, "000000000000ffffffffffffffffffffffffffffffff00000000000000000000"},
+		{model.MaskIP6Src128, 1, 2, "000000000000ffffffffffffffffffffffffffffffff00000000000000000000"},
 	}
 	for _, c := range cases {
 		t.Run(c.mask.String(), func(t *testing.T) {
@@ -55,16 +53,16 @@ func TestSessionMatchLayout(t *testing.T) {
 		valHex   string // address bytes
 		valAt    int    // absolute packet offset
 	}{
-		// ip4 dst/32: L3 IP dst at byte 16; total (1+1)*16 = 32
-		{model.MaskIP4Dst32, "203.0.113.10/32", 32, "cb00710a", 16},
-		// ip4 src/32: L3 IP src at byte 12; total (0+1)*16 = 16
-		{model.MaskIP4Src32, "203.0.113.10/32", 16, "cb00710a", 12},
+		// ip4 dst/32: Ethernet14 + IP dst16 = byte 30; total (1+2)*16 = 48
+		{model.MaskIP4Dst32, "203.0.113.10/32", 48, "cb00710a", 30},
+		// ip4 src/32: byte 26; total (1+1)*16 = 32
+		{model.MaskIP4Src32, "203.0.113.10/32", 32, "cb00710a", 26},
 		// ip4 dst/24 network 203.0.113.0
-		{model.MaskIP4Dst24, "203.0.113.0/24", 32, "cb007100", 16},
-		// ip6 dst/128: L3 IP dst at byte 24; total (1+2)*16 = 48
-		{model.MaskIP6Dst128, "2001:db8::a/128", 48, "20010db800000000000000000000000a", 24},
-		// ip6 src/128: L3 IP src at byte 8; total (0+2)*16 = 32
-		{model.MaskIP6Src128, "2001:db8::a/128", 32, "20010db800000000000000000000000a", 8},
+		{model.MaskIP4Dst24, "203.0.113.0/24", 48, "cb007100", 30},
+		// ip6 dst/128: byte 38; total (2+2)*16 = 64
+		{model.MaskIP6Dst128, "2001:db8::a/128", 64, "20010db800000000000000000000000a", 38},
+		// ip6 src/128: byte 22; total (1+2)*16 = 48
+		{model.MaskIP6Src128, "2001:db8::a/128", 48, "20010db800000000000000000000000a", 22},
 	}
 	for _, c := range cases {
 		t.Run(c.mask.String(), func(t *testing.T) {
