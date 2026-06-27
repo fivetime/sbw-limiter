@@ -22,7 +22,7 @@ import (
 // milliseconds, T-705), pulling the latest state from a DesiredProvider.
 type BirdApplier struct {
 	anchors *anchors.Applier // the anchors include (anchors4/anchors6 blocks)
-	flow    *anchors.Applier // the egress FlowSpec include (flowspec4 block)
+	flow    *anchors.Applier // the egress FlowSpec include (flowspec4/flowspec6 blocks)
 	log     *slog.Logger
 	wake    chan struct{}
 }

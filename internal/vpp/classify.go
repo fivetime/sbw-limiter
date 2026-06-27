@@ -146,9 +146,13 @@ type TableSpec struct {
 // NoTable is the sentinel for "no next/this table" (VPP ~0).
 const NoTable = ^uint32(0)
 
-// AddTable creates a standalone mask table and returns its index. Defaults:
-// nbuckets 4096, memory 16 MiB (ample for 3000 sessions, §5.3). Use LinkTable
-// to chain it. next/miss default to NoTable (chain end / fall through arc).
+// AddTable creates a standalone mask table and returns its index. Zero-value
+// fallback defaults: nbuckets 4096, memory 16 MiB. These are the legacy default
+// only — production callers pass Nbuckets/MemorySize sized by the per-node memory
+// budget (internal/agent/classifysizing.go); the classify table is a fixed
+// non-growable heap and the old "16M/4096 ample for 3000" assumption crashed VPP
+// at full (§5.3). Use LinkTable to chain it. next/miss default to NoTable (chain
+// end / fall through arc).
 func (c *Classify) AddTable(spec TableSpec) (uint32, error) {
 	ms, err := specOf(spec.Mask)
 	if err != nil {

@@ -10,9 +10,9 @@ import (
 )
 
 // Interfaces resolves VPP interface names to sw_if_index (T-410): the agent's
-// config names interfaces (uplink/core/inter-edge); the materializers
-// (policer-classify attach, ABF attach, uRPF, lcp pairs) need the numeric
-// sw_if_index. VPP assigns indexes at runtime, so the agent must look them up.
+// config names interfaces (uplink/core/inter-edge); the policer-classify
+// attach materializer needs the numeric sw_if_index. VPP assigns indexes at
+// runtime, so the agent must look them up.
 type Interfaces struct {
 	ch govppapi.Channel
 }
