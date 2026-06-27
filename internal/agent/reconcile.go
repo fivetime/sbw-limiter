@@ -168,7 +168,17 @@ func (r *Reconciler) AddObserver(fn func(model.EdgeDesiredState, Result, error))
 
 func (r *Reconciler) notify(desired model.EdgeDesiredState, res Result, err error) {
 	for _, fn := range r.observers {
-		fn(desired, res, err)
+		// Isolate each observer: a panic in one (e.g. the metrics observer) must NOT skip
+		// the others — the canary/health observers drive soft-death failover signalling and
+		// must always run regardless of an earlier observer faulting.
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					r.log.Error("reconcile observer panicked; continuing with the rest", "panic", p)
+				}
+			}()
+			fn(desired, res, err)
+		}()
 	}
 }
 

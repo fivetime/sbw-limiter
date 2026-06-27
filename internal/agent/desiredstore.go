@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"net/netip"
 	"sync"
 	"time"
 
@@ -96,9 +97,25 @@ func (s *DesiredStore) Merge(delta model.EdgeDesiredDelta) (prevSessions []model
 		touched[id] = struct{}{}
 	}
 
+	// Member prefixes of the touched pools, captured from the CURRENT classify sessions
+	// BEFORE they are filtered. Anchors/FlowRedirects carry no pool id, so a touched pool's
+	// anchors are identified by its members' prefixes (an anchor is a member's host route; a
+	// flow-redirect its source prefix) — letting us REPLACE them on merge instead of
+	// accumulating duplicate /32 advertisements (the bug: BIRD/FlowSpec duplicate steering).
+	touchedPrefixes := map[netip.Prefix]struct{}{}
+	for _, c := range s.state.ClassifySessions {
+		if _, ok := touched[c.PoolID]; ok {
+			touchedPrefixes[c.Prefix] = struct{}{}
+		}
+	}
+
 	// Drop touched pools' policers and sessions from the held state.
 	s.state.Policers = filterOutPools(s.state.Policers, touched, func(p model.PolicerSpec) model.PoolID { return p.PoolID })
 	s.state.ClassifySessions = filterOutPools(s.state.ClassifySessions, touched, func(c model.ClassifySession) model.PoolID { return c.PoolID })
+	// Drop touched pools' anchors + flow-redirects (matched by member prefix) so the upserts
+	// below REPLACE them rather than accumulate.
+	s.state.Anchors = filterOutPrefixes(s.state.Anchors, touchedPrefixes, func(a model.Anchor) netip.Prefix { return a.Prefix })
+	s.state.FlowRedirects = filterOutPrefixes(s.state.FlowRedirects, touchedPrefixes, func(f model.FlowRedirect) netip.Prefix { return f.SrcPrefix })
 
 	// Re-add each upserted pool's contribution.
 	for _, up := range delta.Upserts {
@@ -128,6 +145,19 @@ func filterOutPools[T any](xs []T, drop map[model.PoolID]struct{}, poolOf func(T
 	out := xs[:0:0]
 	for _, x := range xs {
 		if _, gone := drop[poolOf(x)]; gone {
+			continue
+		}
+		out = append(out, x)
+	}
+	return out
+}
+
+// filterOutPrefixes returns xs with every element whose prefix is in drop removed —
+// the Anchor/FlowRedirect analogue of filterOutPools (those carry no pool id).
+func filterOutPrefixes[T any](xs []T, drop map[netip.Prefix]struct{}, prefixOf func(T) netip.Prefix) []T {
+	out := xs[:0:0]
+	for _, x := range xs {
+		if _, gone := drop[prefixOf(x)]; gone {
 			continue
 		}
 		out = append(out, x)

@@ -276,7 +276,12 @@ func main() {
 			return
 		}
 		if _, err := recon.ApplyDelta(delta, prev); err != nil {
-			log.Error("desired-delta apply failed; full reconcile backstop will heal", "err", err)
+			// VPP only partially applied → do NOT wake BIRD: it must not advertise anchors/
+			// FlowSpec for a delta VPP could not fully install (traffic would steer to an
+			// uninstalled policer = unpoliced). The held-state/VPP divergence is healed by
+			// the full reconcile + the controller's hash-mismatch resync (gap-drop backstop).
+			log.Error("desired-delta apply failed; not waking BIRD, awaiting full reconcile/resync", "err", err)
+			return
 		}
 		birdWake() // a removed/added pool may change anchors/flowspec
 	})
