@@ -474,19 +474,35 @@ func (r *Reconciler) reconcileBindings(cl *vpp.Classify, ifaces *vpp.Interfaces)
 		if c4 == ip4Head && c6 == ip6Head {
 			continue // already attached to the right chain heads
 		}
-		if ip4Head == vpp.NoTable && ip6Head == vpp.NoTable {
-			// Nothing desired: detach the chain currently bound (pool destroyed).
-			if err := cl.SetPolicerInterface(sw, c4, c6, false); err != nil {
-				return changed, fmt.Errorf("agent: bindings: detach %s: %w", name, err)
+		// Set each family in its OWN policer_classify_set_interface call. A single
+		// COMBINED call that sets BOTH the ip4 and ip6 table indices at once enables
+		// only ip4 on VPP — the ip6 feature is silently dropped (ip6-policer-classify
+		// never lands on the interface's ip6-unicast arc), so v6 ingress traffic
+		// bypasses the policer entirely (classify hits=0; rate stays 0). The v6 ingress
+		// dataplane e2e exposed this; the single-family CLI (`set policer classify
+		// interface X ip6-table N`) proves a per-family call works. is_add=true with
+		// NoTable for the other family is additive and never clobbers it, so we drive
+		// attach/detach independently per family.
+		if c4 != ip4Head {
+			ip4, add := ip4Head, true
+			if ip4Head == vpp.NoTable {
+				ip4, add = c4, false // pool gone for v4: detach the currently-bound chain
 			}
-			r.log.Info("reconcile: detached policer-classify", "iface", name, "swifindex", sw)
-		} else {
-			if err := cl.SetPolicerInterface(sw, ip4Head, ip6Head, true); err != nil {
-				return changed, fmt.Errorf("agent: bindings: attach %s: %w", name, err)
+			if err := cl.SetPolicerInterface(sw, ip4, vpp.NoTable, add); err != nil {
+				return changed, fmt.Errorf("agent: bindings: %s ip4: %w", name, err)
 			}
-			r.log.Info("reconcile: attached policer-classify", "iface", name,
-				"swifindex", sw, "ip4table", ip4Head, "ip6table", ip6Head)
 		}
+		if c6 != ip6Head {
+			ip6, add := ip6Head, true
+			if ip6Head == vpp.NoTable {
+				ip6, add = c6, false // pool gone for v6: detach the currently-bound chain
+			}
+			if err := cl.SetPolicerInterface(sw, vpp.NoTable, ip6, add); err != nil {
+				return changed, fmt.Errorf("agent: bindings: %s ip6: %w", name, err)
+			}
+		}
+		r.log.Info("reconcile: set policer-classify", "iface", name,
+			"swifindex", sw, "ip4table", ip4Head, "ip6table", ip6Head)
 		changed++
 	}
 	return changed, nil
