@@ -198,3 +198,41 @@ func TestFallbackOnDialFailure(t *testing.T) {
 	// up back on a working endpoint (boot:1) rather than stuck.
 	waitFor(t, func() bool { return d.CurrentEndpoint() == "boot:1" }, "stay/return to a reachable endpoint")
 }
+
+// TestReturnsToRecoveredPrimary proves the periodic return-to-primary: the primary is down
+// when the agent homes (so it parks on a fallback), then the primary recovers — and the
+// agent migrates back to it with NO external event (no REHOME, no disconnect), driven solely
+// by the rehomeRetry timer. This is the coverer-recovery case where a REHOME raced the
+// coverer's agent-facing readiness and the agent fell back.
+func TestReturnsToRecoveredPrimary(t *testing.T) {
+	var mu sync.Mutex
+	primaryUp := false // p:1 starts DOWN (dial fails)
+	dial := func(endpoint string, onCov grpcclient.CovererFunc) (Conn, error) {
+		if endpoint == "p:1" {
+			mu.Lock()
+			up := primaryUp
+			mu.Unlock()
+			if !up {
+				return nil, context.DeadlineExceeded
+			}
+		}
+		return &fakeConn{endpoint: endpoint, onCov: onCov,
+			assignOn: func(string) (model.CovererAssignment, bool) {
+				return assign("p:1", "boot:1"), true // primary p:1, fallback boot:1
+			}}, nil
+	}
+	d := New([]string{"boot:1"}, 1, dial,
+		WithBackoff(5*time.Millisecond),
+		WithRehomeRetry(25*time.Millisecond)) // short retry for the test
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go d.Run(ctx)
+
+	// Primary down -> parks on the fallback.
+	waitFor(t, func() bool { return d.CurrentEndpoint() == "boot:1" }, "park on fallback while primary down")
+	// Primary recovers; the timer must auto-migrate the agent back onto it.
+	mu.Lock()
+	primaryUp = true
+	mu.Unlock()
+	waitFor(t, func() bool { return d.CurrentEndpoint() == "p:1" }, "auto-return to recovered primary")
+}

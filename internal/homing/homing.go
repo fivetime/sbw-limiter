@@ -48,11 +48,12 @@ type DialFunc func(endpoint string, onCoverers grpcclient.CovererFunc) (Conn, er
 // Director maintains the agent's connection to its primary coverer, re-homing on
 // REHOME and falling back to other coverers/bootstrap endpoints on failure.
 type Director struct {
-	bootstrap []string
-	capacity  uint64
-	dial      DialFunc
-	backoff   time.Duration
-	log       logger
+	bootstrap   []string
+	capacity    uint64
+	dial        DialFunc
+	backoff     time.Duration
+	rehomeRetry time.Duration
+	log         logger
 
 	mu          sync.Mutex
 	cur         Conn
@@ -80,6 +81,14 @@ type Option func(*Director)
 // WithBackoff sets the reconnect backoff (default 1s).
 func WithBackoff(d time.Duration) Option { return func(dir *Director) { dir.backoff = d } }
 
+// WithRehomeRetry sets how often an agent parked on a FALLBACK retries its primary (default
+// 30s). The retry covers the case where the primary was unreachable when we homed (e.g. a
+// coverer restarting: its Watch reconnects to the server — which REHOMEs us toward it —
+// before its agent-facing service is ready, so our switch fails and we fall back), and
+// nothing else would retry it while the fallback subscription stays up. Rate-limited so a
+// genuinely-down primary does not thrash.
+func WithRehomeRetry(d time.Duration) Option { return func(dir *Director) { dir.rehomeRetry = d } }
+
 // WithLogger sets the logger.
 func WithLogger(l logger) Option { return func(dir *Director) { dir.log = l } }
 
@@ -88,11 +97,12 @@ func WithLogger(l logger) Option { return func(dir *Director) { dir.log = l } }
 // at each Register.
 func New(bootstrap []string, capacityBps uint64, dial DialFunc, opts ...Option) *Director {
 	d := &Director{
-		bootstrap: bootstrap,
-		capacity:  capacityBps,
-		dial:      dial,
-		backoff:   time.Second,
-		log:       nopLogger{},
+		bootstrap:   bootstrap,
+		capacity:    capacityBps,
+		dial:        dial,
+		backoff:     time.Second,
+		rehomeRetry: 30 * time.Second,
+		log:         nopLogger{},
 	}
 	for _, o := range opts {
 		o(d)
@@ -177,10 +187,13 @@ func (d *Director) Run(ctx context.Context) {
 			continue // reconnect to the primary now (no backoff — directed)
 		}
 
-		// Subscribe pass, cancelable so a REHOME mid-stream forces a re-home.
+		// Subscribe pass, cancelable so a REHOME mid-stream (or the return-to-primary timer)
+		// forces a re-home.
 		passCtx, cancel := context.WithCancel(ctx)
 		d.setCancel(cancel)
+		stopRetry := d.scheduleReturnToPrimary(target)
 		_ = c.SubscribePass(passCtx)
+		stopRetry()
 		d.setCancel(nil)
 		cancel()
 		d.closeCurrent()
@@ -220,6 +233,36 @@ func (d *Director) setCancel(fn context.CancelFunc) {
 	d.mu.Lock()
 	d.cancelPass = fn
 	d.mu.Unlock()
+}
+
+// scheduleReturnToPrimary, while the agent is parked on a NON-primary endpoint (target !=
+// primary — a fallback we rolled to because the primary was unreachable when we homed),
+// arms a one-shot timer that forces a fresh attempt to return to the primary after
+// rehomeRetry. Nothing else retries the primary while a fallback subscription stays up, so
+// without this a transient primary outage (e.g. a coverer restart racing the REHOME) strands
+// the agent on its fallback indefinitely. Returns a stop func to call when the pass ends.
+// No-op when already on the primary or no primary is known. The fire re-checks under the
+// lock that we are still off the primary, then sets the directed re-home + cancels the pass
+// (reusing the REHOME mid-stream mechanism); the Run loop then reconnects to the primary.
+func (d *Director) scheduleReturnToPrimary(target string) func() {
+	d.mu.Lock()
+	p, ok := d.assignment.Primary()
+	d.mu.Unlock()
+	if !ok || p.GRPCEndpoint == "" || p.GRPCEndpoint == target {
+		return func() {}
+	}
+	t := time.AfterFunc(d.rehomeRetry, func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		pp, ok := d.assignment.Primary()
+		if ok && pp.GRPCEndpoint != "" && pp.GRPCEndpoint != d.curEndpoint {
+			d.rehomeTo = pp.GRPCEndpoint
+			if d.cancelPass != nil {
+				d.cancelPass()
+			}
+		}
+	})
+	return func() { t.Stop() }
 }
 
 func (d *Director) takeRehome() string {
