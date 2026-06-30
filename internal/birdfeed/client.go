@@ -55,7 +55,7 @@ func (c *Client) flush() error {
 
 func (c *Client) close() {
 	if c.conn != nil {
-		c.conn.Close()
+		_ = c.conn.Close()
 	}
 	c.conn = nil
 	c.w = nil
