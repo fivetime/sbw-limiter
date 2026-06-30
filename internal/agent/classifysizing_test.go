@@ -5,13 +5,13 @@ import "testing"
 func TestClassifyTableSizing(t *testing.T) {
 	const GiB = 1 << 30
 	tests := []struct {
-		name       string
-		members    uint32
-		memPct     float64
-		budget     uint64
-		wantNb     uint32 // 0 = don't assert
-		minMem     uint32 // memorySize must be >= this
-		maxMem     uint32 // memorySize must be <= this (0 = skip)
+		name    string
+		members uint32
+		memPct  float64
+		budget  uint64
+		wantNb  uint32 // 0 = don't assert
+		minMem  uint32 // memorySize must be >= this
+		maxMem  uint32 // memorySize must be <= this (0 = skip)
 	}{
 		{name: "explicit members wins over pct", members: 1_000_000, memPct: 50, budget: 4 * GiB,
 			wantNb: 1 << 20 /*1,048,576 = nextPow2(1M), under 2M cap*/, minMem: 128 << 20},

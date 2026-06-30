@@ -36,10 +36,10 @@ const (
 	// (the only upfront cost) is bounded by classifyMaxBuckets.
 	defaultClassifyMemPct = 2.0
 	// floors/caps.
-	classifyMinMembers = 3000      // never below the legacy capacity
-	classifyMinBuckets = 4096      // VPP-friendly minimum
-	classifyMaxBuckets = 2 << 20   // 2M: caps upfront bucket array (~16MB/table)
-	classifyMinMem     = 16 << 20  // 16 MiB floor (legacy default)
+	classifyMinMembers = 3000       // never below the legacy capacity
+	classifyMinBuckets = 4096       // VPP-friendly minimum
+	classifyMaxBuckets = 2 << 20    // 2M: caps upfront bucket array (~16MB/table)
+	classifyMinMem     = 16 << 20   // 16 MiB floor (legacy default)
 	classifyMaxMem     = 0xE0000000 // ~3.5 GiB: memory_size is u32 in the VPP API
 )
 
@@ -95,7 +95,7 @@ func memoryBudget() uint64 {
 	phys := procMemTotalBytes()
 	budget := phys
 	for _, p := range []string{
-		"/sys/fs/cgroup/memory.max",                  // cgroup v2
+		"/sys/fs/cgroup/memory.max",                   // cgroup v2
 		"/sys/fs/cgroup/memory/memory.limit_in_bytes", // cgroup v1
 	} {
 		if v, ok := readCgroupLimit(p); ok && v < budget {
