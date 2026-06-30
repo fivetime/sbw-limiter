@@ -30,6 +30,10 @@ type Config struct {
 	TLSCAFile string
 	// TLSInsecureSkipVerify disables broker cert verification (test only).
 	TLSInsecureSkipVerify bool
+	// Plaintext disables SASL + TLS entirely for dev/lab brokers that speak plain
+	// Kafka with no auth (e.g. a Redpanda dev-container). Production leaves this
+	// false → SASL_SSL. When true, Username/Password/Mechanism/TLS* are ignored.
+	Plaintext bool
 }
 
 // Sink is an agent.MeteringSink backed by a Kafka producer.
@@ -47,31 +51,35 @@ func New(cfg Config) (*Sink, error) {
 	if len(cfg.Brokers) == 0 || cfg.Topic == "" {
 		return nil, fmt.Errorf("kafkasink: brokers and topic required")
 	}
-	auth := scram.Auth{User: cfg.Username, Pass: cfg.Password}
-	var mech = auth.AsSha256Mechanism()
-	if cfg.Mechanism == "SCRAM-SHA-512" {
-		mech = auth.AsSha512Mechanism()
-	}
-
-	tlsCfg := &tls.Config{InsecureSkipVerify: cfg.TLSInsecureSkipVerify} //nolint:gosec // gated by config
-	if cfg.TLSCAFile != "" {
-		pem, err := os.ReadFile(cfg.TLSCAFile)
-		if err != nil {
-			return nil, fmt.Errorf("kafkasink: read CA %s: %w", cfg.TLSCAFile, err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("kafkasink: CA %s has no usable certificate", cfg.TLSCAFile)
-		}
-		tlsCfg.RootCAs = pool
-	}
-
-	cl, err := kgo.NewClient(
+	opts := []kgo.Opt{
 		kgo.SeedBrokers(cfg.Brokers...),
 		kgo.DefaultProduceTopic(cfg.Topic),
-		kgo.SASL(mech),
-		kgo.DialTLSConfig(tlsCfg),
-	)
+	}
+
+	// Plaintext (dev/lab): plain Kafka, no SASL, no TLS. Otherwise SASL_SSL.
+	if !cfg.Plaintext {
+		auth := scram.Auth{User: cfg.Username, Pass: cfg.Password}
+		var mech = auth.AsSha256Mechanism()
+		if cfg.Mechanism == "SCRAM-SHA-512" {
+			mech = auth.AsSha512Mechanism()
+		}
+
+		tlsCfg := &tls.Config{InsecureSkipVerify: cfg.TLSInsecureSkipVerify} //nolint:gosec // gated by config
+		if cfg.TLSCAFile != "" {
+			pem, err := os.ReadFile(cfg.TLSCAFile)
+			if err != nil {
+				return nil, fmt.Errorf("kafkasink: read CA %s: %w", cfg.TLSCAFile, err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pem) {
+				return nil, fmt.Errorf("kafkasink: CA %s has no usable certificate", cfg.TLSCAFile)
+			}
+			tlsCfg.RootCAs = pool
+		}
+		opts = append(opts, kgo.SASL(mech), kgo.DialTLSConfig(tlsCfg))
+	}
+
+	cl, err := kgo.NewClient(opts...)
 	if err != nil {
 		return nil, fmt.Errorf("kafkasink: new client: %w", err)
 	}

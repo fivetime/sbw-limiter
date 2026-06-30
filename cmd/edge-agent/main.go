@@ -345,6 +345,7 @@ func main() {
 			Brokers: cfg.KafkaBrokers, Topic: cfg.KafkaTopic,
 			Username: cfg.KafkaSASLUser, Password: cfg.KafkaSASLPass, Mechanism: cfg.KafkaSASLMech,
 			TLSCAFile: cfg.KafkaTLSCAFile, TLSInsecureSkipVerify: cfg.KafkaTLSInsecure,
+			Plaintext: cfg.KafkaPlaintext,
 		}); err != nil {
 			log.Error("metering disabled: kafka sink init failed", "err", err)
 			_ = statsReader.Close()

@@ -83,6 +83,7 @@ type Config struct {
 	KafkaSASLMech    string          `json:"kafka_sasl_mechanism"` // default SCRAM-SHA-256
 	KafkaTLSCAFile   string          `json:"kafka_tls_ca_file"`
 	KafkaTLSInsecure bool            `json:"kafka_tls_insecure"` // test only
+	KafkaPlaintext   bool            `json:"kafka_plaintext"`    // dev/lab: no SASL, no TLS (plain Kafka)
 }
 
 // DefaultConfig returns the edge-agent defaults from DESIGN.md §4/§5/§7.
@@ -187,6 +188,11 @@ func (c *Config) applyEnv() error {
 		return err
 	}
 	c.KafkaTLSInsecure = ti
+	pt, err := config.Bool("METERING_PLAINTEXT", c.KafkaPlaintext)
+	if err != nil {
+		return err
+	}
+	c.KafkaPlaintext = pt
 	return nil
 }
 
