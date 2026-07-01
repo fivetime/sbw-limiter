@@ -18,8 +18,8 @@ import (
 
 func discardLogger() *slog.Logger { return slog.New(slog.DiscardHandler) }
 
-// fakeServer is a minimal controller for client tests (the real one lives in
-// sbw-controller, a different module).
+// fakeServer is a minimal AgentService for client tests (the real one is served by
+// sbw-coverer, a different module).
 type fakeServer struct {
 	rpc.UnimplementedAgentServiceServer
 	mu       sync.Mutex

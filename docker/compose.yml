@@ -1,8 +1,8 @@
 # Local smoke: VPP + edge-agent co-located (sharing /run/vpp). Shows the agent
 # image connecting to VPP over the api.sock — the "same node, shared socket"
-# deployment model (NOT image inheritance). The agent then dials the controller
-# (set CONTROLLER_ENDPOINTS to a running sbw-controller); without it the agent just
-# keeps retrying, which is the correct fail-static behaviour.
+# deployment model (NOT image inheritance). The agent then dials the coverer's
+# agent-facing AgentService (set CONTROLLER_ENDPOINTS to a running sbw-coverer); without
+# it the agent just keeps retrying, which is the correct fail-static behaviour.
 #
 #   CONTROLLER_ENDPOINTS=host.docker.internal:1791 docker compose up --build
 #
@@ -44,7 +44,7 @@ services:
       BWPOOL_CAPACITY_BPS: "1000000000"
       BWPOOL_REPORT_INTERVAL: 2s
       BWPOOL_LOG_FORMAT: text
-      # point at a running controller (e.g. the sbw-controller compose on the host)
+      # point at a running coverer (e.g. the sbw-coverer AgentService on the host)
       BWPOOL_CONTROLLER_ENDPOINTS: ${CONTROLLER_ENDPOINTS:-host.docker.internal:1791}
     extra_hosts:
       - "host.docker.internal:host-gateway"
