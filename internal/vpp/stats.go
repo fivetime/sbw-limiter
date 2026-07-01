@@ -3,9 +3,12 @@ package vpp
 import (
 	"fmt"
 	"strings"
+	"sync"
 
 	"go.fd.io/govpp/adapter"
 	"go.fd.io/govpp/adapter/statsclient"
+	govppapi "go.fd.io/govpp/api"
+	govppcore "go.fd.io/govpp/core"
 )
 
 // PolicerCounters is one policer's cumulative conform/exceed/violate combined
@@ -28,32 +31,121 @@ const (
 // StatsReader reads the VPP stats segment over its own socket connection
 // (separate from the binary-API connection — the stats segment is shared memory,
 // not the API). Read-only and non-destructive: reading never resets a counter.
+//
+// It exposes two layers: ReadPolicers uses the RAW adapter (index-keyed policer
+// vectors the high-level API does not surface), while ReadInterfaceStats /
+// ReadErrorStats use govpp's high-level StatsConnection (per-interface drop counters
+// and per-node drop-reason counters, §4.2.2). Both share the one connected adapter, so
+// all reads are serialized by mu (the metering loop and the loss loop may both read).
 type StatsReader struct {
-	client adapter.StatsAPI
+	mu     sync.Mutex
+	client adapter.StatsAPI           // raw, for the index-keyed policer dump
+	conn   *govppcore.StatsConnection // high-level, for interface / error stats
 }
 
 // NewStatsReader connects to the VPP stats segment at socketPath (e.g.
 // /run/vpp/stats.sock).
 func NewStatsReader(socketPath string) (*StatsReader, error) {
 	c := statsclient.NewStatsClient(socketPath)
-	if err := c.Connect(); err != nil {
+	conn, err := govppcore.ConnectStats(c) // connects the adapter (do not Connect() twice)
+	if err != nil {
 		return nil, fmt.Errorf("vpp: stats connect %s: %w", socketPath, err)
 	}
-	return &StatsReader{client: c}, nil
+	return &StatsReader{client: c, conn: conn}, nil
 }
 
 // Close disconnects from the stats segment.
 func (s *StatsReader) Close() error {
-	if s.client == nil {
-		return nil
+	if s.conn != nil {
+		s.conn.Disconnect() // disconnects the underlying stats socket
 	}
-	return s.client.Disconnect()
+	return nil
+}
+
+// InterfaceStats is one interface's cumulative rx/tx + error/drop counters from the
+// stats segment (§4.2.2 node/interface-level backstop + a coarse drop-count source).
+type InterfaceStats struct {
+	SwIfIndex          uint32
+	Name               string
+	RxPackets, RxBytes uint64
+	TxPackets, TxBytes uint64
+	Drops              uint64
+	RxErrors           uint64
+	RxMiss             uint64
+	RxNoBuf            uint64
+	Punts              uint64
+}
+
+// ErrorStat is one VPP node/reason drop-cause counter, summed over worker threads.
+// Name is "<node>/<reason>" (e.g. "ip4-input/ip4 no route"); Count is the cumulative
+// hit count. The §4.2.5 MemberLoss.TopDropReason picks the dominant one.
+type ErrorStat struct {
+	Name  string
+	Count uint64
+}
+
+// ReadInterfaceStats returns per-interface counters (keyed nowhere; caller maps by
+// SwIfIndex/Name). Summed across worker threads by govpp.
+func (s *StatsReader) ReadInterfaceStats() ([]InterfaceStats, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var is govppapi.InterfaceStats
+	if err := s.conn.GetInterfaceStats(&is); err != nil {
+		return nil, fmt.Errorf("vpp: get interface stats: %w", err)
+	}
+	return foldInterfaceStats(is), nil
+}
+
+// ReadErrorStats returns every NON-ZERO node/reason drop counter (the full set is huge
+// and mostly idle). Summed across worker threads.
+func (s *StatsReader) ReadErrorStats() ([]ErrorStat, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var es govppapi.ErrorStats
+	if err := s.conn.GetErrorStats(&es); err != nil {
+		return nil, fmt.Errorf("vpp: get error stats: %w", err)
+	}
+	return foldErrorStats(es), nil
+}
+
+// foldInterfaceStats projects govpp's InterfaceStats onto the local struct (pure).
+func foldInterfaceStats(is govppapi.InterfaceStats) []InterfaceStats {
+	out := make([]InterfaceStats, 0, len(is.Interfaces))
+	for _, c := range is.Interfaces {
+		out = append(out, InterfaceStats{
+			SwIfIndex: c.InterfaceIndex, Name: c.InterfaceName,
+			RxPackets: c.Rx.Packets, RxBytes: c.Rx.Bytes,
+			TxPackets: c.Tx.Packets, TxBytes: c.Tx.Bytes,
+			Drops: c.Drops, RxErrors: c.RxErrors, RxMiss: c.RxMiss,
+			RxNoBuf: c.RxNoBuf, Punts: c.Punts,
+		})
+	}
+	return out
+}
+
+// foldErrorStats sums each error counter's per-thread values and drops the idle ones
+// (Count==0), so the caller sees only reasons that actually fired (pure).
+func foldErrorStats(es govppapi.ErrorStats) []ErrorStat {
+	out := make([]ErrorStat, 0, len(es.Errors))
+	for _, e := range es.Errors {
+		var sum uint64
+		for _, v := range e.Values {
+			sum += v
+		}
+		if sum == 0 {
+			continue
+		}
+		out = append(out, ErrorStat{Name: e.CounterName, Count: sum})
+	}
+	return out
 }
 
 // ReadPolicers returns the current cumulative counters per VPP policer index.
 // Indexes with no policer report zero; the caller filters to managed policers via
 // the name→index map. Counters are summed over all worker threads.
 func (s *StatsReader) ReadPolicers() (map[uint32]PolicerCounters, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	entries, err := s.client.DumpStats(statPolicerConform, statPolicerExceed, statPolicerViolate)
 	if err != nil {
 		return nil, fmt.Errorf("vpp: dump policer stats: %w", err)
