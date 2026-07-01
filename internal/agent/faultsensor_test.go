@@ -179,3 +179,20 @@ func TestForwardingProbeHealthyNone(t *testing.T) {
 		t.Fatalf("healthy probe = %v, want none", fk)
 	}
 }
+
+// A dump failure must NOT mask a probe-confirmed ③ (a wedged main thread that also
+// black-holes forwarding is exactly what we want to catch, not swallow).
+func TestDumpErrorDoesNotMaskForwardingBroken(t *testing.T) {
+	s := discardSensor(func() bool { return true }, func() ([]vpp.Interface, error) {
+		return nil, errors.New("dump timeout (wedged main thread)")
+	}, "host-macc")
+	s.broken = func() bool { return true }
+	if fk, _ := s.Fault(); fk != model.FaultForwardingBroken {
+		t.Fatalf("dump error must not mask probe-confirmed ③, got %v", fk)
+	}
+	// But a dump error with NO probe verdict stays undetermined (FaultNone).
+	s.broken = func() bool { return false }
+	if fk, _ := s.Fault(); fk != model.FaultNone {
+		t.Fatalf("dump error without a broken probe = %v, want none", fk)
+	}
+}

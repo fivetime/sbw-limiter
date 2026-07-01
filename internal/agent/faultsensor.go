@@ -3,11 +3,17 @@ package agent
 import (
 	"log/slog"
 	"strings"
+	"time"
 
 	"github.com/fivetime/sbw-contract/model"
 
 	"github.com/fivetime/sbw-limiter/internal/vpp"
 )
+
+// dumpTimeout bounds the report-time sw_interface_dump so a wedged/slow VPP main thread
+// cannot block the report goroutine (Fault runs on Reporter.Build). A dump that exceeds
+// it is treated as "undetermined link state", NOT a stall of the whole report path.
+const dumpTimeout = 2 * time.Second
 
 // FaultSensor types the edge's data-plane fault kind (DESIGN-liveness §4.2.3) from
 // LIVE signals, independent of the slow reconcile pass, so a DETERMINATE fault reaches
@@ -57,6 +63,7 @@ func NewFaultSensor(conn *vpp.Conn, policerIfaces []string, broken func() bool, 
 				return nil, err
 			}
 			defer ch.Close()
+			ch.SetReplyTimeout(dumpTimeout) // never block the report path on a wedged main thread
 			return vpp.NewInterfaces(ch).List()
 		},
 		policerIfaces: policerIfaces,
@@ -73,11 +80,17 @@ func (s *FaultSensor) Fault() (model.FaultKind, string) {
 	}
 	list, err := s.dumpIfaces()
 	if err != nil {
-		// Raced down between the health check and the dump, or a transient channel
-		// error. If the connection is now down it IS vpp-gone; otherwise leave the fault
-		// untyped (the reconcile pass will classify it) rather than guess.
+		// Raced down between the health check and the dump, or a slow/wedged main thread
+		// timed the dump out. If the connection is now down it IS vpp-gone.
 		if !s.healthy() {
 			return model.FaultVPPGone, "vpp control link down (dump failed)"
+		}
+		// VPP is up but we couldn't read link state. A dump failure must NOT MASK a
+		// probe-confirmed ③ — the forwarding probe is authoritative for forwarding-broken
+		// and does not depend on the dump; report it (a wedged main thread that also
+		// black-holes forwarding is exactly a case we want to catch, not swallow).
+		if s.broken != nil && s.broken() {
+			return model.FaultForwardingBroken, "forwarding probe: path black-holed (interface dump unavailable)"
 		}
 		s.log.Warn("fault sensor: interface dump failed; not typing the fault", "err", err)
 		return model.FaultNone, ""
