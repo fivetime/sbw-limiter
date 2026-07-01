@@ -63,7 +63,8 @@ func (s *StatsReader) Close() error {
 }
 
 // InterfaceStats is one interface's cumulative rx/tx + error/drop counters from the
-// stats segment (§4.2.2 node/interface-level backstop + a coarse drop-count source).
+// stats segment — the §4.2.6 device-level drop backstop (a wedged worker → all
+// interfaces' Drops/RxMiss spike) and corroboration for the §4.2 forwarding probe.
 type InterfaceStats struct {
 	SwIfIndex          uint32
 	Name               string
@@ -78,7 +79,8 @@ type InterfaceStats struct {
 
 // ErrorStat is one VPP node/reason drop-cause counter, summed over worker threads.
 // Name is "<node>/<reason>" (e.g. "ip4-input/ip4 no route"); Count is the cumulative
-// hit count. The §4.2.5 MemberLoss.TopDropReason picks the dominant one.
+// hit count — the drop-CAUSE the §4.2 forwarding-health story reads (a rising
+// "ip4 no route" is forwarding breakage, distinct from policer / congestion drops).
 type ErrorStat struct {
 	Name  string
 	Count uint64
