@@ -127,9 +127,7 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	// trusts the report on that healthDead signal alone and routes it to its fast
 	// debounce (§4.2.4). FaultNone leaves the reconcile classification untouched.
 	if r.fault != nil {
-		fk, reason := r.fault.Fault()
-		r.log.Info("TRACE-BUILD sensor verdict", "edge", r.edgeID, "fault", fk, "reason", reason)
-		if fk != model.FaultNone {
+		if fk, reason := r.fault.Fault(); fk != model.FaultNone {
 			rep.Health.FaultKind = fk
 			rep.Health.State = model.HealthDataPlaneDown
 			if reason != "" {
