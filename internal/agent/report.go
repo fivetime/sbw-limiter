@@ -39,6 +39,12 @@ type CapacityFunc func() model.CapacityReport
 // MeteringFunc reports per-pool policer accounting (T-1001). nil → no metering.
 type MeteringFunc func() []model.PoolMetering
 
+// MemberLossFunc reports the §4.2.5 per-member forwarding-loss vector for the current
+// window (only members over the agent watermark). nil → the report carries no
+// MemberLoss (the feature is off / flowprobe not wired). The server holds the
+// alert/migrate thresholds.
+type MemberLossFunc func() []model.MemberLoss
+
 // FaultSource types the edge's data-plane fault kind LIVE (DESIGN-liveness §4.2.3),
 // consulted at report-build time so a determinate fault (vpp-gone / link-down) reaches
 // the controller within one report interval, not one (slower) reconcile interval.
@@ -62,6 +68,7 @@ type Reporter struct {
 	health   HealthSource
 	capacity CapacityFunc
 	metering MeteringFunc
+	loss     MemberLossFunc
 	poolHash PoolHashFunc
 	fault    FaultSource
 	now      func() int64
@@ -76,6 +83,11 @@ func WithCapacity(fn CapacityFunc) ReporterOption { return func(r *Reporter) { r
 
 // WithMetering wires the per-pool metering source (T-1001).
 func WithMetering(fn MeteringFunc) ReporterOption { return func(r *Reporter) { r.metering = fn } }
+
+// WithMemberLoss wires the §4.2.5 per-member forwarding-loss source: Build stamps its
+// vector into the report's health so the server's loss policy (alert / per-pool
+// migrate) sees it. nil = no member-loss reporting.
+func WithMemberLoss(fn MemberLossFunc) ReporterOption { return func(r *Reporter) { r.loss = fn } }
 
 // WithPoolHash wires the installed pool-set hash source (reconciler.InstalledPoolHash):
 // the report carries it so the controller can detect drift and resync.
@@ -140,6 +152,12 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	}
 	if r.metering != nil {
 		rep.Metering = r.metering()
+	}
+	// §4.2.5 per-member loss: stamp the current window's vector into the health section
+	// (the fault overlay above handles the edge-level fault_kind; this is the orthogonal
+	// per-member forwarding-quality signal). Empty/nil → the key is omitted (omitempty).
+	if r.loss != nil {
+		rep.Health.MemberLoss = r.loss()
 	}
 	if r.poolHash != nil {
 		rep.InstalledPoolHash = r.poolHash()
