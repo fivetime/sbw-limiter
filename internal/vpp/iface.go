@@ -24,7 +24,8 @@ func NewInterfaces(ch govppapi.Channel) *Interfaces { return &Interfaces{ch: ch}
 type Interface struct {
 	Name      string
 	SwIfIndex uint32
-	Up        bool
+	Up        bool // ADMIN_UP (operator intent): the interface is administratively enabled
+	LinkUp    bool // LINK_UP (physical carrier): the link is actually up (cable in, peer up)
 }
 
 // List dumps all interfaces.
@@ -44,13 +45,19 @@ func (i *Interfaces) List() ([]Interface, error) {
 			Name:      d.InterfaceName,
 			SwIfIndex: uint32(d.SwIfIndex),
 			Up:        d.Flags&interfaceFlagAdminUp != 0,
+			LinkUp:    d.Flags&interfaceFlagLinkUp != 0,
 		})
 	}
 	return out, nil
 }
 
-// interfaceFlagAdminUp is IF_STATUS_API_FLAG_ADMIN_UP (bit 0).
-const interfaceFlagAdminUp = 1
+// interfaceFlagAdminUp / interfaceFlagLinkUp are IF_STATUS_API_FLAG_ADMIN_UP (bit 0) /
+// IF_STATUS_API_FLAG_LINK_UP (bit 1) — operator intent vs physical carrier. A pulled
+// cable / down peer clears LINK_UP while ADMIN_UP stays set (§4.2 fault ②).
+const (
+	interfaceFlagAdminUp = 1
+	interfaceFlagLinkUp  = 2
+)
 
 // IndexMap resolves several names at once, returning a name→index map. Missing
 // names are reported together.

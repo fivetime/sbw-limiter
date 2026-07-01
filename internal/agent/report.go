@@ -39,6 +39,15 @@ type CapacityFunc func() model.CapacityReport
 // MeteringFunc reports per-pool policer accounting (T-1001). nil → no metering.
 type MeteringFunc func() []model.PoolMetering
 
+// FaultSource types the edge's data-plane fault kind LIVE (DESIGN-liveness §4.2.3),
+// consulted at report-build time so a determinate fault (vpp-gone / link-down) reaches
+// the controller within one report interval, not one (slower) reconcile interval.
+// *FaultSensor satisfies it. nil → the report carries FaultNone (the reconcile-derived
+// classification stands unchanged).
+type FaultSource interface {
+	Fault() (model.FaultKind, string)
+}
+
 // PoolHashFunc reports the hash of the pool-set the agent currently has
 // materialized in its data plane (model.PoolSetHash over the installed pool ids).
 // *Reconciler.InstalledPoolHash satisfies it. The controller compares this against
@@ -54,6 +63,7 @@ type Reporter struct {
 	capacity CapacityFunc
 	metering MeteringFunc
 	poolHash PoolHashFunc
+	fault    FaultSource
 	now      func() int64
 	log      *slog.Logger
 }
@@ -70,6 +80,10 @@ func WithMetering(fn MeteringFunc) ReporterOption { return func(r *Reporter) { r
 // WithPoolHash wires the installed pool-set hash source (reconciler.InstalledPoolHash):
 // the report carries it so the controller can detect drift and resync.
 func WithPoolHash(fn PoolHashFunc) ReporterOption { return func(r *Reporter) { r.poolHash = fn } }
+
+// WithFault wires the live fault-kind sensor (§4.2.3): Build overlays its verdict onto
+// the report so a determinate fault is typed + surfaced within one report interval.
+func WithFault(fn FaultSource) ReporterOption { return func(r *Reporter) { r.fault = fn } }
 
 // WithReporterClock overrides the timestamp source (tests).
 func WithReporterClock(now func() int64) ReporterOption { return func(r *Reporter) { r.now = now } }
@@ -106,6 +120,20 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 		Generation:       h.GenerationApplied,
 		ReportedAtUnixMs: r.now(),
 		Health:           h,
+	}
+	// §4.2.3 live fault typing: overlay the sensor's verdict onto the (possibly stale)
+	// reconcile-derived health. A DETERMINATE fault (vpp-gone / link-down) also forces
+	// State=DataPlaneDown so SoftDead() is true — the server's typed-fault dataDead()
+	// trusts the report on that healthDead signal alone and routes it to its fast
+	// debounce (§4.2.4). FaultNone leaves the reconcile classification untouched.
+	if r.fault != nil {
+		if fk, reason := r.fault.Fault(); fk != model.FaultNone {
+			rep.Health.FaultKind = fk
+			rep.Health.State = model.HealthDataPlaneDown
+			if reason != "" {
+				rep.Health.Reason = reason
+			}
+		}
 	}
 	if r.capacity != nil {
 		rep.Capacity = r.capacity()

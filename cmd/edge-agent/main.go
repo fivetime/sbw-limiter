@@ -131,6 +131,11 @@ func main() {
 		// set to detect drift and trigger a full DESIRED_STATE resync (the
 		// report-driven backstop to the controller-driven delta hot path).
 		agent.WithPoolHash(recon.InstalledPoolHash),
+		// §4.2.3 live fault typing: co-located with VPP, the agent types vpp-gone
+		// (api.sock EOF) / link-down (policer-interface carrier down) at report time so
+		// the server routes a DETERMINATE fault to its fast failover (§4.2.4) instead of
+		// the blanket soft-death debounce. Reuses the same policer-interface set.
+		agent.WithFault(agent.NewFaultSensor(conn, cfg.PolicerInterfaces, log)),
 		agent.WithReporterLogger(log),
 	)
 
