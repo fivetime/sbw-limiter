@@ -7,8 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"net/netip"
-
 	"github.com/fivetime/sbw-contract/model"
 )
 
@@ -156,28 +154,5 @@ func TestReporterRunSinkErrorIsNotFatal(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("loop stalled after sink error")
 		}
-	}
-}
-
-func TestReporterStampsMemberLoss(t *testing.T) {
-	hc := NewHealthChecker("l1", fakeLive{healthy: true}, WithClock(func() int64 { return 1 }))
-	hc.Observe(model.EdgeDesiredState{Generation: 3}, Result{}, nil)
-	want := []model.MemberLoss{{
-		Prefix: netip.MustParsePrefix("172.16.0.5/32"), Dir: model.DirectionIngress,
-		LossBps: 3200, TopDropReason: "ip4-input",
-	}}
-	r := NewReporter("l1", hc, WithMemberLoss(func() []model.MemberLoss { return want }))
-	rep, ok := r.Build()
-	if !ok {
-		t.Fatal("Build not ready")
-	}
-	if len(rep.Health.MemberLoss) != 1 || rep.Health.MemberLoss[0] != want[0] {
-		t.Fatalf("member loss not stamped: %+v", rep.Health.MemberLoss)
-	}
-	// A nil source leaves MemberLoss empty (feature off).
-	r2 := NewReporter("l1", hc)
-	rep2, _ := r2.Build()
-	if len(rep2.Health.MemberLoss) != 0 {
-		t.Fatalf("no source must leave MemberLoss empty, got %+v", rep2.Health.MemberLoss)
 	}
 }

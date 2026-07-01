@@ -24,13 +24,6 @@ const (
 	IEEgressInterface  = 14
 	IESrcIPv6          = 27
 	IEDstIPv6          = 28
-	IEFlowDirection    = 61 // 0 = ingress (rx observation), 1 = egress (tx observation)
-)
-
-// FlowDirection values for IEFlowDirection.
-const (
-	FlowRx = 0
-	FlowTx = 1
 )
 
 const (
