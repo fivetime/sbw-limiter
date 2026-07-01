@@ -34,13 +34,18 @@ type FaultSensor struct {
 	// reconcile attaches policer-classify to); a link-down on any of them breaks
 	// forwarding for this edge's members.
 	policerIfaces []string
-	log           *slog.Logger
+	// broken is the §4.2.7 device-level forwarding-probe verdict (③): true once the
+	// active probe has seen K consecutive black-holed rounds. nil → ③ disabled.
+	broken func() bool
+	log    *slog.Logger
 }
 
 // NewFaultSensor builds a sensor over a live VPP connection. policerIfaces is the
 // member/data interface set (cfg.PolicerInterfaces). Each Fault() call opens a
 // short-lived channel for the dump (only when the connection is healthy).
-func NewFaultSensor(conn *vpp.Conn, policerIfaces []string, log *slog.Logger) *FaultSensor {
+// NewFaultSensor builds a sensor over a live VPP connection. broken is the §4.2.7
+// forwarding-probe verdict (ForwardingProbe.Broken); nil disables the ③ path.
+func NewFaultSensor(conn *vpp.Conn, policerIfaces []string, broken func() bool, log *slog.Logger) *FaultSensor {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
@@ -55,6 +60,7 @@ func NewFaultSensor(conn *vpp.Conn, policerIfaces []string, log *slog.Logger) *F
 			return vpp.NewInterfaces(ch).List()
 		},
 		policerIfaces: policerIfaces,
+		broken:        broken,
 		log:           log,
 	}
 }
@@ -78,6 +84,13 @@ func (s *FaultSensor) Fault() (model.FaultKind, string) {
 	}
 	if down := linkDownAmong(list, s.policerIfaces); len(down) > 0 {
 		return model.FaultLinkDown, "link down on " + strings.Join(down, ",")
+	}
+	// ③ forwarding-broken (§4.2.7): VPP up + links up, but the active probe sees a
+	// silent black-hole. Ranked LAST — an unambiguous vpp-gone/link-down explains the
+	// probe failure and is preferred; only an otherwise-healthy edge that still can't
+	// forward is a genuine ③.
+	if s.broken != nil && s.broken() {
+		return model.FaultForwardingBroken, "forwarding probe: path black-holed (device up, not forwarding)"
 	}
 	return model.FaultNone, ""
 }

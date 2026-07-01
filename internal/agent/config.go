@@ -69,6 +69,16 @@ type Config struct {
 	CanaryPrefix  string `json:"canary_prefix"`  // /32 or /128
 	CanaryLC      string `json:"canary_lc"`      // "global:local1:local2"
 
+	// Forwarding probe (③ forwarding-broken, DESIGN-liveness §4.2.7): when
+	// ForwardingProbeTarget is set, the agent periodically pings it through VPP's data
+	// plane; ForwardingProbeFails consecutive no-reply rounds flip fault_kind to
+	// forwarding-broken (device up + links up, but a silent black-hole). Immune to the
+	// policer — a low-rate echo is far below any pool rate. Empty target disables ③.
+	ForwardingProbeTarget   string          `json:"forwarding_probe_target"`   // stable reachable next-hop (fabric gateway); empty = off
+	ForwardingProbeInterval config.Duration `json:"forwarding_probe_interval"` // 0 → 3s
+	ForwardingProbeFails    int             `json:"forwarding_probe_fails"`    // consecutive no-reply rounds → broken; 0 → 3
+	ForwardingProbeTimeout  config.Duration `json:"forwarding_probe_timeout"`  // per-round reply timeout (bounds a wedged main thread); 0 → 2s
+
 	// Metering export (T-1001): when MeteringEnable and the Kafka brokers/topic/
 	// creds are set, the agent reads VPP policer counters every MeteringInterval
 	// and pushes RAW CUMULATIVE samples to Kafka (→ ClickHouse → BSS). The system
@@ -101,6 +111,10 @@ func DefaultConfig() Config {
 		VPPStatsSocket:    "/run/vpp/stats.sock",
 		KafkaTopic:        "sbw.metering",
 		KafkaSASLMech:     "SCRAM-SHA-256",
+
+		ForwardingProbeInterval: config.Duration(3 * time.Second),
+		ForwardingProbeFails:    3,
+		ForwardingProbeTimeout:  config.Duration(2 * time.Second),
 	}
 }
 
@@ -193,6 +207,17 @@ func (c *Config) applyEnv() error {
 		return err
 	}
 	c.KafkaPlaintext = pt
+
+	c.ForwardingProbeTarget = config.String("FORWARDING_PROBE_TARGET", c.ForwardingProbeTarget)
+	if c.ForwardingProbeInterval, err = config.DurationEnv("FORWARDING_PROBE_INTERVAL", c.ForwardingProbeInterval); err != nil {
+		return err
+	}
+	if c.ForwardingProbeFails, err = config.Int("FORWARDING_PROBE_FAILS", c.ForwardingProbeFails); err != nil {
+		return err
+	}
+	if c.ForwardingProbeTimeout, err = config.DurationEnv("FORWARDING_PROBE_TIMEOUT", c.ForwardingProbeTimeout); err != nil {
+		return err
+	}
 	return nil
 }
 

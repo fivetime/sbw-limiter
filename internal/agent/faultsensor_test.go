@@ -19,6 +19,16 @@ func discardSensor(healthy func() bool, dump func() ([]vpp.Interface, error), if
 	}
 }
 
+func upList(names ...string) func() ([]vpp.Interface, error) {
+	return func() ([]vpp.Interface, error) {
+		out := make([]vpp.Interface, len(names))
+		for i, n := range names {
+			out[i] = vpp.Interface{Name: n, Up: true, LinkUp: true}
+		}
+		return out, nil
+	}
+}
+
 func TestLinkDownAmong(t *testing.T) {
 	list := []vpp.Interface{
 		{Name: "host-macc", Up: true, LinkUp: false},   // admin-up, carrier down → FAULT
@@ -137,5 +147,35 @@ func TestReporterFaultNoneLeavesHealthy(t *testing.T) {
 	rep, _ := r.Build()
 	if rep.Health.FaultKind != model.FaultNone || rep.Health.State != model.HealthHealthy {
 		t.Fatalf("FaultNone must not alter health: kind=%v state=%v", rep.Health.FaultKind, rep.Health.State)
+	}
+}
+
+// ③ forwarding-broken: VPP healthy + links up, but the probe reports the path broken.
+func TestFaultForwardingBroken(t *testing.T) {
+	s := discardSensor(func() bool { return true }, upList("host-macc"), "host-macc")
+	s.broken = func() bool { return true }
+	if fk, reason := s.Fault(); fk != model.FaultForwardingBroken || reason == "" {
+		t.Fatalf("healthy device + broken probe = %v, want forwarding-broken", fk)
+	}
+}
+
+// ③ is ranked LAST: an unambiguous link-down explains the probe failure and wins.
+func TestLinkDownOutranksForwardingBroken(t *testing.T) {
+	dump := func() ([]vpp.Interface, error) {
+		return []vpp.Interface{{Name: "host-macc", Up: true, LinkUp: false}}, nil
+	}
+	s := discardSensor(func() bool { return true }, dump, "host-macc")
+	s.broken = func() bool { return true }
+	if fk, _ := s.Fault(); fk != model.FaultLinkDown {
+		t.Fatalf("link-down must outrank forwarding-broken, got %v", fk)
+	}
+}
+
+// A healthy probe leaves the sensor at FaultNone.
+func TestForwardingProbeHealthyNone(t *testing.T) {
+	s := discardSensor(func() bool { return true }, upList("host-macc"), "host-macc")
+	s.broken = func() bool { return false }
+	if fk, _ := s.Fault(); fk != model.FaultNone {
+		t.Fatalf("healthy probe = %v, want none", fk)
 	}
 }

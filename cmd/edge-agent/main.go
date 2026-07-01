@@ -123,6 +123,24 @@ func main() {
 		met.RecordDesiredStatus(st.Frozen, st.Generation)
 	})
 
+	// ③ forwarding-broken (§4.2.7): device-level active probe — ping a stable next-hop
+	// through VPP's data plane; ForwardingProbeFails consecutive black-holed rounds →
+	// forwarding-broken. Immune to the policer (a low-rate echo is below any pool rate),
+	// so failure means a real black-hole, not rate-limiting. Disabled if no target set.
+	var probeBroken func() bool
+	if cfg.ForwardingProbeTarget != "" {
+		fp := agent.NewForwardingProbe(
+			func() (int, error) {
+				_, recv, err := conn.Ping(cfg.ForwardingProbeTarget, 3, 0.1, cfg.ForwardingProbeTimeout.Std())
+				return recv, err
+			},
+			cfg.ForwardingProbeInterval.Std(), cfg.ForwardingProbeFails, log)
+		go fp.Run(ctx)
+		probeBroken = fp.Broken
+		log.Info("forwarding probe enabled (§4.2.7 ③)", "target", cfg.ForwardingProbeTarget,
+			"interval", cfg.ForwardingProbeInterval.Std(), "fails", cfg.ForwardingProbeFails)
+	}
+
 	reporter := agent.NewReporter(model.EdgeID(cfg.EdgeID), health,
 		agent.WithCapacity(func() model.CapacityReport {
 			return model.CapacityReport{NICCapacityBps: cfg.CapacityBps}
@@ -132,10 +150,10 @@ func main() {
 		// report-driven backstop to the controller-driven delta hot path).
 		agent.WithPoolHash(recon.InstalledPoolHash),
 		// §4.2.3 live fault typing: co-located with VPP, the agent types vpp-gone
-		// (api.sock EOF) / link-down (policer-interface carrier down) at report time so
-		// the server routes a DETERMINATE fault to its fast failover (§4.2.4) instead of
-		// the blanket soft-death debounce. Reuses the same policer-interface set.
-		agent.WithFault(agent.NewFaultSensor(conn, cfg.PolicerInterfaces, log)),
+		// (api.sock EOF) / link-down (policer-interface carrier down) / forwarding-broken
+		// (③ probe verdict) at report time so the server routes a DETERMINATE fault to its
+		// fast failover (§4.2.4) instead of the blanket soft-death debounce.
+		agent.WithFault(agent.NewFaultSensor(conn, cfg.PolicerInterfaces, probeBroken, log)),
 		agent.WithReporterLogger(log),
 	)
 
