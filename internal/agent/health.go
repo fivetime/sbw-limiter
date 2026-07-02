@@ -73,6 +73,12 @@ type HealthChecker struct {
 	// drift; this just folds it into the unified report.
 	fibDrift func() int
 
+	// deltasDropped returns the reconciler's cumulative dropped-delta count (deltaQ
+	// overflow, DESIGN §9.1); nil is treated as 0. Folded into the report so the
+	// server emits a delivery-degraded BSS event on a rise. Wire to
+	// Reconciler.DeltasDropped.
+	deltasDropped func() uint64
+
 	// now is injectable for tests; defaults to time.Now().UnixMilli.
 	now func() int64
 
@@ -116,6 +122,13 @@ func WithClock(now func() int64) HealthOption {
 	return func(h *HealthChecker) { h.now = now }
 }
 
+// WithDeltasDropped wires the reconciler's cumulative dropped-delta counter into the
+// report (DESIGN §9.1); the server emits delivery-degraded on a rise. Wire to
+// Reconciler.DeltasDropped.
+func WithDeltasDropped(fn func() uint64) HealthOption {
+	return func(h *HealthChecker) { h.deltasDropped = fn }
+}
+
 // WithPhase wires the layered data-plane liveness tracker (§4.1): each Observe
 // feeds it the pass's apply progress (desired-actual pending + error) and stamps
 // the resulting phase into the report.
@@ -141,6 +154,9 @@ func (h *HealthChecker) Observe(desired model.EdgeDesiredState, res Result, reco
 		drift = h.fibDrift()
 	}
 	rep := Classify(h.edgeID, desired, h.live.Healthy(), res, reconcileErr, drift, h.now())
+	if h.deltasDropped != nil {
+		rep.DeltasDropped = h.deltasDropped()
+	}
 	if h.forced.Load() {
 		rep.State = model.HealthDataPlaneDown
 		rep.Reason = "forced data-plane-down (chaos/test hook, 6.13)"

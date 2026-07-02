@@ -108,7 +108,8 @@ func main() {
 	// loops freeze, which a probe misreads as a wedge (verify-proven); "worker really
 	// forwarding" can't be told passively (§4.1.6).
 	phaseTracker := agent.NewPhaseTracker(conn, log)
-	health := agent.NewHealthChecker(model.EdgeID(cfg.EdgeID), conn, agent.WithPhase(phaseTracker))
+	health := agent.NewHealthChecker(model.EdgeID(cfg.EdgeID), conn,
+		agent.WithPhase(phaseTracker), agent.WithDeltasDropped(recon.DeltasDropped))
 	recon.AddObserver(health.Observe) // reconcile result drives soft-death health (B-05)
 
 	// Observability (T-1003): the metrics observer runs AFTER health.Observe, so

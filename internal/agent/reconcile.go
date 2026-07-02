@@ -116,6 +116,13 @@ type Reconciler struct {
 	// loop drains and applies via onDelta. Buffered so a burst of pushes is not lost.
 	deltaQ chan model.EdgeDesiredDelta
 
+	// deltasDropped is the CUMULATIVE count of deltas SubmitDelta discarded because
+	// deltaQ was full (local back-pressure — the resync backstop re-delivers, but a
+	// rising count means this agent is saturated). Surfaced in the health report so
+	// the server emits a `delivery-degraded` BSS event on a rise (DESIGN §9.1). Bumped
+	// from the transport dispatch goroutine, read from the health goroutine → atomic.
+	deltasDropped atomic.Uint64
+
 	// onDelta applies one queued delta from the reconcile goroutine: gap-detect
 	// against lastGen, merge into the held desired state, and apply just the touched
 	// pools (wired by main to DesiredStore.Merge + ApplyDelta). On a gap it requests
@@ -221,10 +228,17 @@ func (r *Reconciler) SubmitDelta(d model.EdgeDesiredDelta) {
 	select {
 	case r.deltaQ <- d:
 	default:
+		r.deltasDropped.Add(1)
 		r.log.Warn("delta queue full; dropping (resync backstop will heal)",
-			"generation", d.Generation, "base", d.BaseGeneration)
+			"generation", d.Generation, "base", d.BaseGeneration,
+			"deltas_dropped", r.deltasDropped.Load())
 	}
 }
+
+// DeltasDropped returns the cumulative count of deltas dropped under deltaQ overflow
+// (see deltasDropped). The health builder reads it into HealthReport.DeltasDropped so
+// the server can emit a delivery-degraded BSS event on a rise (DESIGN §9.1).
+func (r *Reconciler) DeltasDropped() uint64 { return r.deltasDropped.Load() }
 
 // Reset drops in-memory caches that a VPP restart invalidates. The policer
 // name→index map is the only such state: after a restart VPP reassigns indexes
