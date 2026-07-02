@@ -47,8 +47,18 @@ func Classify(edgeID model.EdgeID, desired model.EdgeDesiredState, vppHealthy bo
 		rep.State = model.HealthDataPlaneDown
 		rep.Reason = "vpp control link down"
 	case reconcileErr != nil:
-		rep.State = model.HealthDataPlaneDown
-		rep.Reason = "reconcile failed: " + reconcileErr.Error()
+		// We only reach here with vppHealthy==true — the govpp connection is ALIVE
+		// (not EOF). So a reconcile error is "this pass could not complete" (a slow/
+		// timed-out dump under VPP load, or one op that failed), NOT a dead data plane:
+		// a truly gone VPP fails the connection (case 1), and a truly broken FORWARDING
+		// plane is caught by the active forwarding probe (§4.2.7) overlaid in the
+		// reporter — both unambiguous, latency-independent. Treating a slow dump as
+		// DataPlaneDown made an arbitrary dump timeout (2s) the death threshold and
+		// caused false soft-death flapping under lab churn. Classify it as DEGRADED
+		// (self-healing: the next pass retries; if it's a real persistent break the
+		// forwarding probe fires) — Degraded is NOT SoftDead(), so it triggers no failover.
+		rep.State = model.HealthDegraded
+		rep.Reason = "reconcile pass incomplete (vpp slow/transient, connection alive) — retrying: " + reconcileErr.Error()
 	case rep.RepairActions > 0:
 		rep.State = model.HealthDegraded
 		rep.Reason = "data-plane drift repaired locally (soft-death symptom)"

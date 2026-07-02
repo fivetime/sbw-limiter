@@ -40,7 +40,11 @@ func TestClassify(t *testing.T) {
 		{"drift repaired", true, repaired, nil, 0, model.HealthDegraded, false},
 		{"fib drift", true, clean, nil, 5, model.HealthDegraded, false},
 		{"vpp down", false, clean, nil, 0, model.HealthDataPlaneDown, true},
-		{"reconcile error", true, clean, errors.New("boom"), 0, model.HealthDataPlaneDown, true},
+		// A reconcile error while the connection is ALIVE (vppHealthy) is "this pass could not
+		// complete" (a slow/timed-out dump under load), NOT a dead data plane → self-healing
+		// Degraded (retry), NOT SoftDead. Real death is caught by the connection-EOF case +
+		// the active forwarding probe, latency-independent (§4.2.7).
+		{"reconcile error, conn alive = degraded retry", true, clean, errors.New("boom"), 0, model.HealthDegraded, false},
 		{"vpp down dominates drift", false, repaired, nil, 9, model.HealthDataPlaneDown, true},
 	}
 	for _, c := range cases {
