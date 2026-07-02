@@ -47,18 +47,7 @@ const (
 // from the explicit member capacity (members>0) or memPct of the memory budget.
 // Pure (budget injected) so it is unit-testable; classifyAutoSizing wires the live budget.
 func classifyTableSizing(members uint32, memPct float64, budget uint64) (nbuckets, memorySize uint32) {
-	capacity := uint64(members)
-	if capacity == 0 {
-		if memPct <= 0 {
-			memPct = defaultClassifyMemPct
-		}
-		if budget > 0 {
-			capacity = uint64(float64(budget)*memPct/100.0) / classifyPerEntryBytes
-		}
-	}
-	if capacity < classifyMinMembers {
-		capacity = classifyMinMembers
-	}
+	capacity := classifyCapacity(members, memPct, budget)
 
 	nb := nextPow2(capacity)
 	if nb < classifyMinBuckets {
@@ -80,12 +69,41 @@ func classifyTableSizing(members uint32, memPct float64, budget uint64) (nbucket
 	return
 }
 
+// classifyCapacity is the max members (≈ sessions) ONE classify mask table can hold
+// before its fixed heap fills — the explicit BWPOOL_CLASSIFY_MEMBERS, else memPct of the
+// memory budget, floored at the legacy minimum. This is the value both the table sizing
+// (nbuckets/memory) and the reported materialization SessionBudget derive from, so they
+// never disagree. Pure (budget injected) for testability.
+func classifyCapacity(members uint32, memPct float64, budget uint64) uint64 {
+	capacity := uint64(members)
+	if capacity == 0 {
+		if memPct <= 0 {
+			memPct = defaultClassifyMemPct
+		}
+		if budget > 0 {
+			capacity = uint64(float64(budget)*memPct/100.0) / classifyPerEntryBytes
+		}
+	}
+	if capacity < classifyMinMembers {
+		capacity = classifyMinMembers
+	}
+	return capacity
+}
+
 // classifyAutoSizing reads BWPOOL_CLASSIFY_MEMBERS / BWPOOL_CLASSIFY_MEM_PCT and the
 // live memory budget, returning the per-table (nbuckets, memorySize).
 func classifyAutoSizing() (nbuckets, memorySize uint32) {
 	members := uint32(envUint("BWPOOL_CLASSIFY_MEMBERS", 0))
 	pct := envFloat("BWPOOL_CLASSIFY_MEM_PCT", 0) // 0 → use default inside the sizing fn
 	return classifyTableSizing(members, pct, memoryBudget())
+}
+
+// ClassifySessionBudget is the materialization admission budget the agent reports to the
+// controller (CapacityReport.SessionBudget, DESIGN §9.1): the max members this edge can
+// program before the classify table os_panics. Same source as classifyAutoSizing so the
+// reported budget matches the tables the reconciler actually builds.
+func ClassifySessionBudget() uint64 {
+	return classifyCapacity(uint32(envUint("BWPOOL_CLASSIFY_MEMBERS", 0)), envFloat("BWPOOL_CLASSIFY_MEM_PCT", 0), memoryBudget())
 }
 
 // memoryBudget returns the memory budget in bytes: min(cgroup limit, physical RAM).

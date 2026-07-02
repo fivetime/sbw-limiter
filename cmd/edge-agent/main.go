@@ -144,7 +144,14 @@ func main() {
 
 	reporter := agent.NewReporter(model.EdgeID(cfg.EdgeID), health,
 		agent.WithCapacity(func() model.CapacityReport {
-			return model.CapacityReport{NICCapacityBps: cfg.CapacityBps}
+			// SessionBudget (DESIGN §9.1 admission): the max members this edge can
+			// materialize before its classify heap os_panics — the SAME auto-sized
+			// capacity the reconciler builds its tables from, so the controller's
+			// session-dimension placement never over-commits the data plane.
+			return model.CapacityReport{
+				NICCapacityBps: cfg.CapacityBps,
+				SessionBudget:  agent.ClassifySessionBudget(),
+			}
 		}),
 		// Installed pool-set hash: the controller compares it against its expected
 		// set to detect drift and trigger a full DESIRED_STATE resync (the
