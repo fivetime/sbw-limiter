@@ -125,22 +125,70 @@ func main() {
 		met.RecordDesiredStatus(st.Frozen, st.Generation)
 	})
 
-	// ③ forwarding-broken (§4.2.7): device-level active probe — ping a stable next-hop
-	// through VPP's data plane; ForwardingProbeFails consecutive black-holed rounds →
-	// forwarding-broken. Immune to the policer (a low-rate echo is below any pool rate),
-	// so failure means a real black-hole, not rate-limiting. Disabled if no target set.
+	// ③ forwarding-broken (§4.2.7/§4.2.8): device-level active forwarding check —
+	// ForwardingProbeFails consecutive black-holed rounds → forwarding-broken (device
+	// up, links up, but a silent black-hole). Two sources, selected by config:
+	//   - plugin gauge (§4.2.8, preferred): the `probe` VPP plugin resolves the target
+	//     in the FIB on its own process node and publishes reachability to the stats
+	//     segment; the agent reads it over shared memory, never touching VPP's single
+	//     main thread — a busy VPP can't self-time-out the probe (the cli_inband ping's
+	//     fatal flaw under load).
+	//   - cli_inband ping (§4.2.7, legacy fallback): pings the target through the data
+	//     plane. Immune to the policer (a low-rate echo is below any pool rate).
+	// Disabled if no target set.
 	var probeBroken func() bool
 	if cfg.ForwardingProbeTarget != "" {
-		fp := agent.NewForwardingProbe(
-			func() (int, error) {
-				_, recv, err := conn.Ping(cfg.ForwardingProbeTarget, 3, 0.1, cfg.ForwardingProbeTimeout.Std())
-				return recv, err
-			},
-			cfg.ForwardingProbeInterval.Std(), cfg.ForwardingProbeFails, log)
-		go fp.Run(ctx)
-		probeBroken = fp.Broken
-		log.Info("forwarding probe enabled (§4.2.7 ③)", "target", cfg.ForwardingProbeTarget,
-			"interval", cfg.ForwardingProbeInterval.Std(), "fails", cfg.ForwardingProbeFails)
+		var fp *agent.ForwardingProbe
+		if cfg.ForwardingProbePlugin {
+			// Its own read-only stats connection (shared memory, decoupled from the
+			// metering reader's lifetime). A connect failure disables ③ but not the agent.
+			if probeStats, serr := vpp.NewStatsReader(cfg.VPPStatsSocket); serr != nil {
+				log.Error("forwarding probe (plugin) disabled: VPP stats connect failed",
+					"err", serr, "socket", cfg.VPPStatsSocket)
+			} else {
+				defer probeStats.Close()
+				gauge := "/probe/fib/" + cfg.ForwardingProbeStatName + "/reachable"
+				// Register the target once — a main-thread setup call (not the detection
+				// loop). Idempotent-ish: an "already exists" on agent restart is benign,
+				// and a fresh VPP (post-restart) is self-healed by the lazy re-register
+				// in the round below.
+				register := func() error {
+					_, cerr := conn.CliInband(fmt.Sprintf("probe fib add %s table %d name %s",
+						cfg.ForwardingProbeTarget, cfg.ForwardingProbeTable, cfg.ForwardingProbeStatName),
+						cfg.ForwardingProbeTimeout.Std())
+					return cerr
+				}
+				if rerr := register(); rerr != nil {
+					log.Warn("probe target register at startup returned error (continuing; gauge read is source of truth)", "err", rerr)
+				}
+				fp = agent.NewForwardingProbe(func() (int, error) {
+					v, gerr := probeStats.ReadGauge(gauge)
+					if gerr != nil {
+						// Gauge absent = target unregistered (fresh VPP after a restart).
+						// Re-register best-effort and report "could not run" (verdict
+						// unchanged), so a VPP restart never false-positives a black-hole.
+						_ = register()
+						return 0, gerr
+					}
+					return int(v), nil
+				}, cfg.ForwardingProbeInterval.Std(), cfg.ForwardingProbeFails, log)
+				log.Info("forwarding probe enabled (plugin gauge, §4.2.8)", "target", cfg.ForwardingProbeTarget,
+					"gauge", gauge, "interval", cfg.ForwardingProbeInterval.Std(), "fails", cfg.ForwardingProbeFails)
+			}
+		} else {
+			fp = agent.NewForwardingProbe(
+				func() (int, error) {
+					_, recv, err := conn.Ping(cfg.ForwardingProbeTarget, 3, 0.1, cfg.ForwardingProbeTimeout.Std())
+					return recv, err
+				},
+				cfg.ForwardingProbeInterval.Std(), cfg.ForwardingProbeFails, log)
+			log.Info("forwarding probe enabled (cli_inband ping, §4.2.7 legacy)", "target", cfg.ForwardingProbeTarget,
+				"interval", cfg.ForwardingProbeInterval.Std(), "fails", cfg.ForwardingProbeFails)
+		}
+		if fp != nil {
+			go fp.Run(ctx)
+			probeBroken = fp.Broken
+		}
 	}
 
 	reporter := agent.NewReporter(model.EdgeID(cfg.EdgeID), health,

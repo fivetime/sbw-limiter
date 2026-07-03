@@ -7,15 +7,16 @@ import (
 	"time"
 )
 
-// ForwardingProbe is the §4.2.7 device-level active forwarding probe — the ③ signal
-// (VPP up, interfaces up, but not forwarding: a silent black-hole a passive check
-// cannot see). It periodically pings a stable, always-reachable next-hop through VPP's
-// data plane; after K consecutive rounds with no reply it declares the forwarding path
-// broken. It runs at the DEVICE level (one probe, not per-member) and is immune to the
-// policer — a single low-rate echo is far below any pool rate, so it never triggers
-// rate-limiting: probe failure means a real forwarding fault, not intentional drops
-// (see DESIGN-liveness §4.2.5 SUPERSEDED / §4.2.7). The FaultSensor reads Broken() and
-// reports FaultForwardingBroken.
+// ForwardingProbe is the §4.2.7/§4.2.8 device-level active forwarding check — the ③
+// signal (VPP up, interfaces up, but not forwarding: a silent black-hole a passive
+// check cannot see). Each round observes whether a stable target is forwarding-reachable
+// (recv > 0); after K consecutive black-holed rounds it declares the path broken. It is
+// source-agnostic: the round closure either reads the `probe` plugin's FIB-reachability
+// gauge over the stats segment (§4.2.8, preferred — never touches VPP's main thread) or
+// pings the target through the data plane (§4.2.7 legacy). It runs at the DEVICE level
+// (one probe, not per-member) and is immune to the policer — a single low-rate echo is
+// far below any pool rate, so failure means a real forwarding fault, not intentional
+// drops. The FaultSensor reads Broken() and reports FaultForwardingBroken.
 type ForwardingProbe struct {
 	// ping runs one probe round, returning how many echoes came back and any transport
 	// error (channel unavailable / main-thread timeout). recv > 0 = path healthy.

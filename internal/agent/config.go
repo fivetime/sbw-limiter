@@ -86,6 +86,16 @@ type Config struct {
 	ForwardingProbeFails    int             `json:"forwarding_probe_fails"`    // consecutive no-reply rounds → broken; 0 → 3
 	ForwardingProbeTimeout  config.Duration `json:"forwarding_probe_timeout"`  // per-round reply timeout (bounds a wedged main thread); 0 → 2s
 
+	// Plugin-based forwarding probe (preferred): instead of a cli_inband ping —
+	// which self-times-out and stalls VPP's single main thread under load — the
+	// `probe` VPP plugin resolves ForwardingProbeTarget in the FIB on its own
+	// process node and publishes reachability to the stats segment. The agent
+	// registers the target once (`probe fib add`) and reads the gauge over shared
+	// memory each round (never touching the main thread). Empty target still = off.
+	ForwardingProbePlugin   bool   `json:"forwarding_probe_plugin"`    // true → read the probe-plugin gauge instead of cli_inband ping
+	ForwardingProbeStatName string `json:"forwarding_probe_stat_name"` // probe target name; gauge = /probe/fib/<name>/reachable; default "fwd"
+	ForwardingProbeTable    int    `json:"forwarding_probe_table"`     // FIB table id the target is resolved in; default 0
+
 	// Metering export (T-1001): when MeteringEnable and the Kafka brokers/topic/
 	// creds are set, the agent reads VPP policer counters every MeteringInterval
 	// and pushes RAW CUMULATIVE samples to Kafka (→ ClickHouse → BSS). The system
@@ -123,6 +133,7 @@ func DefaultConfig() Config {
 		ForwardingProbeInterval: config.Duration(3 * time.Second),
 		ForwardingProbeFails:    3,
 		ForwardingProbeTimeout:  config.Duration(2 * time.Second),
+		ForwardingProbeStatName: "fwd",
 	}
 }
 
@@ -229,6 +240,13 @@ func (c *Config) applyEnv() error {
 		return err
 	}
 	if c.ForwardingProbeTimeout, err = config.DurationEnv("FORWARDING_PROBE_TIMEOUT", c.ForwardingProbeTimeout); err != nil {
+		return err
+	}
+	if c.ForwardingProbePlugin, err = config.Bool("FORWARDING_PROBE_PLUGIN", c.ForwardingProbePlugin); err != nil {
+		return err
+	}
+	c.ForwardingProbeStatName = config.String("FORWARDING_PROBE_STAT_NAME", c.ForwardingProbeStatName)
+	if c.ForwardingProbeTable, err = config.Int("FORWARDING_PROBE_TABLE", c.ForwardingProbeTable); err != nil {
 		return err
 	}
 	return nil

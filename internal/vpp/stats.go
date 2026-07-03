@@ -142,6 +142,33 @@ func foldErrorStats(es govppapi.ErrorStats) []ErrorStat {
 	return out
 }
 
+// ReadGauge reads a single scalar gauge from the stats segment by exact name
+// (e.g. "/probe/fib/fwd/reachable", published by the probe plugin's process
+// node). The value is stored as an f64 but always holds an integer; it is
+// returned as a uint64. Returns an error if the name is absent (e.g. the probe
+// target has not been registered yet) or is not a scalar. Reading the stats
+// segment is a shared-memory operation — it never touches VPP's main thread,
+// which is the whole point of moving forwarding liveness off the cli_inband ping.
+func (s *StatsReader) ReadGauge(name string) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := s.client.DumpStats(name)
+	if err != nil {
+		return 0, fmt.Errorf("vpp: dump gauge %s: %w", name, err)
+	}
+	for _, e := range entries {
+		if string(e.Name) != name {
+			continue // DumpStats matches by prefix; take the exact leaf
+		}
+		v, ok := e.Data.(adapter.ScalarStat)
+		if !ok {
+			return 0, fmt.Errorf("vpp: gauge %s is not a scalar (%T)", name, e.Data)
+		}
+		return uint64(v), nil
+	}
+	return 0, fmt.Errorf("vpp: gauge %s not found", name)
+}
+
 // ReadPolicers returns the current cumulative counters per VPP policer index.
 // Indexes with no policer report zero; the caller filters to managed policers via
 // the name→index map. Counters are summed over all worker threads.
