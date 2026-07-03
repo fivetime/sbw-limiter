@@ -148,13 +148,25 @@ func main() {
 			} else {
 				defer func() { _ = probeStats.Close() }()
 				gauge := "/probe/fib/" + cfg.ForwardingProbeStatName + "/reachable"
+				// The `probe fib add` CLI needs a prefix; a bare next-hop address
+				// (the natural way to express the target) gets its host length.
+				probePrefix := cfg.ForwardingProbeTarget
+				if !strings.Contains(probePrefix, "/") {
+					if a, perr := netip.ParseAddr(probePrefix); perr == nil {
+						if a.Is4() {
+							probePrefix += "/32"
+						} else {
+							probePrefix += "/128"
+						}
+					}
+				}
 				// Register the target once — a main-thread setup call (not the detection
 				// loop). Idempotent-ish: an "already exists" on agent restart is benign,
 				// and a fresh VPP (post-restart) is self-healed by the lazy re-register
 				// in the round below.
 				register := func() error {
 					_, cerr := conn.CliInband(fmt.Sprintf("probe fib add %s table %d name %s",
-						cfg.ForwardingProbeTarget, cfg.ForwardingProbeTable, cfg.ForwardingProbeStatName),
+						probePrefix, cfg.ForwardingProbeTable, cfg.ForwardingProbeStatName),
 						cfg.ForwardingProbeTimeout.Std())
 					return cerr
 				}
