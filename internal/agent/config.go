@@ -25,7 +25,7 @@ type Config struct {
 	// the L4 worker loops (engine) do — so this is set high to NEUTER the probe: it
 	// must not false-disconnect a busy VPP (which triggered the reinstall storm). A
 	// real crash still breaks the socket and is caught immediately, independent of it.
-	VPPHealthTimeout   config.Duration `json:"vpp_health_timeout"`
+	VPPHealthTimeout config.Duration `json:"vpp_health_timeout"`
 	// VPPReplyTimeout overrides govpp's default per-channel reply timeout for every
 	// reconcile dump/apply channel. govpp's 2s default is too tight for VPP's single
 	// busy-poll main thread: under normal packet+API contention a multipart dump takes
