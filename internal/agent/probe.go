@@ -25,8 +25,9 @@ type ForwardingProbe struct {
 	k        int // consecutive zero-reply rounds before Broken flips true
 	log      *slog.Logger
 
-	fails  int         // loop-local consecutive failure count (only the Run goroutine touches it)
-	broken atomic.Bool // the verdict the FaultSensor reads
+	fails       int         // loop-local consecutive failure count (only the Run goroutine touches it)
+	everHealthy bool        // has the target been reachable at least once? (loop-local)
+	broken      atomic.Bool // the verdict the FaultSensor reads
 }
 
 // NewForwardingProbe builds a probe. ping is one round (e.g. conn.Ping wrapped to return
@@ -71,8 +72,17 @@ func (p *ForwardingProbe) round() {
 			p.log.Info("forwarding probe recovered", "after_fails", p.fails)
 		}
 		p.fails = 0
+		p.everHealthy = true
 		p.broken.Store(false)
-	default: // recv == 0 → this path black-holed this round
+	case !p.everHealthy:
+		// recv == 0 but the target has never been reachable — this is initial
+		// convergence (routes/BGP not up yet), not a regression. Declaring a
+		// black-hole here would trip an immediate failover on every restart during
+		// the convergence window. Only arm ③ after the path has been healthy once;
+		// a genuinely dead-from-boot edge is caught by other signals (vpp-gone,
+		// registration, link-down).
+		return
+	default: // recv == 0 after having been healthy → a real regression this round
 		p.fails++
 		if p.fails >= p.k && !p.broken.Load() {
 			p.log.Warn("forwarding probe: path black-holed", "consecutive_fails", p.fails, "threshold", p.k)
