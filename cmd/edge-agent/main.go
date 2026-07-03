@@ -146,7 +146,7 @@ func main() {
 				log.Error("forwarding probe (plugin) disabled: VPP stats connect failed",
 					"err", serr, "socket", cfg.VPPStatsSocket)
 			} else {
-				defer probeStats.Close()
+				defer func() { _ = probeStats.Close() }()
 				gauge := "/probe/fib/" + cfg.ForwardingProbeStatName + "/reachable"
 				// Register the target once — a main-thread setup call (not the detection
 				// loop). Idempotent-ish: an "already exists" on agent restart is benign,
