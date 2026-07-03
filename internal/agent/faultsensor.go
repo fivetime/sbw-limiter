@@ -13,7 +13,10 @@ import (
 // dumpTimeout bounds the report-time sw_interface_dump so a wedged/slow VPP main thread
 // cannot block the report goroutine (Fault runs on Reporter.Build). A dump that exceeds
 // it is treated as "undetermined link state", NOT a stall of the whole report path.
-const dumpTimeout = 2 * time.Second
+// 5s (not govpp's 2s default) matches vpp.WithReplyTimeout: VPP's single busy-poll main
+// thread legitimately takes >2s to answer a multipart dump under packet+API contention,
+// which is slow-not-wedged (< the 15s report interval). See vpp-single-mainthread-bottleneck.
+const dumpTimeout = 5 * time.Second
 
 // FaultSensor types the edge's data-plane fault kind (DESIGN-liveness §4.2.3) from
 // LIVE signals, independent of the slow reconcile pass, so a DETERMINATE fault reaches

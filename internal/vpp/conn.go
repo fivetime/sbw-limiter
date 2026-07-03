@@ -33,6 +33,17 @@ type Conn struct {
 	done    chan struct{}
 	stopOne sync.Once
 
+	// replyTimeout, when >0, overrides govpp's default per-channel reply timeout on
+	// every channel Channel() hands out (reconcile dumps/apply). govpp's 2s default
+	// is too tight for VPP's SINGLE busy-poll main thread: under normal packet+API
+	// contention a multipart dump (policer_dump/sw_interface_dump) legitimately takes
+	// >2s to complete — not a wedge, just slow — and timing it out fails the reconcile
+	// pass → Degraded → the canary is withdrawn even though forwarding is fine (the L-01
+	// lab saw one edge stuck here indefinitely while l1/l2 only flapped through it). A
+	// wider bound (still bounded, not infinite) lets the dump finish. See
+	// vpp-single-mainthread-bottleneck.
+	replyTimeout time.Duration
+
 	// gen counts healthy (re)connects: 1 on first connect, +1 each reconnect.
 	// A reconnect means VPP may have restarted and lost all data-plane state
 	// (policers/classify/ABF) — routes alone are re-dumped by linux-cp, but our
@@ -56,6 +67,7 @@ type config struct {
 	compatMsgs    []govppapi.Message
 	readyWait     time.Duration
 	healthTimeout time.Duration
+	replyTimeout  time.Duration
 }
 
 // WithReconnect sets the reconnect attempt count and interval.
@@ -68,6 +80,10 @@ func WithLogger(l *slog.Logger) Option { return func(c *config) { c.log = l } }
 
 // WithReadyTimeout bounds how long Connect waits for the first healthy connect.
 func WithReadyTimeout(d time.Duration) Option { return func(c *config) { c.readyWait = d } }
+
+// WithReplyTimeout overrides govpp's default per-channel reply timeout (see Conn.replyTimeout).
+// 0 keeps govpp's default. Applied to every channel Channel() returns.
+func WithReplyTimeout(d time.Duration) Option { return func(c *config) { c.replyTimeout = d } }
 
 // WithHealthCheck overrides govpp's health-probe reply timeout. govpp's default
 // (250ms) is too tight at scale: a VPP busy installing classify sessions can take
@@ -114,11 +130,12 @@ func Connect(ctx context.Context, a adapter.VppAPI, opts ...Option) (*Conn, erro
 	}
 
 	c := &Conn{
-		conn:      conn,
-		log:       cfg.log,
-		done:      make(chan struct{}),
-		reconnect: make(chan struct{}, 1),
-		readyChan: make(chan struct{}),
+		conn:         conn,
+		log:          cfg.log,
+		done:         make(chan struct{}),
+		reconnect:    make(chan struct{}, 1),
+		readyChan:    make(chan struct{}),
+		replyTimeout: cfg.replyTimeout,
 	}
 	c.checkCompat = func() error {
 		return c.verifyCompatibility(cfg.compatMsgs)
@@ -252,6 +269,9 @@ func (c *Conn) Channel() (govppapi.Channel, error) {
 	ch, err := c.conn.NewAPIChannel()
 	if err != nil {
 		return nil, fmt.Errorf("vpp: new api channel: %w", err)
+	}
+	if c.replyTimeout > 0 {
+		ch.SetReplyTimeout(c.replyTimeout)
 	}
 	return ch, nil
 }

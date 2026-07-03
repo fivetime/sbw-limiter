@@ -86,6 +86,7 @@ func main() {
 		vpp.WithReconnect(vppReconnectAttempts, vppReconnectInterval),
 		vpp.WithLogger(log),
 		vpp.WithHealthCheck(cfg.VPPHealthTimeout.Std()),
+		vpp.WithReplyTimeout(cfg.VPPReplyTimeout.Std()),
 	)
 	if err != nil {
 		log.Error("vpp connect failed", "socket", cfg.VPPAPISocket, "err", err)

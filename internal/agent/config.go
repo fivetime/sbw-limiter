@@ -26,6 +26,13 @@ type Config struct {
 	// must not false-disconnect a busy VPP (which triggered the reinstall storm). A
 	// real crash still breaks the socket and is caught immediately, independent of it.
 	VPPHealthTimeout   config.Duration `json:"vpp_health_timeout"`
+	// VPPReplyTimeout overrides govpp's default per-channel reply timeout for every
+	// reconcile dump/apply channel. govpp's 2s default is too tight for VPP's single
+	// busy-poll main thread: under normal packet+API contention a multipart dump takes
+	// >2s to COMPLETE (not a wedge, just slow), which times out the reconcile pass →
+	// Degraded → canary withdrawn though forwarding is healthy. 0 → govpp default.
+	// See vpp.WithReplyTimeout / vpp-single-mainthread-bottleneck.
+	VPPReplyTimeout    config.Duration `json:"vpp_reply_timeout"`
 	ControllerEndpoint string          `json:"controller_endpoint"` // desired-state source (single / bootstrap)
 	// ControllerEndpoints is the bootstrap set for controller sharding (L-06): the
 	// agent connects to any one, Registers, and is told its primary/fallback
@@ -103,6 +110,7 @@ func DefaultConfig() Config {
 		BIRDSocketPath:    "/run/bird.ctl",
 		VPPAPISocket:      "/run/vpp/api.sock",
 		VPPHealthTimeout:  config.Duration(30 * time.Second),
+		VPPReplyTimeout:   config.Duration(5 * time.Second),
 		BirdAPISocket:     "/run/bird/api.sock",
 		ReconcileInterval: config.Duration(60 * time.Second),
 		ReportInterval:    config.Duration(15 * time.Second),
@@ -147,6 +155,11 @@ func (c *Config) applyEnv() error {
 		return err
 	}
 	c.VPPHealthTimeout = vht
+	vrt, err := config.DurationEnv("VPP_REPLY_TIMEOUT", c.VPPReplyTimeout)
+	if err != nil {
+		return err
+	}
+	c.VPPReplyTimeout = vrt
 	c.ControllerEndpoint = config.String("CONTROLLER_ENDPOINT", c.ControllerEndpoint)
 	c.ControllerEndpoints = config.Strings("CONTROLLER_ENDPOINTS", c.ControllerEndpoints)
 
