@@ -119,3 +119,49 @@ func TestFeedBadNextHopFails(t *testing.T) {
 		t.Fatalf("nothing should be fed on a failed pass, got %d frames", len(s.frames))
 	}
 }
+
+// v6 flowspec is now fed (no longer skipped): a v6 source + RedirectNextHopV6
+// produces a flow6 ADD carrying the 20-byte i6ec redirect EC, alongside v4.
+func TestFeedV6Flowspec(t *testing.T) {
+	f, s := newTestFeed()
+	st := model.EdgeDesiredState{
+		FlowRedirects: []model.FlowRedirect{
+			flow("11.0.0.0/32"),    // v4
+			flow("fc00:16::3/128"), // v6
+		},
+		RedirectNextHop:   netip.MustParseAddr("10.0.0.1"),
+		RedirectNextHopV6: netip.MustParseAddr("2001:db8::7"),
+	}
+	if err := f.apply(st); err != nil {
+		t.Fatal(err)
+	}
+	var v6flow []byte
+	for _, fr := range s.frames {
+		if fr[1] == opAdd && fr[hdrLen] == netFlow6 {
+			v6flow = fr
+		}
+	}
+	if v6flow == nil {
+		t.Fatal("v6 flowspec was not fed (still skipped?)")
+	}
+	// body: net(1) px(1) key(16) then the attr TLV — must be EXTCOMM, len 20.
+	if at, alen := v6flow[hdrLen+18], v6flow[hdrLen+19]; at != attrExtComm || alen != 20 {
+		t.Fatalf("v6 flow attr = type %d len %d, want EXTCOMM/20", at, alen)
+	}
+}
+
+// v6 flowspec with a non-v6 redirect next-hop is fail-static (nothing fed),
+// mirroring the v4 rule.
+func TestFeedV6BadNextHopFails(t *testing.T) {
+	f, s := newTestFeed()
+	st := model.EdgeDesiredState{
+		FlowRedirects:     []model.FlowRedirect{flow("fc00:16::3/128")},
+		RedirectNextHopV6: netip.Addr{}, // not v6
+	}
+	if err := f.apply(st); err == nil {
+		t.Fatal("expected error for v6 flowspec with non-v6 next-hop")
+	}
+	if len(s.frames) != 0 {
+		t.Fatalf("nothing should be fed on a failed pass, got %d frames", len(s.frames))
+	}
+}

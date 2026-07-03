@@ -36,10 +36,11 @@ type Feed struct {
 	wake   chan struct{}
 
 	// snapshot of what is currently fed, for diffing.
-	anchors map[netip.Prefix]struct{}
-	flows   map[netip.Prefix]struct{}
-	nextHop netip.Addr
-	resync  bool
+	anchors  map[netip.Prefix]struct{}
+	flows    map[netip.Prefix]struct{} // both families; EC chosen per-prefix family
+	nextHop  netip.Addr                // v4 redirect target (for the 8-byte EC)
+	nextHop6 netip.Addr                // v6 redirect target (for the 20-byte i6ec)
+	resync   bool
 }
 
 // NewFeed wires a Feed over a fresh Client for the api socket path.
@@ -104,34 +105,57 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 		f.resync = true
 	}
 
-	// Desired sets. v6 flowspec is deferred (needs the 20-byte i6ec EC on both
-	// bird + here, see DESIGN-bird-api.md §3.3); v6 anchors are handled.
+	// Desired sets. Anchors (v4+v6) and flowspec (v4+v6) are all fed; the redirect
+	// EC is chosen per source-prefix family — 8-byte redirect-to-IPv4 for a v4
+	// source, 20-byte redirect-to-IPv6 i6ec for a v6 source (DESIGN-bird-api §3.3).
 	desA := make(map[netip.Prefix]struct{}, len(st.Anchors))
 	for _, a := range st.Anchors {
 		desA[a.Prefix] = struct{}{}
 	}
 	desF := make(map[netip.Prefix]struct{}, len(st.FlowRedirects))
+	haveV4, haveV6 := false, false
 	for _, r := range st.FlowRedirects {
-		if r.SrcPrefix.Addr().Is6() {
-			continue
-		}
 		desF[r.SrcPrefix] = struct{}{}
+		if r.SrcPrefix.Addr().Is6() {
+			haveV6 = true
+		} else {
+			haveV4 = true
+		}
 	}
 
-	var ec [8]byte
-	if len(desF) > 0 {
+	// Per-family redirect ECs, validated fail-static (mirrors flowspec.Render): a
+	// flow of a family requires that family's redirect next-hop.
+	var ec4 [8]byte
+	var ec6 [20]byte
+	if haveV4 {
 		if !st.RedirectNextHop.Is4() {
 			err := fmt.Errorf("bird feed: v4 flowspec present but RedirectNextHop %s not v4", st.RedirectNextHop)
 			f.log.Error(err.Error())
-			return err // fail-static: skip the whole pass (mirrors flowspec.Render strictness)
+			return err
 		}
-		ec = redirectIP4EC(st.RedirectNextHop)
+		ec4 = redirectIP4EC(st.RedirectNextHop)
+	}
+	if haveV6 {
+		if !st.RedirectNextHopV6.Is6() {
+			err := fmt.Errorf("bird feed: v6 flowspec present but RedirectNextHopV6 %s not v6", st.RedirectNextHopV6)
+			f.log.Error(err.Error())
+			return err
+		}
+		ec6 = redirectI6EC(st.RedirectNextHopV6)
+	}
+	ecFor := func(p netip.Prefix) []byte {
+		if p.Addr().Is6() {
+			return ec6[:]
+		}
+		return ec4[:]
 	}
 
-	if f.resync || st.RedirectNextHop != f.nextHop {
-		f.fullResync(desA, desF, ec)
+	// A change to EITHER redirect next-hop must re-announce every flow of that
+	// family (the EC is an attribute, not part of the diff key), so resync on both.
+	if f.resync || st.RedirectNextHop != f.nextHop || st.RedirectNextHopV6 != f.nextHop6 {
+		f.fullResync(desA, desF, ecFor)
 	} else {
-		f.incremental(desA, desF, ec)
+		f.incremental(desA, desF, ecFor)
 	}
 
 	if err := f.client.flush(); err != nil {
@@ -141,26 +165,28 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 		return err
 	}
 	// Commit the snapshot only after a clean flush.
-	f.anchors, f.flows, f.nextHop = desA, desF, st.RedirectNextHop
+	f.anchors, f.flows = desA, desF
+	f.nextHop, f.nextHop6 = st.RedirectNextHop, st.RedirectNextHopV6
 	return nil
 }
 
 // fullResync: HELLO + all current routes + EOR. The proto marks everything stale
 // on HELLO, the re-announces clear it, EOR prunes whatever the agent dropped.
-func (f *Feed) fullResync(desA, desF map[netip.Prefix]struct{}, ec [8]byte) {
+// ecFor picks the redirect EC for a flow by its source-prefix family.
+func (f *Feed) fullResync(desA, desF map[netip.Prefix]struct{}, ecFor func(netip.Prefix) []byte) {
 	f.client.write(frameHello())
 	for p := range desA {
 		f.client.write(frameAnchor(opAdd, p))
 	}
 	for p := range desF {
-		f.client.write(frameFlow(opAdd, p, ec))
+		f.client.write(frameFlow(opAdd, p, ecFor(p)))
 	}
 	f.client.write(frameEOR())
 	f.resync = false
 }
 
 // incremental: only the diff vs the last-fed snapshot (O(delta) into bird).
-func (f *Feed) incremental(desA, desF map[netip.Prefix]struct{}, ec [8]byte) {
+func (f *Feed) incremental(desA, desF map[netip.Prefix]struct{}, ecFor func(netip.Prefix) []byte) {
 	for p := range desA {
 		if _, ok := f.anchors[p]; !ok {
 			f.client.write(frameAnchor(opAdd, p))
@@ -173,12 +199,12 @@ func (f *Feed) incremental(desA, desF map[netip.Prefix]struct{}, ec [8]byte) {
 	}
 	for p := range desF {
 		if _, ok := f.flows[p]; !ok {
-			f.client.write(frameFlow(opAdd, p, ec))
+			f.client.write(frameFlow(opAdd, p, ecFor(p)))
 		}
 	}
 	for p := range f.flows {
 		if _, ok := desF[p]; !ok {
-			f.client.write(frameFlow(opDel, p, ec)) // ec ignored on DEL
+			f.client.write(frameFlow(opDel, p, ecFor(p))) // ec ignored on DEL
 		}
 	}
 }

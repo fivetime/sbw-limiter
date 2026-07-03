@@ -46,7 +46,7 @@ func TestFrameAnchorV6(t *testing.T) {
 
 func TestFrameFlowAdd(t *testing.T) {
 	ec := redirectIP4EC(netip.MustParseAddr("10.70.99.21"))
-	got := frameFlow(opAdd, netip.MustParsePrefix("11.0.0.5/32"), ec)
+	got := frameFlow(opAdd, netip.MustParsePrefix("11.0.0.5/32"), ec[:])
 	want := []byte{
 		1, opAdd, 0, 0, 0, 0, 0, 24, // header, len = 8+1+1+4+2+8 = 24
 		netFlow4, 32, 11, 0, 0, 5,
@@ -54,6 +54,36 @@ func TestFrameFlowAdd(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("flow ADD = % x\nwant          % x", got, want)
+	}
+}
+
+// redirectI6EC must be the standard 20-byte i6ec wire layout:
+// type/sub-type 0x000c, then the 16-byte IPv6 target, then a zero local-admin.
+func TestRedirectI6EC(t *testing.T) {
+	ec := redirectI6EC(netip.MustParseAddr("2001:db8::7"))
+	want := [20]byte{
+		0x00, 0x0c, // type 0x00 (IPv6-addr-specific) + sub-type 0x0c (redirect)
+		0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x07, // 2001:db8::7
+		0x00, 0x00, // local-admin 0 (C=0 = redirect)
+	}
+	if ec != want {
+		t.Fatalf("redirectI6EC = % x\nwant           % x", ec, want)
+	}
+}
+
+func TestFrameFlowV6(t *testing.T) {
+	ec := redirectI6EC(netip.MustParseAddr("2001:db8::7"))
+	got := frameFlow(opAdd, netip.MustParsePrefix("fc00:16::3/128"), ec[:])
+	// header(8) + net(1) + px(1) + key(16) + attr-tlv-hdr(2) + ec(20) = 48
+	want := []byte{
+		1, opAdd, 0, 0, 0, 0, 0, 48,
+		netFlow6, 128,
+		0xfc, 0, 0, 0x16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, // fc00:16::3
+		attrExtComm, 20,
+		0x00, 0x0c, 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x07, 0x00, 0x00,
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("v6 flow ADD = % x\nwant             % x", got, want)
 	}
 }
 

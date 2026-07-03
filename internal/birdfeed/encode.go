@@ -38,7 +38,7 @@ const (
 	netFlow6 = 8
 
 	attrBlackhole = 1 // len 0 — RTD_BLACKHOLE (anchor advertisement carrier)
-	attrExtComm   = 2 // len 8 — 8-byte ext-community (v4 flowspec redirect)
+	attrExtComm   = 2 // len 8 (v4 redirect EC) or 20 (v6 redirect i6ec)
 )
 
 // frame prepends the 8-byte header (big-endian / network order, matching bird's
@@ -86,20 +86,23 @@ func frameAnchor(op uint8, p netip.Prefix) []byte {
 }
 
 // frameFlow encodes a flowspec ADD/DEL: a source-prefix flow4/flow6 NLRI; on ADD
-// it carries the 8-byte redirect ext-community ec.
-func frameFlow(op uint8, src netip.Prefix, ec [8]byte) []byte {
+// it carries the redirect ext-community ec — 8 bytes (v4 redirect-to-IPv4) or 20
+// bytes (v6 redirect-to-IPv6 i6ec). On DEL ec is ignored (the key identifies the
+// route). The EXTCOMM TLV's own length byte tells bird's api proto which one it is
+// (8 → bgp_ext_community, 20 → bgp_ipv6_ext_community).
+func frameFlow(op uint8, src netip.Prefix, ec []byte) []byte {
 	a := src.Addr()
 	nt := byte(netFlow4)
 	if a.Is6() {
 		nt = netFlow6
 	}
 	key := addrBytes(a)
-	body := make([]byte, 0, 2+len(key)+10)
+	body := make([]byte, 0, 2+len(key)+2+len(ec))
 	body = append(body, nt, byte(src.Bits()))
 	body = append(body, key...)
 	if op == opAdd {
-		body = append(body, attrExtComm, 8)
-		body = append(body, ec[:]...)
+		body = append(body, attrExtComm, byte(len(ec)))
+		body = append(body, ec...)
 	}
 	return frame(op, body)
 }
@@ -116,5 +119,21 @@ func redirectIP4EC(nextHop netip.Addr) [8]byte {
 	b4 := nextHop.As4()
 	copy(ec[2:6], b4[:])
 	// ec[6], ec[7] = 0 (local-admin, C=0 = redirect not copy)
+	return ec
+}
+
+// redirectI6EC encodes the standard redirect-to-IPv6 transitive IPv6-Address-
+// Specific ext-community (draft-ietf-idr-flowspec-redirect-ip: type/sub-type
+// 0x000c, RFC 5701 20-byte form) for the redirect target nextHop6. The wire
+// layout is the standard i6ec byte order — [type_subtype(2 BE), ipv6(16),
+// local-admin(2 BE)] — with local-admin 0 (C=0 = redirect). Byte-identical to
+// what flowspec.Render's `i6ec(0x000c, nextHop6, 0)` produces, so vppfdp/R parse
+// it unchanged. nextHop6 must be IPv6 (caller validates).
+func redirectI6EC(nextHop6 netip.Addr) [20]byte {
+	var ec [20]byte
+	binary.BigEndian.PutUint16(ec[0:2], 0x000c) // type 0x00 (IPv6-addr-specific) + sub-type 0x0c (redirect)
+	ip := nextHop6.As16()
+	copy(ec[2:18], ip[:])
+	// ec[18:20] = 0 (local-admin, C=0 = redirect not copy)
 	return ec
 }
