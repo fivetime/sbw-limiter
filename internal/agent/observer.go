@@ -36,6 +36,15 @@ func NewMemberObserver(conn *vpp.Conn, memberIfaces []string, log *slog.Logger) 
 
 // Observe dumps the neighbor table on the member interface(s) and returns the sorted,
 // deduplicated set of physically-present member host prefixes (/32, /128).
+//
+// Return-value contract (the server relies on this to distinguish "nothing there" from
+// "couldn't look"):
+//   - nil        → NO trustworthy observation this pass (disabled / VPP unhealthy /
+//     channel or dump error / an interface not resolvable). The server SKIPS — it must
+//     never reap a member on an uncertain read (fail-safe).
+//   - non-nil    → a CLEAN, complete observation: exactly the members physically present.
+//     An empty (but non-nil) slice means "looked, found none" → the server reaps absent
+//     members (member-down). This is why the EmptyIfClean init below is non-nil.
 func (o *MemberObserver) Observe() []netip.Prefix {
 	if o == nil || o.conn == nil || len(o.ifaces) == 0 || !o.conn.Healthy() {
 		return nil
@@ -48,26 +57,27 @@ func (o *MemberObserver) Observe() []netip.Prefix {
 	defer ch.Close()
 	ch.SetReplyTimeout(dumpTimeout) // never block the report path on a wedged main thread
 
-	// Resolve names → sw_if_index. IndexMap returns whatever resolved plus an error
-	// naming the missing ones; use the resolved subset (a member iface may be absent
-	// mid-reconfigure — skip it rather than fail the whole observation).
+	// All member interfaces must resolve for a TRUSTWORTHY pass; a missing one (VPP
+	// mid-reconfigure) makes the observation incomplete → skip rather than falsely report
+	// a smaller set that would reap live members.
 	idx, err := vpp.NewInterfaces(ch).IndexMap(o.ifaces...)
 	if err != nil {
-		o.log.Warn("member observe: interface resolve (using resolved subset)", "err", err)
+		o.log.Warn("member observe: interface resolve incomplete; skipping pass", "err", err)
+		return nil
 	}
 
 	nb := vpp.NewNeighbors(ch)
 	seen := make(map[netip.Prefix]struct{})
-	var out []netip.Prefix
+	out := make([]netip.Prefix, 0) // NON-nil: a clean dump with zero neighbors = "none present"
 	for _, name := range o.ifaces {
 		sw, ok := idx[name]
 		if !ok {
-			continue
+			return nil // defensive (IndexMap already errored above) — incomplete, skip
 		}
 		hosts, err := nb.DumpHosts(sw)
 		if err != nil {
-			o.log.Warn("member observe: neighbor dump", "iface", name, "err", err)
-			continue
+			o.log.Warn("member observe: neighbor dump; skipping pass", "iface", name, "err", err)
+			return nil // a dump error makes the pass incomplete → skip (never reap on error)
 		}
 		for _, h := range hosts {
 			if _, dup := seen[h]; dup {
