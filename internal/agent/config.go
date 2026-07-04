@@ -64,6 +64,16 @@ type Config struct {
 	// plane only / tests). Env POLICER_INTERFACES is comma-separated.
 	PolicerInterfaces []string `json:"policer_interfaces"`
 
+	// MemberInterfaces names the VPP interface(s) where pool MEMBERS physically
+	// attach (the L's member-access leg, e.g. host-macc). The agent reads their
+	// ARP/ND neighbor table as the L's PHYSICAL member-presence authority
+	// (DESIGN-liveness §11 / REFACTOR-coverer-liveness-only.md) and reports it as
+	// EdgeReport.ObservedMembers. Distinct from PolicerInterfaces, which also
+	// includes the uplink (whose neighbors are fabric/mesh, not members). Env
+	// BWPOOL_MEMBER_INTERFACES is comma-separated; empty disables physical
+	// observation (the report simply omits the set — backward compatible).
+	MemberInterfaces []string `json:"member_interfaces"`
+
 	// Canary (soft-death §4.7/6.13): when all three are set, the agent advertises
 	// CanaryPrefix tagged with CanaryLC via BIRD WHILE the data plane is healthy
 	// and WITHDRAWS it when SoftDead — the link down OR a Degraded/Dead phase
@@ -199,6 +209,9 @@ func (c *Config) applyEnv() error {
 	c.BirdAPISocket = config.String("BIRD_API_SOCKET", c.BirdAPISocket)
 	if v := config.String("POLICER_INTERFACES", ""); v != "" {
 		c.PolicerInterfaces = splitCSV(v)
+	}
+	if v := config.String("MEMBER_INTERFACES", ""); v != "" {
+		c.MemberInterfaces = splitCSV(v)
 	}
 	c.CanaryInclude = config.String("CANARY_INCLUDE", c.CanaryInclude)
 	c.CanaryPrefix = config.String("CANARY_PREFIX", c.CanaryPrefix)

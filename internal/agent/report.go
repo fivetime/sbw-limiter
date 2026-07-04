@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"log/slog"
+	"net/netip"
 	"time"
 
 	"github.com/fivetime/sbw-contract/model"
@@ -55,6 +56,11 @@ type FaultSource interface {
 // (the report-driven backstop). nil → the report carries 0 (no attestation).
 type PoolHashFunc func() uint64
 
+// ObservedMembersFunc yields the member host prefixes the agent PHYSICALLY observes
+// on its member interface (VPP ARP/ND neighbor table) — the L's physical authority
+// (DESIGN-liveness §11). nil → the report carries no set (backward compatible).
+type ObservedMembersFunc func() []netip.Prefix
+
 // Reporter assembles the agent's EdgeReport uplink (B-03) from the soft-death
 // health (B-05) plus capacity/metering sources, and sends it periodically.
 type Reporter struct {
@@ -64,6 +70,7 @@ type Reporter struct {
 	metering MeteringFunc
 	poolHash PoolHashFunc
 	fault    FaultSource
+	observed ObservedMembersFunc
 	now      func() int64
 	log      *slog.Logger
 }
@@ -84,6 +91,13 @@ func WithPoolHash(fn PoolHashFunc) ReporterOption { return func(r *Reporter) { r
 // WithFault wires the live fault-kind sensor (§4.2.3): Build overlays its verdict onto
 // the report so a determinate fault is typed + surfaced within one report interval.
 func WithFault(fn FaultSource) ReporterOption { return func(r *Reporter) { r.fault = fn } }
+
+// WithObservedMembers wires the physical member-presence source (VPP ARP/ND neighbor
+// table): Build carries its set as EdgeReport.ObservedMembers, the L's physical
+// authority the server consumes for member-up/down + locality (REFACTOR §2/§3).
+func WithObservedMembers(fn ObservedMembersFunc) ReporterOption {
+	return func(r *Reporter) { r.observed = fn }
+}
 
 // WithReporterClock overrides the timestamp source (tests).
 func WithReporterClock(now func() int64) ReporterOption { return func(r *Reporter) { r.now = now } }
@@ -143,6 +157,9 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	}
 	if r.poolHash != nil {
 		rep.InstalledPoolHash = r.poolHash()
+	}
+	if r.observed != nil {
+		rep.ObservedMembers = r.observed()
 	}
 	return rep, true
 }

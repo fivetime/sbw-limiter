@@ -223,6 +223,12 @@ func main() {
 		// (③ probe verdict) at report time so the server routes a DETERMINATE fault to its
 		// fast failover (§4.2.4) instead of the blanket soft-death debounce.
 		agent.WithFault(agent.NewFaultSensor(conn, cfg.PolicerInterfaces, probeBroken, log)),
+		// Physical member presence (REFACTOR §2/§3, DESIGN-liveness §11): read the
+		// member interface's VPP ARP/ND neighbor table each report → EdgeReport.
+		// ObservedMembers. The L's physical authority the server consumes for
+		// member-up/down + locality, and the agent's own local anti-blackhole gate.
+		// Empty MemberInterfaces → observer returns nil → field omitted (compatible).
+		agent.WithObservedMembers(agent.NewMemberObserver(conn, cfg.MemberInterfaces, log).Observe),
 		agent.WithReporterLogger(log),
 	)
 
