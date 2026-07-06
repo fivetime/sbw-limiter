@@ -384,9 +384,16 @@ func main() {
 	})
 	// REFACTOR step 4: connect DIRECTLY to the server (no coverer relay, no homing
 	// director). One server endpoint; the gRPC ClientConn reconnects transparently and
-	// RunDirect re-registers + re-subscribes on each drop. cfg.Bootstrap()[0] is the
-	// server endpoint (env BWPOOL_CONTROLLER_ENDPOINTS, re-pointed at sbw-server).
-	serverEndpoint := cfg.ControllerEndpoint
+	// RunDirect re-registers + re-subscribes on each drop. cfg.Bootstrap() returns
+	// ControllerEndpoints (env BWPOOL_CONTROLLER_ENDPOINTS, re-pointed at sbw-server) if
+	// set, else [ControllerEndpoint]; take the first (a single server Service DNS name —
+	// gRPC handles replicas behind it).
+	boot := cfg.Bootstrap()
+	if len(boot) == 0 {
+		log.Error("no controller/server endpoint configured (set CONTROLLER_ENDPOINT[S])")
+		os.Exit(1)
+	}
+	serverEndpoint := boot[0]
 	client, err := grpcclient.Dial(serverEndpoint, model.EdgeID(cfg.EdgeID),
 		grpcclient.WithDesired(onDesired),
 		grpcclient.WithDelta(recon.SubmitDelta), // hot path: queue deltas to the reconcile goroutine
