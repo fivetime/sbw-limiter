@@ -34,12 +34,8 @@ type DeltaFunc func(model.EdgeDesiredDelta)
 // raw JSON payload is passed through for the agent to interpret.
 type DirectiveFunc func(kind rpc.Directive_Kind, generation uint64, payload []byte)
 
-// CovererFunc receives this agent's coverer assignment (DESIGN-liveness §10,
-// L-06): on the Register response (initial homing) and on every REHOME directive
-// (coverage moved). The homing director uses it to (re)connect to the primary.
-type CovererFunc func(model.CovererAssignment)
-
-// Client is the agent's connection to the controller.
+// Client is the agent's connection to the control plane (REFACTOR step 4: the server
+// directly; formerly a coverer).
 type Client struct {
 	conn *grpc.ClientConn
 	svc  rpc.AgentServiceClient
@@ -48,7 +44,6 @@ type Client struct {
 	onDesired   DesiredFunc
 	onDelta     DeltaFunc
 	onDirective DirectiveFunc
-	onCoverers  CovererFunc
 	backoff     time.Duration
 	log         *slog.Logger
 
@@ -89,10 +84,6 @@ func WithDesired(fn DesiredFunc) Option { return func(c *Client) { c.onDesired =
 
 // WithDelta wires the incremental DESIRED_DELTA handler (the hot path).
 func WithDelta(fn DeltaFunc) Option { return func(c *Client) { c.onDelta = fn } }
-
-// WithCoverers wires the coverer-assignment handler (homing, L-06): called on the
-// Register response and on every REHOME directive.
-func WithCoverers(fn CovererFunc) Option { return func(c *Client) { c.onCoverers = fn } }
 
 // WithBackoff sets the reconnect backoff (default 1s).
 func WithBackoff(d time.Duration) Option { return func(c *Client) { c.backoff = d } }
@@ -153,17 +144,39 @@ func (c *Client) Register(ctx context.Context, capacityBps uint64) error {
 		return fmt.Errorf("grpcclient: registration rejected (controller schema %d, agent %d)",
 			resp.SchemaVersion, model.SchemaVersion)
 	}
-	// Surface the coverer assignment so the homing director can connect to the
-	// primary (L-06). Empty when sharding is off — the agent stays where it is.
-	if len(resp.Coverers) > 0 && c.onCoverers != nil {
-		var a model.CovererAssignment
-		if err := json.Unmarshal(resp.Coverers, &a); err != nil {
-			c.log.Error("bad coverers in register response", "err", err)
+	// REFACTOR step 4: the agent connects DIRECTLY to the server, so it needs no coverer
+	// assignment — resp.Coverers is empty (the server leaves it nil for a direct connect)
+	// and the agent stays on the server it reached. The old coverer-homing parse is gone.
+	return nil
+}
+
+// RunDirect is the direct-to-server control loop (REFACTOR step 4): (re)register, then
+// hold a Subscribe stream open, reconnecting with backoff until ctx is cancelled. It
+// re-registers on every reconnect so a freshly-(re)started server replica re-learns this
+// agent (registry seed + mon.Alive); the durable registry makes a repeat register
+// idempotent. Replaces the homing.Director's per-coverer register+subscribe+rehome loop —
+// there is one server target and no coverer assignment, so the gRPC ClientConn's own
+// transparent reconnect handles endpoint churn beneath a single Subscribe pass. Blocks;
+// run in a goroutine.
+func (c *Client) RunDirect(ctx context.Context, capacityBps uint64) {
+	for ctx.Err() == nil {
+		if err := c.Register(ctx, capacityBps); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			c.log.Warn("register failed; retrying", "err", err, "backoff", c.backoff)
 		} else {
-			c.onCoverers(a)
+			c.log.Info("registered with server (direct)")
+			if err := c.subscribeOnce(ctx); err != nil && ctx.Err() == nil {
+				c.log.Warn("subscribe stream ended; reconnecting", "err", err, "backoff", c.backoff)
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(c.backoff):
 		}
 	}
-	return nil
 }
 
 // SendReport delivers an EdgeReport to the controller (implements agent.ReportSink).
@@ -192,12 +205,6 @@ func (c *Client) Run(ctx context.Context) {
 		}
 	}
 }
-
-// SubscribePass runs ONE subscribe stream to completion (stream end or ctx
-// cancel). The homing director (L-06) drives passes itself so it can react to
-// each disconnect — re-home to a new primary or fall back to another coverer —
-// instead of Run's blind same-endpoint reconnect.
-func (c *Client) SubscribePass(ctx context.Context) error { return c.subscribeOnce(ctx) }
 
 func (c *Client) subscribeOnce(ctx context.Context) error {
 	stream, err := c.svc.Subscribe(ctx, &rpc.SubscribeRequest{EdgeId: string(c.edge)})
@@ -258,16 +265,6 @@ func (c *Client) dispatch(d *rpc.Directive) {
 		}
 		if c.onDelta != nil {
 			c.onDelta(delta)
-		}
-	case rpc.Directive_REHOME:
-		// Coverage moved (L-06): re-home to the new primary, keep the fallbacks.
-		var a model.CovererAssignment
-		if err := json.Unmarshal(d.Payload, &a); err != nil {
-			c.log.Error("bad REHOME payload", "err", err)
-			return
-		}
-		if c.onCoverers != nil {
-			c.onCoverers(a)
 		}
 	default:
 		if c.onDirective != nil {

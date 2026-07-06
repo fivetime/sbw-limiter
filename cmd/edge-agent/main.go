@@ -24,7 +24,6 @@ import (
 	"github.com/fivetime/sbw-limiter/internal/bird"
 	"github.com/fivetime/sbw-limiter/internal/birdfeed"
 	"github.com/fivetime/sbw-limiter/internal/grpcclient"
-	"github.com/fivetime/sbw-limiter/internal/homing"
 	"github.com/fivetime/sbw-limiter/internal/kafkasink"
 	"github.com/fivetime/sbw-limiter/internal/metrics"
 	"github.com/fivetime/sbw-limiter/internal/vpp"
@@ -383,19 +382,21 @@ func main() {
 		}
 		birdWake() // a removed/added pool may change anchors/flowspec
 	})
-	dial := func(endpoint string, onCov grpcclient.CovererFunc) (homing.Conn, error) {
-		c, err := grpcclient.Dial(endpoint, model.EdgeID(cfg.EdgeID),
-			grpcclient.WithDesired(onDesired),
-			grpcclient.WithDelta(recon.SubmitDelta), // hot path: queue deltas to the reconcile goroutine
-			grpcclient.WithCoverers(onCov),
-			grpcclient.WithLogger(log),
-		)
-		if err != nil {
-			return nil, err
-		}
-		return c, nil
+	// REFACTOR step 4: connect DIRECTLY to the server (no coverer relay, no homing
+	// director). One server endpoint; the gRPC ClientConn reconnects transparently and
+	// RunDirect re-registers + re-subscribes on each drop. cfg.Bootstrap()[0] is the
+	// server endpoint (env BWPOOL_CONTROLLER_ENDPOINTS, re-pointed at sbw-server).
+	serverEndpoint := cfg.ControllerEndpoint
+	client, err := grpcclient.Dial(serverEndpoint, model.EdgeID(cfg.EdgeID),
+		grpcclient.WithDesired(onDesired),
+		grpcclient.WithDelta(recon.SubmitDelta), // hot path: queue deltas to the reconcile goroutine
+		grpcclient.WithLogger(log),
+	)
+	if err != nil {
+		log.Error("dial server failed", "endpoint", serverEndpoint, "err", err)
+		os.Exit(1)
 	}
-	director := homing.New(cfg.Bootstrap(), cfg.CapacityBps, dial, homing.WithLogger(log))
+	defer func() { _ = client.Close() }()
 
 	// Prometheus /metrics (T-1003).
 	if cfg.MetricsListenAddr != "" {
@@ -412,9 +413,9 @@ func main() {
 	}
 
 	// Start the loops. Each blocks until ctx is cancelled.
-	go director.Run(ctx)                                          // downlink: home onto primary coverer, subscribe + dispatch (L-06)
+	go client.RunDirect(ctx, cfg.CapacityBps)                     // downlink: register + subscribe + dispatch, direct to server (REFACTOR step 4)
 	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // converge VPP to desired every interval
-	go reporter.Run(ctx, cfg.ReportInterval.Std(), director)      // uplink: health/capacity report to current coverer (B-03)
+	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)       // uplink: health/capacity report direct to server (B-03); client is the ReportSink
 	go func() {                                                   // L4 engine + socket probe: faster than the reconcile pass so a worker wedge / socket loss surfaces in seconds (§4.1)
 		t := time.NewTicker(3 * time.Second)
 		defer t.Stop()

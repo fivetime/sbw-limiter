@@ -33,10 +33,15 @@ type Config struct {
 	// Degraded → canary withdrawn though forwarding is healthy. 0 → govpp default.
 	// See vpp.WithReplyTimeout / vpp-single-mainthread-bottleneck.
 	VPPReplyTimeout    config.Duration `json:"vpp_reply_timeout"`
-	ControllerEndpoint string          `json:"controller_endpoint"` // desired-state source (single / bootstrap)
-	// ControllerEndpoints is the bootstrap set for controller sharding (L-06): the
-	// agent connects to any one, Registers, and is told its primary/fallback
-	// coverers to home onto. Empty → [ControllerEndpoint] (single-controller mode).
+	// ControllerEndpoint is the SERVER endpoint the agent connects to DIRECTLY (REFACTOR
+	// step 4): register + subscribe (desired-state) + report all over one AgentService
+	// connection to sbw-server. Formerly a coverer address; the coverer no longer relays
+	// agent control (it taps passively). Env CONTROLLER_ENDPOINT.
+	ControllerEndpoint string          `json:"controller_endpoint"`
+	// ControllerEndpoints is retained for a multi-replica server behind DISTINCT addresses
+	// (bootstrap list; the agent uses the first). With a single server Service DNS the
+	// gRPC client's own reconnect suffices, so this is usually empty → [ControllerEndpoint].
+	// (Formerly the coverer-sharding primary/fallback set; coverer homing is gone.)
 	ControllerEndpoints []string        `json:"controller_endpoints"`
 	ReconcileInterval   config.Duration `json:"reconcile_interval"`  // §7: 60s
 	ReportInterval      config.Duration `json:"report_interval"`     // B-03 uplink cadence
