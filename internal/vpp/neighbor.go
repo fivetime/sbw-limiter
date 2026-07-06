@@ -53,6 +53,12 @@ func (n *Neighbors) DumpHosts(swIfIndex uint32) ([]netip.Prefix, error) {
 				continue
 			}
 			addr = addr.Unmap() // ToIP() already narrows v4 to 4 bytes; belt-and-suspenders
+			// Skip link-local (fe80::/10, 169.254/16): a member advertises its ROUTABLE
+			// address; its link-local is ND/RA noise that never matches a pool member's
+			// anchor and would pollute EdgeReport.ObservedMembers.
+			if addr.IsLinkLocalUnicast() {
+				continue
+			}
 			out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
 		}
 	}
