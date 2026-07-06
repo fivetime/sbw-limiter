@@ -4,25 +4,29 @@ import (
 	"log/slog"
 	"net/netip"
 	"sort"
+	"sync"
 
 	"github.com/fivetime/sbw-limiter/internal/vpp"
 )
 
 // MemberObserver reads the L's PHYSICAL member presence from VPP's ARP/ND neighbor
 // table on the member interface(s) — the L's physical authority (DESIGN-liveness §11 /
-// REFACTOR-coverer-liveness-only.md). Its Observe() feeds EdgeReport.ObservedMembers
-// (which the server consumes for member-up/down + locality) and, later, the agent's
-// own local anti-blackhole anchor gate ("防盲写黑洞": advertise only members the data
-// plane can actually see).
+// REFACTOR-coverer-liveness-only.md). ONE observation feeds two consumers: Observe() fills
+// EdgeReport.ObservedMembers (the server's member-up/down source) AND caches the result so
+// the anchor feed's local anti-blackhole gate reads it via Latest() without a second VPP
+// dump ("防盲写黑洞": advertise only members the data plane can actually see).
 //
 // Like FaultSensor, it opens a short-lived, reply-timeout-bounded channel per call so a
 // wedged/slow VPP main thread never blocks the report path (VPP single-main-thread
-// bottleneck). Best-effort: any VPP error yields an empty set — the report just omits
-// the field this pass; the server's fail-static "advertise" default is unaffected.
+// bottleneck). Best-effort: any VPP error yields nil ("no trustworthy read") — the report
+// omits the field and the gate falls static (advertises); the last GOOD read stays cached.
 type MemberObserver struct {
 	conn   *vpp.Conn
 	ifaces []string // member-facing interface names (e.g. host-macc)
 	log    *slog.Logger
+
+	mu   sync.Mutex
+	last []netip.Prefix // most recent TRUSTWORTHY observation (nil until first success)
 }
 
 // NewMemberObserver builds an observer over a live VPP connection scoped to the
@@ -88,5 +92,31 @@ func (o *MemberObserver) Observe() []netip.Prefix {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
+	// Cache this TRUSTWORTHY read (out is non-nil here) so the anchor feed's gate can read
+	// it via Latest() without a second VPP dump. Untrustworthy passes returned nil above
+	// and never reach here, so the cache always holds the last GOOD physical set.
+	f := make([]netip.Prefix, len(out))
+	copy(f, out)
+	o.mu.Lock()
+	o.last = f
+	o.mu.Unlock()
 	return out
+}
+
+// Latest returns the most recent TRUSTWORTHY observation (a copy), or nil if none has
+// succeeded yet. The anchor feed's local anti-blackhole gate reads it — sharing the
+// reporter's periodic dump rather than issuing its own. nil ⇒ the gate falls static
+// (advertise all, never blackhole a live member on an unread physical set).
+func (o *MemberObserver) Latest() []netip.Prefix {
+	if o == nil {
+		return nil
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.last == nil {
+		return nil
+	}
+	f := make([]netip.Prefix, len(o.last))
+	copy(f, o.last)
+	return f
 }

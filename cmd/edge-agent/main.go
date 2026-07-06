@@ -202,6 +202,11 @@ func main() {
 		}
 	}
 
+	// ONE physical member observer (REFACTOR step 3+5): its Observe() dump feeds the
+	// reporter's EdgeReport.ObservedMembers AND caches the result so the anchor feed's
+	// local anti-blackhole gate reads it via Latest() without a second VPP dump.
+	memberObserver := agent.NewMemberObserver(conn, cfg.MemberInterfaces, log)
+
 	reporter := agent.NewReporter(model.EdgeID(cfg.EdgeID), health,
 		agent.WithCapacity(func() model.CapacityReport {
 			// SessionBudget (DESIGN §9.1 admission): the max members this edge can
@@ -227,7 +232,7 @@ func main() {
 		// ObservedMembers. The L's physical authority the server consumes for
 		// member-up/down + locality, and the agent's own local anti-blackhole gate.
 		// Empty MemberInterfaces → observer returns nil → field omitted (compatible).
-		agent.WithObservedMembers(agent.NewMemberObserver(conn, cfg.MemberInterfaces, log).Observe),
+		agent.WithObservedMembers(memberObserver.Observe),
 		agent.WithReporterLogger(log),
 	)
 
@@ -247,7 +252,11 @@ func main() {
 		// to bird-vpp's `api` proto over the socket, no full-file `birdc configure`.
 		// Lazy connect; (re)connect triggers a HELLO+EOR resync, the proto's grace
 		// window covers brief reconnects without flapping the routes.
-		feed = birdfeed.NewFeed(cfg.BirdAPISocket, log)
+		// Local physical anti-blackhole gate (REFACTOR step 5): only advertise anchors for
+		// members the agent physically observes (VPP ARP/ND, via the shared observer's
+		// cached Latest). intent ∧ physical, both local to the agent — replaces the old
+		// coverer-tap ∧ server shouldWithdraw gate.
+		feed = birdfeed.NewFeed(cfg.BirdAPISocket, log).WithObserved(memberObserver.Latest)
 		log.Info("bird control plane via api socket (incremental feed)", "socket", cfg.BirdAPISocket)
 	} else if cfg.BirdAnchorsInclude != "" && cfg.BirdFlowspecInclude != "" {
 		bc := bird.NewReconnecting(cfg.BIRDSocketPath, log)
