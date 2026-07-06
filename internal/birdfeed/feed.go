@@ -139,12 +139,18 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 			for _, p := range obs {
 				present[p] = struct{}{}
 			}
+			var withheld []netip.Prefix
 			for p := range desA {
 				if model.IsHost(p) {
 					if _, ok := present[p]; !ok {
 						delete(desA, p)
+						withheld = append(withheld, p)
 					}
 				}
+			}
+			if len(withheld) > 0 {
+				f.log.Info("anchor gate: withholding physically-absent members",
+					"withheld", withheld, "observed", obs)
 			}
 		}
 	}

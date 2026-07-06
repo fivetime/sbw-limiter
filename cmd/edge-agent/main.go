@@ -280,6 +280,10 @@ func main() {
 			birdApply.Wake()
 		}
 	}
+	// Wake the anchor feed when the physical member set CHANGES (REFACTOR step 5): a member
+	// appearing → advertise its anchor promptly; a member leaving → WITHDRAW promptly
+	// (防盲写黑洞). Without this the local gate only re-evaluates on the reconcile timer.
+	memberObserver.SetOnChange(birdWake)
 
 	// Canary (soft-death §4.7/6.13): advertise CanaryPrefix tagged with CanaryLC
 	// via BIRD while the data plane is healthy; withdraw it on HealthDataPlaneDown

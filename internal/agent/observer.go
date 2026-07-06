@@ -25,9 +25,16 @@ type MemberObserver struct {
 	ifaces []string // member-facing interface names (e.g. host-macc)
 	log    *slog.Logger
 
-	mu   sync.Mutex
-	last []netip.Prefix // most recent TRUSTWORTHY observation (nil until first success)
+	mu       sync.Mutex
+	last     []netip.Prefix // most recent TRUSTWORTHY observation (nil until first success)
+	onChange func()         // fired (non-blocking) when the trustworthy set CHANGES
 }
+
+// SetOnChange wires a callback fired whenever a trustworthy observation DIFFERS from the
+// previous one — the agent wires it to birdWake so the anchor feed re-evaluates its local
+// gate PROMPTLY on a member appearing/leaving, rather than waiting for the next reconcile
+// timer. Prompt WITHDRAWAL on a member leaving is the anti-blackhole-critical half.
+func (o *MemberObserver) SetOnChange(fn func()) { o.onChange = fn }
 
 // NewMemberObserver builds an observer over a live VPP connection scoped to the
 // member-access interfaces. memberIfaces empty → Observe returns nil (disabled).
@@ -98,9 +105,28 @@ func (o *MemberObserver) Observe() []netip.Prefix {
 	f := make([]netip.Prefix, len(out))
 	copy(f, out)
 	o.mu.Lock()
+	changed := !samePrefixSet(o.last, f)
 	o.last = f
 	o.mu.Unlock()
+	if changed && o.onChange != nil {
+		o.onChange() // wake the anchor feed to re-gate promptly (member appeared/left)
+	}
 	return out
+}
+
+// samePrefixSet reports whether two SORTED prefix slices are equal. Both Observe outputs
+// are sorted, so an element-wise compare suffices. A nil-vs-empty difference counts as a
+// change (first trustworthy read after startup).
+func samePrefixSet(a, b []netip.Prefix) bool {
+	if (a == nil) != (b == nil) || len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Latest returns the most recent TRUSTWORTHY observation (a copy), or nil if none has
