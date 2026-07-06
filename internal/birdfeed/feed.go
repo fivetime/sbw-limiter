@@ -139,18 +139,24 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 			for _, p := range obs {
 				present[p] = struct{}{}
 			}
-			var withheld []netip.Prefix
+			withheld := 0
+			var sample netip.Prefix
 			for p := range desA {
 				if model.IsHost(p) {
 					if _, ok := present[p]; !ok {
 						delete(desA, p)
-						withheld = append(withheld, p)
+						if withheld == 0 {
+							sample = p
+						}
+						withheld++
 					}
 				}
 			}
-			if len(withheld) > 0 {
+			if withheld > 0 {
+				// Scale-safe: log counts + one sample, not the full sets (a member-scale
+				// edge could withhold thousands — never dump them all).
 				f.log.Info("anchor gate: withholding physically-absent members",
-					"withheld", withheld, "observed", obs)
+					"withheld", withheld, "sample", sample, "observed_count", len(present))
 			}
 		}
 	}
