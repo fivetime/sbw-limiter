@@ -111,3 +111,74 @@ func TestDesiredStoreStaleForGrows(t *testing.T) {
 		t.Fatalf("StaleFor = %s, want 90s", d)
 	}
 }
+
+// The stale-render guard (content watermark): the controller's full renders read
+// the pool store through follower reads pinned up to ~10s in the past, so a full
+// snapshot can carry a NEWER generation than a per-pool delta while its CONTENT
+// predates the delta's pool. Ordering by generation alone let such a snapshot
+// clobber the delta's merge — the next reconcile then orphan-deleted the fresh
+// pool's VPP policers for ~60s (TEST-SCENARIOS §6.26). Accept must reject a full
+// state whose content watermark is strictly older than what was applied.
+func TestDesiredStoreRejectsContentStaleSnapshot(t *testing.T) {
+	s := NewDesiredStore()
+
+	// Baseline full state at watermark T-10s (a normal follower-read render).
+	base := stateGen(10, ingressSpec(200, 1_000_000))
+	base.GeneratedAtUnixMs = 100_000
+	if !s.Accept(base) {
+		t.Fatal("baseline accept failed")
+	}
+
+	// A delta merges pool 964 with an EXACT content watermark (post-commit stamp).
+	if _, ok := s.Merge(model.EdgeDesiredDelta{
+		SchemaVersion: model.SchemaVersion, EdgeID: "test",
+		Generation: 11, GeneratedAtUnixMs: 111_000,
+		Upserts: []model.PoolDelta{{PoolID: 964, Policers: []model.PolicerSpec{ingressSpec(964, 500_000)}}},
+	}); !ok {
+		t.Fatal("delta merge failed")
+	}
+
+	// The racing stale full render: generation NEWER than the delta (minted after)
+	// but content watermark OLDER (follower-read snapshot predates the commit) and
+	// pool 964 missing. Must be rejected — accepting it would tear 964 down.
+	stale := stateGen(12, ingressSpec(200, 1_000_000))
+	stale.GeneratedAtUnixMs = 105_000 // < the delta's 111_000
+	if s.Accept(stale) {
+		t.Fatal("content-stale snapshot (newer generation, older watermark) must be rejected")
+	}
+	got, _ := s.Desired()
+	if got.Generation != 11 || len(got.Policers) != 2 {
+		t.Fatalf("held state clobbered: gen=%d policers=%d (want 11/2)", got.Generation, len(got.Policers))
+	}
+
+	// A later render past the staleness bound (watermark >= the delta's) with the
+	// full converged content is accepted — the level-triggered heal.
+	fresh := stateGen(13, ingressSpec(200, 1_000_000), ingressSpec(964, 500_000))
+	fresh.GeneratedAtUnixMs = 112_000
+	if !s.Accept(fresh) {
+		t.Fatal("fresh snapshot must be accepted")
+	}
+
+	// Legacy producer (no watermark, 0): generation ordering alone, as before.
+	legacy := stateGen(14, ingressSpec(200, 1_000_000))
+	legacy.GeneratedAtUnixMs = 0
+	if !s.Accept(legacy) {
+		t.Fatal("watermark-less (legacy) state must fall back to generation ordering")
+	}
+}
+
+// Equal watermarks must NOT be rejected: a commit at time T is visible to a
+// snapshot pinned at T, so an equal-watermark snapshot already contains it.
+func TestDesiredStoreAcceptsEqualWatermark(t *testing.T) {
+	s := NewDesiredStore()
+	a := stateGen(1, ingressSpec(200, 1_000_000))
+	a.GeneratedAtUnixMs = 50_000
+	if !s.Accept(a) {
+		t.Fatal("accept a")
+	}
+	b := stateGen(2, ingressSpec(200, 1_000_000))
+	b.GeneratedAtUnixMs = 50_000
+	if !s.Accept(b) {
+		t.Fatal("equal-watermark snapshot must be accepted")
+	}
+}

@@ -361,6 +361,14 @@ func main() {
 		if store.Accept(st) {
 			recon.Wake() // apply a fresh push now, not on the next timer tick (T-705)
 			birdWake()
+		} else {
+			// Rejected: older generation, or a content-stale snapshot (rendered from
+			// a follower-read DB snapshot predating an already-applied delta — the
+			// stale-render guard; see DesiredStore.Accept). Level-triggered resyncs
+			// deliver a fresh-enough one within seconds; log for gen-level tracing.
+			log.Info("desired state rejected (older generation or content-stale snapshot)",
+				"generation", st.Generation, "content_watermark_ms", st.GeneratedAtUnixMs,
+				"policers", len(st.Policers))
 		}
 	}
 	// Delta hot path (the agent is hands, not brain): apply just the touched pools in

@@ -35,6 +35,18 @@ type DesiredStore struct {
 	healthy   bool      // controller currently reachable
 	lastTouch time.Time // last accepted update
 
+	// contentAsOf is the CONTENT watermark (server clock, unix ms) of the held
+	// state: the max GeneratedAtUnixMs across every Accept and Merge applied. The
+	// controller's full renders read the pool store through FOLLOWER READS pinned
+	// up to ~10s in the past, so a full snapshot can carry a NEWER Generation than
+	// a per-pool delta while its content PREDATES that delta — ordering by
+	// generation alone let such a snapshot clobber the delta's merge and the next
+	// reconcile tore the fresh pool down as a VPP orphan (~60s rate-limit hole on
+	// its home edge; TEST-SCENARIOS §6.26). Accept therefore also rejects a full
+	// state whose watermark is strictly OLDER than this. 0 = producer sent no
+	// watermark (legacy): generation ordering alone, as before.
+	contentAsOf int64
+
 	now func() time.Time
 }
 
@@ -57,10 +69,22 @@ func (s *DesiredStore) Accept(state model.EdgeDesiredState) bool {
 	if s.haveState && state.Generation < s.state.Generation {
 		return false // older revision arrived late; keep the newer one
 	}
+	if s.haveState && state.GeneratedAtUnixMs > 0 && state.GeneratedAtUnixMs < s.contentAsOf {
+		// Content-stale snapshot: rendered from a follower-read DB snapshot that
+		// predates content we already applied (typically a delta's pool create),
+		// even though its Generation is newer. Taking it would remove that content
+		// and the next reconcile would orphan-delete its VPP programming. Reject;
+		// the controller's level-triggered resync re-renders past the staleness
+		// bound within seconds and THAT one is accepted.
+		return false
+	}
 	s.state = state
 	s.haveState = true
 	s.healthy = true
 	s.lastTouch = s.now()
+	if state.GeneratedAtUnixMs > s.contentAsOf {
+		s.contentAsOf = state.GeneratedAtUnixMs
+	}
 	return true
 }
 
@@ -148,6 +172,13 @@ func (s *DesiredStore) Merge(delta model.EdgeDesiredDelta) (prevSessions []model
 	s.state.Generation = delta.Generation
 	if delta.DesiredVersion != 0 {
 		s.state.DesiredVersion = delta.DesiredVersion
+	}
+	// Adopt the delta's content watermark: deltas are rendered from the committed
+	// pool passed in-memory (content-exact, stamped post-commit), so this is what
+	// protects the merge from a follower-read-stale full snapshot arriving later
+	// with a newer Generation (see Accept + the model field's doc).
+	if delta.GeneratedAtUnixMs > s.contentAsOf {
+		s.contentAsOf = delta.GeneratedAtUnixMs
 	}
 	s.healthy = true
 	s.lastTouch = s.now()
