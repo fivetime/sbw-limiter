@@ -61,8 +61,9 @@ func NewFeed(path string, log *slog.Logger) *Feed {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
-	return &Feed{
-		client:  NewClient(path),
+	c := NewClient(path)
+	f := &Feed{
+		client:  c,
 		path:    path,
 		log:     log,
 		wake:    make(chan struct{}, 1),
@@ -70,6 +71,13 @@ func NewFeed(path string, log *slog.Logger) *Feed {
 		flows:   map[netip.Prefix]struct{}{},
 		resync:  true,
 	}
+	// Bird-death wake (the bird-restart hole): the client's watcher detects the
+	// peer closing the socket (bird restart/stop) and wakes the feed, so the next
+	// pass reconnects + full-resyncs immediately — a stable desired state would
+	// otherwise never exercise the dead socket (zero-diff passes write nothing)
+	// and the steering bird lost would stay gone until an agent restart.
+	c.onDown = f.Wake
+	return f
 }
 
 // Wake requests an immediate feed pass (coalescing, non-blocking).
@@ -112,6 +120,11 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 	if !f.client.connected() {
 		if err := f.client.connect(); err != nil {
 			f.log.Warn("bird feed: connect failed", "socket", f.path, "err", err)
+			// bird is (re)starting — its socket isn't up yet. Retry on a short
+			// fuse instead of waiting out a full ReconcileInterval tick: each
+			// failed pass schedules exactly one wake (coalescing channel), so
+			// this self-arms every ~2s while bird is down and stops on success.
+			time.AfterFunc(2*time.Second, f.Wake)
 			return err
 		}
 		f.log.Info("bird feed: connected", "socket", f.path)

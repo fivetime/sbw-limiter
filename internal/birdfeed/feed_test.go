@@ -255,3 +255,37 @@ func TestGateReappearAndWithdraw(t *testing.T) {
 		t.Fatalf("physical-return: add=%d want 1 (re-advertise)", add)
 	}
 }
+
+// The bird-restart hole (fixed by the client watcher): bird dies while the
+// desired state is STABLE. The zero-diff incremental pass writes nothing, so
+// only connected() flipping false (the watcher's job in prod; simulated here)
+// makes the next pass reconnect and FULL-resync the unchanged state — without
+// it, bird's empty post-restart RIB would never be refed.
+func TestFeedPeerDeathResyncsUnchangedState(t *testing.T) {
+	f, s := newTestFeed()
+	st := model.EdgeDesiredState{
+		Anchors:         []model.Anchor{anchor("11.0.0.0/32"), anchor("11.0.0.1/32")},
+		FlowRedirects:   []model.FlowRedirect{flow("11.0.0.0/32")},
+		RedirectNextHop: netip.MustParseAddr("10.0.0.1"),
+	}
+	if err := f.apply(st); err != nil { // pass 1: cold resync
+		t.Fatal(err)
+	}
+	s.frames = nil
+	if err := f.apply(st); err != nil { // pass 2: steady state → zero diff
+		t.Fatal(err)
+	}
+	if len(s.frames) != 0 {
+		t.Fatalf("steady state must be a zero-diff pass, wrote %d frames", len(s.frames))
+	}
+
+	s.conn = false // bird restarted: the watcher tore the connection down
+	s.frames = nil
+	if err := f.apply(st); err != nil { // pass 3: SAME state → reconnect + full resync
+		t.Fatal(err)
+	}
+	add, del, hello, eor := countOps(s.frames)
+	if hello != 1 || eor != 1 || add != 3 || del != 0 {
+		t.Fatalf("post-death resync: hello=%d eor=%d add=%d del=%d (want 1/1/3/0)", hello, eor, add, del)
+	}
+}
