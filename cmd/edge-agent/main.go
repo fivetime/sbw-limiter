@@ -376,33 +376,36 @@ func main() {
 	// goroutine (SubmitDelta enqueues; SetDeltaApplier wires this), so it is mutually
 	// exclusive with the full Reconcile and may safely touch the VPP channel + polIdx.
 	//
-	// GAP DETECTION: a delta builds on BaseGeneration; if that ≠ the agent's last-
-	// applied generation, a push was missed/coalesced and applying onto a divergent
-	// base would silently corrupt state. We DROP it and rely on the controller's full
-	// DESIRED_STATE resync (it sends one on the hash mismatch the next report surfaces).
-	recon.SetDeltaApplier(func(delta model.EdgeDesiredDelta) {
-		if base := recon.LastAppliedGeneration(); delta.BaseGeneration != base {
-			log.Warn("desired-delta gap; dropping and awaiting full resync",
-				"base_generation", delta.BaseGeneration, "last_applied", base,
-				"delta_generation", delta.Generation)
-			return // controller resyncs a full DESIRED_STATE on the hash mismatch
-		}
+	// applyOneDelta merges one delta into the held state in lockstep with VPP. It
+	// reports whether last-applied ADVANCED so the sequencer knows the chain moved.
+	applyOneDelta := func(delta model.EdgeDesiredDelta) bool {
 		prev, ok := store.Merge(delta) // mutate the held state in lockstep with VPP
 		if !ok {
 			log.Warn("desired-delta with no base state; dropping (cold start, awaiting full state)",
 				"delta_generation", delta.Generation)
-			return
+			return false
 		}
 		if _, err := recon.ApplyDelta(delta, prev); err != nil {
 			// VPP only partially applied → do NOT wake BIRD: it must not advertise anchors/
 			// FlowSpec for a delta VPP could not fully install (traffic would steer to an
 			// uninstalled policer = unpoliced). The held-state/VPP divergence is healed by
-			// the full reconcile + the controller's hash-mismatch resync (gap-drop backstop).
+			// the full reconcile + the controller's hash-mismatch resync.
 			log.Error("desired-delta apply failed; not waking BIRD, awaiting full reconcile/resync", "err", err)
-			return
+			return false
 		}
 		birdWake() // a removed/added pool may change anchors/flowspec
-	})
+		return true
+	}
+	// REORDERING (§6.28): a delta builds on BaseGeneration, and the controller mints
+	// each edge's chain under one lock (so it is strictly linear), but it ENQUEUES
+	// deltas from concurrent goroutines — under a burst a successor can arrive before
+	// its predecessor. Dropping the successor (the old behaviour) forced a full resync
+	// and, under sustained concurrent churn, degraded the delta hot path to periodic
+	// resync. The sequencer buffers an ahead-of-chain delta and drains it the instant
+	// its predecessor lands; a genuinely lost predecessor still heals via the
+	// controller's hash-mismatch resync (which strands + evicts the buffered entry).
+	deltaSeq := agent.NewDeltaSequencer(recon.LastAppliedGeneration, applyOneDelta, log)
+	recon.SetDeltaApplier(deltaSeq.Submit)
 	// REFACTOR step 4: connect DIRECTLY to the server (no coverer relay, no homing
 	// director). One server endpoint; the gRPC ClientConn reconnects transparently and
 	// RunDirect re-registers + re-subscribes on each drop. cfg.Bootstrap() returns
