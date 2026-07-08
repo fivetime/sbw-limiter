@@ -389,9 +389,16 @@ func main() {
 			// VPP only partially applied → do NOT wake BIRD: it must not advertise anchors/
 			// FlowSpec for a delta VPP could not fully install (traffic would steer to an
 			// uninstalled policer = unpoliced). The held-state/VPP divergence is healed by
-			// the full reconcile + the controller's hash-mismatch resync.
-			log.Error("desired-delta apply failed; not waking BIRD, awaiting full reconcile/resync", "err", err)
-			return false
+			// the periodic full reconcile, which retries everything in the held state.
+			//
+			// But DO advance the desired chain (§6.40 layer 4): the Merge above already
+			// adopted this delta into the held state, so the chain position moved — and a
+			// delta that can NEVER apply (VPP rejects its parameters on every retry) must
+			// not strand all later deltas in the reorder buffer, or even this pool's own
+			// REMOVAL can never land and the ghost keeps the edge Degraded forever.
+			recon.AdoptDeltaBaseline(delta.Generation)
+			log.Error("desired-delta apply failed; chain advanced, not waking BIRD, full reconcile will retry", "err", err)
+			return true
 		}
 		birdWake() // a removed/added pool may change anchors/flowspec
 		return true
@@ -446,7 +453,7 @@ func main() {
 	// Start the loops. Each blocks until ctx is cancelled.
 	go client.RunDirect(ctx, cfg.CapacityBps)                     // downlink: register + subscribe + dispatch, direct to server (REFACTOR step 4)
 	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // converge VPP to desired every interval
-	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)       // uplink: health/capacity report direct to server (B-03); client is the ReportSink
+	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)        // uplink: health/capacity report direct to server (B-03); client is the ReportSink
 	go func() {                                                   // L4 engine + socket probe: faster than the reconcile pass so a worker wedge / socket loss surfaces in seconds (§4.1)
 		t := time.NewTicker(3 * time.Second)
 		defer t.Stop()

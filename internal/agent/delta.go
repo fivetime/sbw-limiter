@@ -96,14 +96,32 @@ func (r *Reconciler) ApplyDelta(delta model.EdgeDesiredDelta, prevSessions []mod
 
 	// Republish the metering snapshot (polIdx changed) and adopt this delta as the
 	// new apply baseline + recompute the installed pool-set hash (drift backstop).
+	r.AdoptDeltaBaseline(delta.Generation)
+	return res, nil
+}
+
+// AdoptDeltaBaseline advances the applied-generation chain to gen and republishes
+// the metering snapshot + installed pool-set hash from the CURRENT polIdx.
+// ApplyDelta calls it on success; the delta handler ALSO calls it when the VPP
+// apply FAILED after the desired-state Merge succeeded (§6.40 layer 4): lastGen is
+// the position on the DESIRED chain (what the agent has been told), not a VPP
+// completion marker — refusing to advance it on an apply error stranded every
+// subsequent delta in the reorder buffer behind a predecessor that could never
+// "complete" (a pool with VPP-rejected parameters retries forever), so even the
+// pool's own REMOVAL delta could not land and the ghost pool kept the edge
+// Degraded until restart. The VPP-side gap a failed apply leaves is healed by the
+// periodic full reconcile (which retries everything in the held desired state);
+// the snapshot/hash here reflect whatever polIdx really holds (partial applies
+// included), which is exactly the "installed" truth the drift backstop wants.
+// Reconcile-goroutine-only, like ApplyDelta.
+func (r *Reconciler) AdoptDeltaBaseline(gen uint64) {
 	snap := make(map[string]uint32, len(r.polIdx))
 	for name, idx := range r.polIdx {
 		snap[name] = idx
 	}
 	r.polSnap.Store(snap)
-	r.lastGen = delta.Generation
+	r.lastGen = gen
 	r.recomputePoolHash()
-	return res, nil
 }
 
 // upsertPoolPolicers adds missing / updates drifted policers for one pool's specs,

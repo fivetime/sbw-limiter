@@ -138,3 +138,39 @@ func TestDeltaSequencerApplyFailureHoldsChain(t *testing.T) {
 		t.Errorf("successor should stay buffered after predecessor apply failure: %d", seq.Buffered())
 	}
 }
+
+// TestApplyFailureAdvancesChainSoRemovalLands pins §6.40 layer 4: a delta whose
+// VPP apply FAILS (after the desired-state Merge succeeded) must still ADVANCE the
+// applied-generation chain. lastGen is the position on the DESIRED chain, not a VPP
+// completion marker: a pool with VPP-rejected parameters retries (and fails)
+// forever, so refusing to advance stranded every later delta in the reorder buffer
+// behind an un-completable predecessor — even the bad pool's own REMOVAL delta
+// could never land, and the ghost pool kept its home edges Degraded until a
+// restart. Model the fixed handler contract at the sequencer boundary: apply
+// returns TRUE (chain advanced) even when VPP errored, and the buffered removal
+// (base = the failed delta's generation) drains immediately.
+func TestApplyFailureAdvancesChainSoRemovalLands(t *testing.T) {
+	h := &seqHarness{last: 10, t: t}
+	// The fixed applyOneDelta contract: Merge adopts the delta (chain advances)
+	// even when the VPP apply errors — so this apply NEVER returns false for a
+	// merged delta, and the harness's contiguity check still holds.
+	seq := NewDeltaSequencer(func() uint64 { return h.last }, h.apply, slog.New(slog.DiscardHandler))
+
+	// Removal (base 11) arrives BEFORE its predecessor (the bad create, gen 11):
+	// buffered.
+	seq.Submit(d(11, 12))
+	if seq.Buffered() != 1 {
+		t.Fatalf("removal not buffered: %d", seq.Buffered())
+	}
+	// The bad create lands and its VPP apply FAILS — under the OLD contract apply
+	// returned false, the chain stayed at 10, and gen 12 (the removal) stayed
+	// buffered forever. Under the fixed contract the chain advances to 11 and the
+	// removal drains at once.
+	seq.Submit(d(10, 11))
+	if h.last != 12 {
+		t.Fatalf("chain = %d, want 12 (bad create advanced to 11, removal drained to 12)", h.last)
+	}
+	if seq.Buffered() != 0 {
+		t.Fatalf("removal still stranded: %d buffered", seq.Buffered())
+	}
+}
