@@ -36,6 +36,7 @@ type classifyReconciler interface {
 	FindTablesByMask() (map[model.MaskKind]uint32, error)
 	AddTable(vpp.TableSpec) (uint32, error)
 	DumpSessions(table uint32) ([]vpp.SessionInfo, error)
+	LookupHits(table uint32, mask model.MaskKind, prefixes []netip.Prefix) ([]uint32, error)
 	AddSession(table uint32, mask model.MaskKind, prefix netip.Prefix, hitNext uint32) error
 	DelSessionByKey(table uint32, mask model.MaskKind, key []byte) error
 }

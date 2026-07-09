@@ -51,6 +51,22 @@ func (f *fakeClassify) DumpSessions(table uint32) ([]vpp.SessionInfo, error) {
 	return out, nil
 }
 
+func (f *fakeClassify) LookupHits(table uint32, mask model.MaskKind, prefixes []netip.Prefix) ([]uint32, error) {
+	out := make([]uint32, len(prefixes))
+	for i, p := range prefixes {
+		m, err := vpp.SessionKey(mask, p)
+		if err != nil {
+			return nil, err
+		}
+		if hit, ok := f.sessions[table][hex.EncodeToString(m)]; ok {
+			out[i] = hit
+		} else {
+			out[i] = vpp.NoTable
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeClassify) AddSession(table uint32, mask model.MaskKind, prefix netip.Prefix, hitNext uint32) error {
 	m, err := vpp.SessionKey(mask, prefix)
 	if err != nil {

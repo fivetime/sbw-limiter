@@ -9,6 +9,7 @@ import (
 	"github.com/fivetime/sbw-contract/model"
 	"github.com/fivetime/sbw-limiter/internal/binapi/classify"
 	"github.com/fivetime/sbw-limiter/internal/binapi/interface_types"
+	"github.com/fivetime/sbw-limiter/internal/binapi/probe"
 )
 
 // Classify materializes the six fixed classify mask tables and their member
@@ -440,6 +441,66 @@ func (c *Classify) DumpSessions(tableIndex uint32) ([]SessionInfo, error) {
 			break
 		}
 		out = append(out, SessionInfo{HitNextIndex: d.HitNextIndex, Match: d.Match})
+	}
+	return out, nil
+}
+
+// LookupHits resolves each prefix in ONE mask's table to the hit-next index
+// installed on its classify session (the policer index in policer-classify
+// mode), or NoTable (~0) if no session matches. out[i] is prefixes[i]'s hit,
+// positionally.
+//
+// This is the O(1)-per-key point-lookup that replaces a whole-table
+// DumpSessions on the incremental reconcile hot path: each key is the SAME hash
+// lookup the data plane does per packet (vnet_classify_find_entry), issued in
+// one batched probe_classify_lookup request per chunk instead of dumping the
+// edge-wide shared mask table on every member add/remove. All prefixes must
+// belong to `mask` — they share the table's fixed match-buffer length, so one
+// key_len covers the batch (the plugin groups by table for exactly this reason).
+func (c *Classify) LookupHits(table uint32, mask model.MaskKind, prefixes []netip.Prefix) ([]uint32, error) {
+	if len(prefixes) == 0 {
+		return nil, nil
+	}
+	ms, err := specOf(mask)
+	if err != nil {
+		return nil, err
+	}
+	// Bounded well below the plugin's per-request ceiling (65536); keeps a big
+	// pool to a few round-trips instead of one, each doing O(1) work per key.
+	const chunk = 1024
+	out := make([]uint32, 0, len(prefixes))
+	for start := 0; start < len(prefixes); start += chunk {
+		end := start + chunk
+		if end > len(prefixes) {
+			end = len(prefixes)
+		}
+		var buf []byte
+		keyLen := 0
+		for _, p := range prefixes[start:end] {
+			m, err := ms.sessionMatch(p) // full (skip+match) buffer, as AddSession sends
+			if err != nil {
+				return nil, err
+			}
+			keyLen = len(m) // constant within a mask
+			buf = append(buf, m...)
+		}
+		req := &probe.ProbeClassifyLookup{
+			TableID:  table,
+			KeyLen:   uint32(keyLen),
+			MatchLen: uint32(len(buf)),
+			Match:    buf,
+		}
+		reply := &probe.ProbeClassifyLookupReply{}
+		if err := c.ch.SendRequest(req).ReceiveReply(reply); err != nil {
+			return nil, fmt.Errorf("vpp: probe_classify_lookup: %w", err)
+		}
+		if reply.Retval != 0 {
+			return nil, fmt.Errorf("vpp: probe_classify_lookup failed: retval %d", reply.Retval)
+		}
+		if len(reply.Hits) != end-start {
+			return nil, fmt.Errorf("vpp: probe_classify_lookup: got %d hits, want %d", len(reply.Hits), end-start)
+		}
+		out = append(out, reply.Hits...)
 	}
 	return out, nil
 }

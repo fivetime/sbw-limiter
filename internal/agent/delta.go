@@ -239,9 +239,10 @@ func (r *Reconciler) upsertPoolSessions(cl classifyReconciler, pool model.PoolID
 		prefix  netip.Prefix
 		hitNext uint32
 	}
-	// Desired key → want (within this pool), and the set of masks this pool uses.
+	// Desired key → want (within this pool), and the desired prefixes per mask
+	// (for the targeted point-lookup below).
 	wantByKey := map[string]want{}
-	masks := map[model.MaskKind]struct{}{}
+	wantPrefixes := map[model.MaskKind][]netip.Prefix{}
 	for _, s := range next {
 		idx, ok := r.polIdx[s.PolicerName]
 		if !ok {
@@ -252,7 +253,7 @@ func (r *Reconciler) upsertPoolSessions(cl classifyReconciler, pool model.PoolID
 			return added, deleted, moved, err
 		}
 		wantByKey[sessionMapKey(s.Mask, hex.EncodeToString(key))] = want{s.Mask, s.Prefix, idx}
-		masks[s.Mask] = struct{}{}
+		wantPrefixes[s.Mask] = append(wantPrefixes[s.Mask], s.Prefix)
 	}
 
 	// Delete prev members of this pool no longer desired.
@@ -274,21 +275,30 @@ func (r *Reconciler) upsertPoolSessions(cl classifyReconciler, pool model.PoolID
 		deleted++
 	}
 
-	// Read back the ACTUAL installed sessions for just this pool's masks, so a member
-	// already present at a different hit index is re-pointed (moved), and an unchanged
-	// one is a no-op. Scoped to the pool's mask tables — not a whole-edge dump.
-	actualHit := map[string]uint32{} // matchKey → installed hit index
-	for mask := range masks {
+	// Read back the hit index installed for JUST this pool's desired members, so a
+	// member already present at a different hit index is re-pointed (moved), and an
+	// unchanged one is a no-op. This is an O(pool) point-lookup (probe plugin's
+	// probe_classify_lookup), NOT a whole-table dump — a member add/remove no longer
+	// serializes the edge-wide shared mask table across VPP's main thread.
+	actualHit := map[string]uint32{} // matchKey → installed hit index (absent = no session)
+	for mask, prefixes := range wantPrefixes {
 		table, ok := tables[mask]
 		if !ok {
-			continue
+			continue // table not created yet → no sessions → all treated as adds
 		}
-		ss, err := cl.DumpSessions(table)
+		hits, err := cl.LookupHits(table, mask, prefixes)
 		if err != nil {
-			return added, deleted, moved, fmt.Errorf("agent: delta: dump sessions: %w", err)
+			return added, deleted, moved, fmt.Errorf("agent: delta: lookup sessions: %w", err)
 		}
-		for _, s := range ss {
-			actualHit[sessionMapKey(mask, hex.EncodeToString(s.Match))] = s.HitNextIndex
+		for i, p := range prefixes {
+			if hits[i] == vpp.NoTable {
+				continue // not installed
+			}
+			key, err := vpp.SessionKey(mask, p)
+			if err != nil {
+				return added, deleted, moved, err
+			}
+			actualHit[sessionMapKey(mask, hex.EncodeToString(key))] = hits[i]
 		}
 	}
 

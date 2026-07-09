@@ -21,7 +21,7 @@ OUT="internal/binapi"
 
 # Plugins the edge-agent uses; their type deps are pulled in automatically and
 # the output is pruned to the import closure below.
-KEEP="classify ethernet_types interface interface_types ip_types lcp memclnt policer policer_types"
+KEEP="classify ethernet_types interface interface_types ip_neighbor ip_types lcp memclnt policer policer_types probe"
 
 command -v binapi-generator >/dev/null || {
   echo "binapi-generator not found; go install go.fd.io/govpp/cmd/binapi-generator@v0.12.0" >&2
