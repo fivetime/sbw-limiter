@@ -6,6 +6,7 @@ import (
 	"github.com/fivetime/sbw-limiter/internal/binapi/classify"
 	"github.com/fivetime/sbw-limiter/internal/binapi/lcp"
 	"github.com/fivetime/sbw-limiter/internal/binapi/policer"
+	"github.com/fivetime/sbw-limiter/internal/binapi/probe"
 )
 
 // RequiredMessages is the set of binary-API messages the edge-agent's
@@ -24,6 +25,11 @@ func RequiredMessages() []govppapi.Message {
 		&classify.ClassifyAddDelTable{},
 		&classify.ClassifyAddDelSession{},
 		&classify.PolicerClassifySetInterface{},
+		// probe: O(1) classify session point-lookup (delta hot path). Listed here
+		// so an agent built for it refuses to go READY against a VPP that lacks the
+		// probe plugin / this API (fail-closed) instead of breaking every member
+		// add/remove mid-reconcile.
+		&probe.ProbeClassifyLookup{},
 		// linux-cp (T-410)
 		&lcp.LcpItfPairAddDelV3{},
 	}
