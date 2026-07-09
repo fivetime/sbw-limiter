@@ -231,6 +231,15 @@ func main() {
 	// local anti-blackhole gate reads it via Latest() without a second VPP dump.
 	memberObserver := agent.NewMemberObserver(conn, cfg.MemberInterfaces, log)
 
+	// Transport-level VPP-process liveness (§6.44): dial api.sock every second;
+	// 2 consecutive failures = process gone. Covers govpp's stalled-health-probe
+	// blind spot (conn.Healthy() can read true for up to 30s after a death whose
+	// probe write buffered before the process exited). A ~1s container self-heal
+	// produces at most one failure and never trips it. Detection only — never
+	// touches the govpp connection state. Fault() consults Dead(); the transition
+	// hook (wired below, after the reporter exists) wakes the event-driven report.
+	sockWatch := agent.NewSocketWatcher(cfg.VPPAPISocket, time.Second, 2, log)
+
 	reporter := agent.NewReporter(model.EdgeID(cfg.EdgeID), health,
 		agent.WithCapacity(func() model.CapacityReport {
 			// SessionBudget (DESIGN §9.1 admission): the max members this edge can
@@ -250,7 +259,7 @@ func main() {
 		// (api.sock EOF) / link-down (policer-interface carrier down) / forwarding-broken
 		// (③ probe verdict) at report time so the server routes a DETERMINATE fault to its
 		// fast failover (§4.2.4) instead of the blanket soft-death debounce.
-		agent.WithFault(agent.NewFaultSensor(conn, cfg.PolicerInterfaces, probeBroken, log)),
+		agent.WithFault(agent.NewFaultSensor(conn, cfg.PolicerInterfaces, probeBroken, sockWatch.Dead, log)),
 		// Physical member presence (REFACTOR §2/§3, DESIGN-liveness §11): read the
 		// member interface's VPP ARP/ND neighbor table each report → EdgeReport.
 		// ObservedMembers. The L's physical authority the server consumes for
@@ -478,7 +487,21 @@ func main() {
 	go client.RunDirect(ctx, cfg.CapacityBps)                     // downlink: register + subscribe + dispatch, direct to server (REFACTOR step 4)
 	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // converge VPP to desired every interval
 	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)        // uplink: health/capacity report direct to server (B-03); client is the ReportSink
-	go func() {                                                   // event-driven report: VPP health transition → wake the reporter (§4.2.4 ★实测更新)
+	// Transport-level process-death transitions (§6.44) wake the reporter too,
+	// with the same de-correlation jitter as the govpp path. The watcher already
+	// debounced (K consecutive dials), so no extra delay on the down edge beyond
+	// the jitter; recovery reuses the up-delay reasoning (post-restart breathing).
+	sockWatch.OnTransition(func(dead bool) {
+		delay := time.Duration(rand.Int64N(int64(reportDownJitterMax)))
+		if !dead {
+			delay += reportUpDelay
+		}
+		log.Info("vpp api-socket liveness transition; scheduling event-driven report",
+			"dead", dead, "delay", delay.Round(time.Millisecond))
+		time.AfterFunc(delay, reporter.Wake)
+	})
+	go sockWatch.Run(ctx)
+	go func() { // event-driven report: VPP health transition → wake the reporter (§4.2.4 ★实测更新)
 		for {
 			select {
 			case <-ctx.Done():

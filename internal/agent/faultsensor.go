@@ -46,15 +46,21 @@ type FaultSensor struct {
 	// broken is the §4.2.7 device-level forwarding-probe verdict (③): true once the
 	// active probe has seen K consecutive black-holed rounds. nil → ③ disabled.
 	broken func() bool
-	log    *slog.Logger
+	// apiDead is the transport-level VPP-process liveness (SocketWatcher.Dead,
+	// §6.44): the api socket has been un-dialable for K consecutive checks. It
+	// covers govpp's stalled-health-probe blind spot, where conn.Healthy() reads
+	// true for up to the 30s reply timeout after the process died. nil → disabled.
+	apiDead func() bool
+	log     *slog.Logger
 }
 
 // NewFaultSensor builds a sensor over a live VPP connection. policerIfaces is the
 // member/data interface set (cfg.PolicerInterfaces). Each Fault() call opens a
 // short-lived channel for the dump (only when the connection is healthy).
-// NewFaultSensor builds a sensor over a live VPP connection. broken is the §4.2.7
-// forwarding-probe verdict (ForwardingProbe.Broken); nil disables the ③ path.
-func NewFaultSensor(conn *vpp.Conn, policerIfaces []string, broken func() bool, log *slog.Logger) *FaultSensor {
+// broken is the §4.2.7 forwarding-probe verdict (ForwardingProbe.Broken); nil
+// disables the ③ path. apiDead is the transport-level process liveness
+// (SocketWatcher.Dead, §6.44); nil disables that supplement.
+func NewFaultSensor(conn *vpp.Conn, policerIfaces []string, broken, apiDead func() bool, log *slog.Logger) *FaultSensor {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
@@ -71,6 +77,7 @@ func NewFaultSensor(conn *vpp.Conn, policerIfaces []string, broken func() bool, 
 		},
 		policerIfaces: policerIfaces,
 		broken:        broken,
+		apiDead:       apiDead,
 		log:           log,
 	}
 }
@@ -80,6 +87,14 @@ func NewFaultSensor(conn *vpp.Conn, policerIfaces []string, broken func() bool, 
 func (s *FaultSensor) Fault() (model.FaultKind, string) {
 	if !s.healthy() {
 		return model.FaultVPPGone, "vpp control link down (api.sock EOF)"
+	}
+	// govpp can claim healthy for up to its 30s reply timeout after the process
+	// died (a health probe whose write buffered just before death stalls with no
+	// EPIPE chance — §6.44). The socket watcher's K-consecutive un-dialable is
+	// hard transport-level evidence the process is GONE, immune to a busy main
+	// thread; type ① from it even while conn.Healthy() lies.
+	if s.apiDead != nil && s.apiDead() {
+		return model.FaultVPPGone, "vpp api socket un-dialable (process gone; health-check stalled)"
 	}
 	list, err := s.dumpIfaces()
 	if err != nil {
