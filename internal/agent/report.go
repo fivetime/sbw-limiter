@@ -153,8 +153,10 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	// State=DataPlaneDown so SoftDead() is true — the server's typed-fault dataDead()
 	// trusts the report on that healthDead signal alone and routes it to its fast
 	// debounce (§4.2.4). FaultNone leaves the reconcile classification untouched.
+	var faultKind model.FaultKind
 	if r.fault != nil {
 		if fk, reason := r.fault.Fault(); fk != model.FaultNone {
+			faultKind = fk
 			rep.Health.FaultKind = fk
 			rep.Health.State = model.HealthDataPlaneDown
 			if reason != "" {
@@ -171,7 +173,13 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	if r.poolHash != nil {
 		rep.InstalledPoolHash = r.poolHash()
 	}
-	if r.observed != nil {
+	// ObservedMembers is a fresh VPP binary-API dump (ARP/ND). Skip it when VPP is
+	// GONE: the dump would just block on the dead API until the reply timeout,
+	// delaying the very vpp-gone report this event-driven build is rushing to the
+	// server (§6.44 live: a wedge judged in ~3s took ~18s to REACH the server
+	// because Build stalled here). vpp-gone means "no members observable" anyway;
+	// omit the field (server keeps the last set) rather than pay a doomed dump.
+	if r.observed != nil && faultKind != model.FaultVPPGone {
 		rep.ObservedMembers = r.observed()
 	}
 	return rep, true

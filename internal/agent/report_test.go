@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"sync"
 	"testing"
 	"time"
@@ -224,3 +225,38 @@ func TestReporterWakeStormGuard(t *testing.T) {
 		t.Fatalf("got %d reports total, want exactly 2 (initial + one deferred)", n)
 	}
 }
+
+// TestBuildSkipsObservedOnVPPGone pins the §6.44 fix: when the fault sensor types
+// vpp-gone, Build must NOT call the observed-members source — that source is a VPP
+// binary-API dump that would block on the dead API until the reply timeout,
+// delaying the vpp-gone report itself. Other faults (VPP alive) still dump.
+func TestBuildSkipsObservedOnVPPGone(t *testing.T) {
+	hc := NewHealthChecker("edge-o", fakeLive{healthy: true})
+	hc.Observe(model.EdgeDesiredState{Generation: 1}, Result{}, nil)
+
+	observeCalls := 0
+	fault := model.FaultVPPGone
+	r := NewReporter("edge-o", hc,
+		WithFault(faultFunc(func() (model.FaultKind, string) { return fault, "vpp gone" })),
+		WithObservedMembers(func() []netip.Prefix { observeCalls++; return nil }),
+	)
+
+	if _, ok := r.Build(); !ok {
+		t.Fatal("build should succeed")
+	}
+	if observeCalls != 0 {
+		t.Fatalf("observed dump must be skipped on vpp-gone, called %d times", observeCalls)
+	}
+	// A non-vpp-gone fault (VPP alive) still dumps.
+	fault = model.FaultLinkDown
+	if _, ok := r.Build(); !ok {
+		t.Fatal("build should succeed")
+	}
+	if observeCalls != 1 {
+		t.Fatalf("observed dump must run for a VPP-alive fault, called %d times", observeCalls)
+	}
+}
+
+type faultFunc func() (model.FaultKind, string)
+
+func (f faultFunc) Fault() (model.FaultKind, string) { return f() }
