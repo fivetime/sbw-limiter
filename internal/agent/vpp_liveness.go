@@ -36,6 +36,14 @@ type VppLiveness struct {
 	onTransition func(dead bool)
 	log          *slog.Logger
 
+	// reconnect, if set, rebuilds the stats reader (a stale-segment recovery: govpp's
+	// fsnotify reconnect can race under a rapid VPP restart / crashloop and leave the
+	// reader stuck on a dead segment reading a frozen heartbeat, so the edge would
+	// stay falsely-wedged even after VPP stabilized — needing a pod restart, §6.44).
+	reconnect      func()
+	reconnectEvery time.Duration
+	lastReconnect  time.Time
+
 	// loop-local (only Run's goroutine touches these)
 	haveBeat    bool
 	lastBeat    uint64
@@ -63,6 +71,14 @@ func NewVppLiveness(readBeat func() (uint64, error), disconnected func(error) bo
 // OnTransition registers the dead↔alive hook (wire to the reporter wake so the
 // typed vpp-gone / recovery reaches the server event-driven). Call before Run.
 func (p *VppLiveness) OnTransition(fn func(dead bool)) { p.onTransition = fn }
+
+// OnStaleReconnect wires a stats-reader rebuild, attempted (rate-limited to
+// every) while judged dead — so a reader stuck on a stale segment after a rapid
+// VPP restart recovers on its own instead of needing a pod restart (§6.44).
+func (p *VppLiveness) OnStaleReconnect(fn func(), every time.Duration) {
+	p.reconnect = fn
+	p.reconnectEvery = every
+}
 
 // Dead reports whether VPP is judged gone (process death or main-thread wedge).
 // The FaultSensor consults it to type vpp-gone even while govpp's binary-API
@@ -116,6 +132,15 @@ func (p *VppLiveness) check() {
 	// gauge (or an image without it) is never false-positived at startup.
 	if p.haveBeat && p.now().Sub(p.lastAdvance) >= p.wedgeGrace {
 		p.set(true, "heartbeat not advancing past grace (main-thread wedge)")
+		// Stale-segment recovery: while wedged, periodically rebuild the stats
+		// reader. If the stall was a stale segment from a rapid VPP restart, the
+		// fresh reader sees the live (advancing) heartbeat next poll and recovers;
+		// on a true wedge/death it still reads frozen and we stay dead. Rate-limited
+		// so a crashloop doesn't thrash reconnects.
+		if p.reconnect != nil && p.now().Sub(p.lastReconnect) >= p.reconnectEvery {
+			p.lastReconnect = p.now()
+			p.reconnect()
+		}
 		return
 	}
 	if err != nil {

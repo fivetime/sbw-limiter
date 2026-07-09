@@ -180,3 +180,48 @@ func TestVppLivenessStartupReadFailureSafe(t *testing.T) {
 		t.Fatalf("no transitions expected at startup, got %v", *trans)
 	}
 }
+
+// TestVppLivenessStaleReconnectRecovers pins the §6.44 crashloop-recovery gap: a
+// stats reader stuck on a stale segment after a rapid VPP restart reads a FROZEN
+// heartbeat (falsely wedged) even though VPP is live and advancing. The
+// stale-reconnect hook rebuilds the reader while dead; after the rebuild the
+// fresh reader sees the advancing heartbeat and the edge recovers on its own —
+// no pod restart needed.
+func TestVppLivenessStaleReconnectRecovers(t *testing.T) {
+	p, read, trans, now := newLivenessHarness(3 * time.Second)
+	p.reconnectEvery = 8 * time.Second
+
+	// A "stale reader" reads a frozen value; a rebuild swaps in a "fresh reader"
+	// that reads the live advancing heartbeat.
+	stale := true
+	live := uint64(500)
+	*read = func() (uint64, error) {
+		if stale {
+			return 100, nil // frozen (stale segment)
+		}
+		return live, nil // fresh segment, advancing
+	}
+	p.reconnect = func() { stale = false } // rebuild → swap to the fresh reader
+
+	// Prime alive on the (still-live) stale value, then freeze.
+	p.check() // beat=100, alive, lastAdvance=now
+
+	// Stall past grace → wedge, and the reconnect fires (lastReconnect zero → due).
+	*now = now.Add(4 * time.Second)
+	p.check()
+	if !p.Dead() {
+		t.Fatal("frozen stale read past grace must be judged dead")
+	}
+
+	// Next poll uses the rebuilt (fresh) reader → advancing heartbeat → recover.
+	live++
+	*now = now.Add(1 * time.Second)
+	p.check()
+	if p.Dead() {
+		t.Fatal("after stale-reconnect the fresh reader's advancing heartbeat must revive the edge")
+	}
+	// dead→...→alive transitions both fired.
+	if got := *trans; len(got) < 2 || got[len(got)-1] != false {
+		t.Fatalf("want a final alive transition, got %v", got)
+	}
+}

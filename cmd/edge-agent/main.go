@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -248,14 +249,36 @@ func main() {
 	// after the reporter exists.
 	var vppLive *agent.VppLiveness
 	var vppLiveDead func() bool
-	if liveStats, lerr := vpp.NewStatsReader(cfg.VPPStatsSocket); lerr != nil {
+	if liveStats0, lerr := vpp.NewStatsReader(cfg.VPPStatsSocket); lerr != nil {
 		log.Error("vpp liveness disabled: dedicated stats connect failed (falling back to conn.Healthy)",
 			"err", lerr, "socket", cfg.VPPStatsSocket)
 	} else {
-		defer func() { _ = liveStats.Close() }()
+		// Swappable reader: a rapid VPP restart can leave govpp's fsnotify-based
+		// reconnect stuck on a stale segment (frozen heartbeat → falsely wedged); the
+		// stale-reconnect hook rebuilds it while dead. Guard reads/swaps with a mutex.
+		liveStats := liveStats0
+		var liveMu sync.Mutex
+		defer func() { liveMu.Lock(); _ = liveStats.Close(); liveMu.Unlock() }()
 		vppLive = agent.NewVppLiveness(
-			func() (uint64, error) { return liveStats.ReadGauge("/probe/heartbeat") },
+			func() (uint64, error) {
+				liveMu.Lock()
+				r := liveStats
+				liveMu.Unlock()
+				return r.ReadGauge("/probe/heartbeat")
+			},
 			vpp.IsStatsDisconnected, time.Second, 3*time.Second, log)
+		vppLive.OnStaleReconnect(func() {
+			nr, rerr := vpp.NewStatsReader(cfg.VPPStatsSocket)
+			if rerr != nil {
+				log.Warn("vpp liveness: stale-segment stats reconnect failed", "err", rerr)
+				return
+			}
+			liveMu.Lock()
+			_ = liveStats.Close()
+			liveStats = nr
+			liveMu.Unlock()
+			log.Info("vpp liveness: rebuilt stats reader (recovering from a possibly stale segment)")
+		}, 8*time.Second)
 		vppLiveDead = vppLive.Dead
 	}
 
