@@ -46,11 +46,12 @@ type FaultSensor struct {
 	// broken is the §4.2.7 device-level forwarding-probe verdict (③): true once the
 	// active probe has seen K consecutive black-holed rounds. nil → ③ disabled.
 	broken func() bool
-	// apiDead is the transport-level VPP-process liveness (SocketWatcher.Dead,
-	// §6.44): the api socket has been un-dialable for K consecutive checks. It
-	// covers govpp's stalled-health-probe blind spot, where conn.Healthy() reads
-	// true for up to the 30s reply timeout after the process died. nil → disabled.
-	apiDead func() bool
+	// vppDead is stats-segment VPP liveness (VppLiveness.Dead, §6.44): the
+	// /probe/heartbeat stopped advancing (main-thread wedge) or the stats socket
+	// vanished (process death). It covers govpp's binary-API health-check blind
+	// spots — the reply-timeout stall where conn.Healthy() reads true for up to
+	// 30s after death, AND the wedge a socket dial cannot see. nil → disabled.
+	vppDead func() bool
 	log     *slog.Logger
 }
 
@@ -58,9 +59,9 @@ type FaultSensor struct {
 // member/data interface set (cfg.PolicerInterfaces). Each Fault() call opens a
 // short-lived channel for the dump (only when the connection is healthy).
 // broken is the §4.2.7 forwarding-probe verdict (ForwardingProbe.Broken); nil
-// disables the ③ path. apiDead is the transport-level process liveness
-// (SocketWatcher.Dead, §6.44); nil disables that supplement.
-func NewFaultSensor(conn *vpp.Conn, policerIfaces []string, broken, apiDead func() bool, log *slog.Logger) *FaultSensor {
+// disables the ③ path. vppDead is stats-segment process liveness
+// (VppLiveness.Dead, §6.44); nil disables that supplement.
+func NewFaultSensor(conn *vpp.Conn, policerIfaces []string, broken, vppDead func() bool, log *slog.Logger) *FaultSensor {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
@@ -77,7 +78,7 @@ func NewFaultSensor(conn *vpp.Conn, policerIfaces []string, broken, apiDead func
 		},
 		policerIfaces: policerIfaces,
 		broken:        broken,
-		apiDead:       apiDead,
+		vppDead:       vppDead,
 		log:           log,
 	}
 }
@@ -88,13 +89,13 @@ func (s *FaultSensor) Fault() (model.FaultKind, string) {
 	if !s.healthy() {
 		return model.FaultVPPGone, "vpp control link down (api.sock EOF)"
 	}
-	// govpp can claim healthy for up to its 30s reply timeout after the process
-	// died (a health probe whose write buffered just before death stalls with no
-	// EPIPE chance — §6.44). The socket watcher's K-consecutive un-dialable is
-	// hard transport-level evidence the process is GONE, immune to a busy main
-	// thread; type ① from it even while conn.Healthy() lies.
-	if s.apiDead != nil && s.apiDead() {
-		return model.FaultVPPGone, "vpp api socket un-dialable (process gone; health-check stalled)"
+	// govpp's binary-API health check can lie: a probe write buffered just before
+	// death stalls its 30s reply timeout, and a wedged main thread still lets the
+	// kernel accept — either way conn.Healthy() reads true. Stats-segment liveness
+	// (heartbeat stalled = wedge, socket gone = death) is the off-main-thread
+	// evidence; type ① from it even while conn.Healthy() lies (§6.44).
+	if s.vppDead != nil && s.vppDead() {
+		return model.FaultVPPGone, "vpp dead via stats heartbeat (process gone or main-thread wedge)"
 	}
 	list, err := s.dumpIfaces()
 	if err != nil {

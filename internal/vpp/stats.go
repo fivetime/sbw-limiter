@@ -1,6 +1,7 @@
 package vpp
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +11,15 @@ import (
 	govppapi "go.fd.io/govpp/api"
 	govppcore "go.fd.io/govpp/core"
 )
+
+// IsStatsDisconnected reports whether a stats read failed because the VPP stats
+// segment is gone — the socket was removed, which govpp detects via fsnotify
+// (event-driven, immediate). This is the authoritative "VPP process died/
+// restarted" signal off the stats channel (§6.44): distinct from a transient
+// gauge-not-found (segment still mapped, VPP alive).
+func IsStatsDisconnected(err error) bool {
+	return errors.Is(err, adapter.ErrStatsDisconnected)
+}
 
 // PolicerCounters is one policer's cumulative conform/exceed/violate combined
 // counters (packets + bytes), summed across VPP worker threads.
