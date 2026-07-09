@@ -198,16 +198,29 @@ func TestReporterWakeStormGuard(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("first wake did not send")
 	}
-	// Burst inside wakeMinInterval: all dropped (coalesce + guard). Wake must not block.
+	// Burst inside wakeMinInterval: coalesced + DEFERRED (not sent now, not lost).
+	// Wake must not block.
 	for i := 0; i < 50; i++ {
 		r.Wake()
 	}
 	select {
 	case <-sink.gotC:
-		t.Fatal("wake inside wakeMinInterval produced a report; storm guard broken")
+		t.Fatal("wake inside wakeMinInterval produced an immediate report; storm guard broken")
 	case <-time.After(200 * time.Millisecond):
 	}
 	if n := len(sink.reports()); n != 1 {
-		t.Fatalf("got %d reports, want exactly 1 (guarded burst)", n)
+		t.Fatalf("got %d reports during the guard window, want exactly 1", n)
+	}
+	// The guarded burst is deferred, not dropped: exactly one more send lands once
+	// wakeMinInterval elapses (a permanent-death wake must never be silently lost
+	// to the 15s ticker latency).
+	select {
+	case <-sink.gotC:
+	case <-time.After(3 * wakeMinInterval):
+		t.Fatal("deferred wake never fired; guarded wake was dropped, not deferred")
+	}
+	time.Sleep(50 * time.Millisecond) // absorb any (incorrect) extra sends
+	if n := len(sink.reports()); n != 2 {
+		t.Fatalf("got %d reports total, want exactly 2 (initial + one deferred)", n)
 	}
 }

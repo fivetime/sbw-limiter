@@ -214,8 +214,15 @@ func (r *Reporter) Run(ctx context.Context, interval time.Duration, sink ReportS
 		case <-t.C:
 			send()
 		case <-r.wake:
-			if time.Since(lastSend) < wakeMinInterval {
-				continue // storm guard; the ticker backstops
+			if since := time.Since(lastSend); since < wakeMinInterval {
+				// Storm guard — but DEFER, don't drop: a permanent-death wake
+				// arriving just after a periodic send would otherwise fall back
+				// to the full report-interval latency (the exact term this path
+				// exists to remove). The deferred re-Wake passes through this
+				// guard again, so a flapping source still can't exceed one send
+				// per wakeMinInterval.
+				time.AfterFunc(wakeMinInterval-since, r.Wake)
+				continue
 			}
 			send()
 		}
