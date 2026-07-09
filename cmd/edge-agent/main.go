@@ -280,11 +280,15 @@ func main() {
 		// fast failover (§4.2.4) instead of the blanket soft-death debounce.
 		agent.WithFault(agent.NewFaultSensor(conn, cfg.PolicerInterfaces, probeBroken, vppLiveDead, log)),
 		// Physical member presence (REFACTOR §2/§3, DESIGN-liveness §11): read the
-		// member interface's VPP ARP/ND neighbor table each report → EdgeReport.
-		// ObservedMembers. The L's physical authority the server consumes for
-		// member-up/down + locality, and the agent's own local anti-blackhole gate.
-		// Empty MemberInterfaces → observer returns nil → field omitted (compatible).
-		agent.WithObservedMembers(memberObserver.Observe),
+		// member interface's VPP ARP/ND neighbor table. The L's physical authority
+		// the server consumes for member-up/down + locality, and the agent's own
+		// local anti-blackhole gate. Build reads the CACHED set (Latest), never a
+		// live dump: the dump is a VPP binary-API call that blocks on an
+		// unresponsive/wedged VPP until the reply timeout, and it must not stall the
+		// report — least of all the event-driven vpp-gone report racing to the
+		// server (§6.44 live: it added ~8s to failover). A background loop (below)
+		// refreshes the cache; report/liveness hot paths stay dump-free.
+		agent.WithObservedMembers(memberObserver.Latest),
 		agent.WithReporterLogger(log),
 	)
 
@@ -506,6 +510,19 @@ func main() {
 	go client.RunDirect(ctx, cfg.CapacityBps)                     // downlink: register + subscribe + dispatch, direct to server (REFACTOR step 4)
 	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // converge VPP to desired every interval
 	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)        // uplink: health/capacity report direct to server (B-03); client is the ReportSink
+	go func() {                                                   // observed-members cache refresh (off the report/liveness hot path; §6.44)
+		t := time.NewTicker(cfg.ReportInterval.Std())
+		defer t.Stop()
+		memberObserver.Observe() // prime the cache
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				memberObserver.Observe() // a wedged VPP blocks THIS loop, not the report
+			}
+		}
+	}()
 	// Stats-segment liveness transitions (§6.44) wake the reporter too, with the
 	// same de-correlation jitter as the govpp health path. Wedge/death is already
 	// debounced inside VppLiveness (wedgeGrace / disconnect), so no extra delay on
