@@ -28,6 +28,16 @@ type ForwardingProbe struct {
 	fails       int         // loop-local consecutive failure count (only the Run goroutine touches it)
 	everHealthy bool        // has the target been reachable at least once? (loop-local)
 	broken      atomic.Bool // the verdict the FaultSensor reads
+
+	// gen, when bound, is the data-plane (re)connect generation (vpp.Conn.Generation).
+	// A change means VPP RESTARTED under a still-armed probe: the FIB is empty until
+	// bird/vppfib re-feeds (tens of seconds), and an armed probe would misread that
+	// rebuild window as a black-hole → forwarding-broken → spurious IMMEDIATE failover
+	// (server routes ③ as trusted+immediate). The startup grace (everHealthy) only
+	// covers AGENT restarts; this is its twin for VPP restarts: on a generation change
+	// the probe DISARMS and re-arms on first reachability, exactly like boot.
+	gen     func() uint64
+	lastGen uint64 // loop-local (only the Run goroutine compares/updates after Bind)
 }
 
 // NewForwardingProbe builds a probe. ping is one round (e.g. conn.Ping wrapped to return
@@ -44,6 +54,14 @@ func NewForwardingProbe(ping func() (int, error), interval time.Duration, k int,
 
 // Broken reports whether the forwarding path has failed k consecutive rounds.
 func (p *ForwardingProbe) Broken() bool { return p.broken.Load() }
+
+// BindDataplaneGeneration wires the VPP (re)connect generation source
+// (vpp.Conn.Generation) so a VPP restart disarms the probe (see the gen field
+// doc). The current generation is snapshotted as the baseline. Call before Run.
+func (p *ForwardingProbe) BindDataplaneGeneration(gen func() uint64) {
+	p.gen = gen
+	p.lastGen = gen()
+}
 
 // Run probes every interval until ctx is cancelled. A transport error (probe could not
 // run — busy main thread, channel error) is NEITHER a healthy round NOR a forwarding
@@ -63,6 +81,21 @@ func (p *ForwardingProbe) Run(ctx context.Context) {
 }
 
 func (p *ForwardingProbe) round() {
+	// VPP restarted since the last round → the data plane is REBUILDING (empty FIB
+	// until bird re-feeds); disarm and re-arm on first reachability, like boot. This
+	// must precede the ping so the rebuild window's legitimate zero-reach rounds
+	// never count as regressions (live-hit: §6.44 — 3 fails during a 30s vppfib
+	// re-feed spuriously killed the edge).
+	if p.gen != nil {
+		if g := p.gen(); g != p.lastGen {
+			p.lastGen = g
+			p.fails = 0
+			p.everHealthy = false
+			p.broken.Store(false)
+			p.log.Info("forwarding probe disarmed: VPP restarted (data plane rebuilding); re-arms on first reachability",
+				"generation", g)
+		}
+	}
 	recv, err := p.ping()
 	switch {
 	case err != nil:

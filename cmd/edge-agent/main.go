@@ -217,6 +217,10 @@ func main() {
 				"interval", cfg.ForwardingProbeInterval.Std(), "fails", cfg.ForwardingProbeFails)
 		}
 		if fp != nil {
+			// VPP restart (generation bump) disarms the probe until first
+			// reachability: the post-restart FIB-rebuild window (bird/vppfib
+			// re-feed, tens of seconds) must not read as a black-hole (§6.44).
+			fp.BindDataplaneGeneration(conn.Generation)
 			go fp.Run(ctx)
 			probeBroken = fp.Broken
 		}

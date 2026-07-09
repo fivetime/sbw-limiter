@@ -89,3 +89,42 @@ func TestForwardingProbeArmsOnlyAfterFirstHealthy(t *testing.T) {
 		t.Fatal("after being healthy, K consecutive fails must break")
 	}
 }
+
+// TestForwardingProbeDisarmsOnVPPRestart pins the §6.44 fix: a VPP restart
+// (data-plane generation bump) under a still-ARMED probe must DISARM it — the
+// post-restart FIB-rebuild window (bird/vppfib re-feed) legitimately reads
+// unreachable, and an armed probe counting those rounds declares a spurious
+// black-hole → trusted+immediate failover. Symmetric to the boot grace: re-arms
+// on first reachability, and a real post-rebuild regression still breaks.
+func TestForwardingProbeDisarmsOnVPPRestart(t *testing.T) {
+	var recv int
+	gen := uint64(1)
+	p := NewForwardingProbe(func() (int, error) { return recv, nil }, 0, 3, nil)
+	p.BindDataplaneGeneration(func() uint64 { return gen })
+
+	// Arm: healthy once.
+	recv = 3
+	p.round()
+
+	// VPP restarts; the FIB-rebuild window reads unreachable for many rounds.
+	gen = 2
+	recv = 0
+	for i := 0; i < 10; i++ {
+		p.round()
+	}
+	if p.Broken() {
+		t.Fatal("rebuild window after VPP restart must not read as a black-hole (§6.44 regression)")
+	}
+
+	// Rebuild completes → first reachability re-arms.
+	recv = 3
+	p.round()
+	// A REAL regression after re-arm still breaks in K rounds.
+	recv = 0
+	p.round()
+	p.round()
+	p.round()
+	if !p.Broken() {
+		t.Fatal("a real post-rebuild regression must still break")
+	}
+}
