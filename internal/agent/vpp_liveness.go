@@ -84,7 +84,12 @@ func (p *VppLiveness) Run(ctx context.Context) {
 }
 
 func (p *VppLiveness) check() {
+	_t0 := time.Now()
 	beat, err := p.readBeat()
+	if _ms := time.Since(_t0).Milliseconds(); _ms > 50 || err != nil {
+		p.log.Info("DIAG liveness poll", "beat", beat, "err", err, "readMs", _ms,
+			"sinceAdvanceMs", p.now().Sub(p.lastAdvance).Milliseconds())
+	}
 	switch {
 	case err != nil && p.disconnected(err):
 		// Stats socket removed = process gone (govpp fsnotify). Note: on an
