@@ -87,29 +87,39 @@ func (p *VppLiveness) check() {
 	beat, err := p.readBeat()
 	switch {
 	case err != nil && p.disconnected(err):
-		// Stats socket removed = process gone/restarting.
+		// Stats socket removed = process gone (govpp fsnotify). Note: on an
+		// emptyDir stats socket a crashed VPP's file lingers, so this often does
+		// NOT fire — the heartbeat-stall path below is the real backstop for death.
 		p.set(true, "stats disconnected (VPP process gone)")
-	case err != nil:
-		// Segment connected but heartbeat unreadable (gauge not yet registered on
-		// a just-restarted VPP, or an image without the heartbeat). VPP is alive;
-		// leave the verdict unchanged rather than false-positive a death.
-		p.log.Debug("vpp liveness: heartbeat unreadable (verdict unchanged)", "err", err)
-	case !p.haveBeat || beat > p.lastBeat:
+		return
+	case err == nil && (!p.haveBeat || beat > p.lastBeat):
 		// Advanced (or first read) → alive.
 		p.haveBeat = true
 		p.lastBeat = beat
 		p.lastAdvance = p.now()
 		p.set(false, "")
-	case beat < p.lastBeat:
+		return
+	case err == nil && beat < p.lastBeat:
 		// Counter went backwards → VPP restarted (new process, beats from 0). Alive.
 		p.lastBeat = beat
 		p.lastAdvance = p.now()
 		p.set(false, "")
-	default:
-		// beat == lastBeat: not advancing. Wedge once stalled past the grace.
-		if p.now().Sub(p.lastAdvance) >= p.wedgeGrace {
-			p.set(true, "heartbeat stalled past grace (main-thread wedge)")
-		}
+		return
+	}
+	// Fall-through: the heartbeat did NOT advance this round — either it read the
+	// same value (frozen main thread) OR the read failed with a non-disconnect
+	// error (e.g. a SIGSTOP-frozen VPP wedged mid-stats-update, whose inProgress
+	// flag makes DumpStats fail). BOTH mean "no forward progress", so both count
+	// toward the wedge grace — waiting only on a same-value read let a read-failing
+	// wedge drag on (§6.44 live: SIGSTOP took 16s instead of ~3s). Only arm this
+	// once a beat has ever been seen, so a fresh VPP that hasn't registered the
+	// gauge (or an image without it) is never false-positived at startup.
+	if p.haveBeat && p.now().Sub(p.lastAdvance) >= p.wedgeGrace {
+		p.set(true, "heartbeat not advancing past grace (main-thread wedge)")
+		return
+	}
+	if err != nil {
+		p.log.Debug("vpp liveness: heartbeat unreadable (within grace)", "err", err)
 	}
 }
 

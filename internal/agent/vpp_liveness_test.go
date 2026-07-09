@@ -137,3 +137,46 @@ func TestFaultSensorTypesVPPGoneFromStats(t *testing.T) {
 		t.Fatalf("alive VPP + healthy dump must be FaultNone, got %v", fk)
 	}
 }
+
+// TestVppLivenessReadFailureCountsAsStall pins the §6.44-live fix: after a beat
+// has been seen, a non-disconnect READ FAILURE (a SIGSTOP-frozen VPP whose
+// inProgress makes DumpStats fail) counts toward the wedge grace exactly like a
+// frozen same-value read — otherwise a read-failing wedge drags on (16s vs 3s).
+func TestVppLivenessReadFailureCountsAsStall(t *testing.T) {
+	p, read, _, now := newLivenessHarness(3 * time.Second)
+	beat := uint64(50)
+	*read = func() (uint64, error) { return beat, nil }
+	p.check() // alive, lastAdvance = now
+
+	// Read now FAILS (non-disconnect: frozen-VPP DumpStats error), not just frozen.
+	readErr := errors.New("vpp: dump gauge /probe/heartbeat: access failed")
+	*read = func() (uint64, error) { return 0, readErr }
+	*now = now.Add(2 * time.Second)
+	p.check()
+	if p.Dead() {
+		t.Fatal("2s of read failure < 3s grace must not flip wedge")
+	}
+	*now = now.Add(2 * time.Second) // 4s of continuous read failure
+	p.check()
+	if !p.Dead() {
+		t.Fatal("read failure sustained past grace must be judged wedge (§6.44 16s fix)")
+	}
+}
+
+// TestVppLivenessStartupReadFailureSafe: a read failure BEFORE any beat has been
+// seen (fresh VPP without the gauge yet) must NOT be judged dead, however long —
+// only an ever-alive VPP's stall counts.
+func TestVppLivenessStartupReadFailureSafe(t *testing.T) {
+	p, read, trans, now := newLivenessHarness(3 * time.Second)
+	*read = func() (uint64, error) { return 0, errors.New("vpp: gauge not found") }
+	for i := 0; i < 10; i++ {
+		*now = now.Add(2 * time.Second)
+		p.check()
+	}
+	if p.Dead() {
+		t.Fatal("read failure with no beat ever seen must not be judged dead (startup safety)")
+	}
+	if len(*trans) != 0 {
+		t.Fatalf("no transitions expected at startup, got %v", *trans)
+	}
+}
