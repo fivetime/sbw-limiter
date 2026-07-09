@@ -335,7 +335,7 @@ func main() {
 		// members the agent physically observes (VPP ARP/ND, via the shared observer's
 		// cached Latest). intent ∧ physical, both local to the agent — replaces the old
 		// coverer-tap ∧ server shouldWithdraw gate.
-		feed = birdfeed.NewFeed(cfg.BirdAPISocket, log).WithObserved(memberObserver.Latest)
+		feed = birdfeed.NewFeed(cfg.BirdAPISocket, log)
 		log.Info("bird control plane via api socket (incremental feed)", "socket", cfg.BirdAPISocket)
 	} else if cfg.BirdAnchorsInclude != "" && cfg.BirdFlowspecInclude != "" {
 		bc := bird.NewReconnecting(cfg.BIRDSocketPath, log)
@@ -359,11 +359,6 @@ func main() {
 			birdApply.Wake()
 		}
 	}
-	// Wake the anchor feed when the physical member set CHANGES (REFACTOR step 5): a member
-	// appearing → advertise its anchor promptly; a member leaving → WITHDRAW promptly
-	// (防盲写黑洞). Without this the local gate only re-evaluates on the reconcile timer.
-	memberObserver.SetOnChange(birdWake)
-
 	// Canary (soft-death §4.7/6.13): advertise CanaryPrefix tagged with CanaryLC
 	// via BIRD while the data plane is healthy; withdraw it on HealthDataPlaneDown
 	// so the controller's RIB tap sees CanaryDown and (with the agent's own

@@ -35,14 +35,6 @@ type Feed struct {
 	log    *slog.Logger
 	wake   chan struct{}
 
-	// observed, if set, is the local physical anti-blackhole gate (防盲写黑洞,
-	// REFACTOR step 5): the agent's most recent TRUSTWORTHY VPP ARP/ND observation
-	// (MemberObserver.Latest). A HOST member's /32//128 anchor is fed only if that
-	// member is physically present in this set (intent ∧ physical, both local to the
-	// agent). nil, or a nil return, ⇒ no gating (fail-static: advertise all — never
-	// blackhole a live member because its physical set couldn't be read).
-	observed func() []netip.Prefix
-
 	// snapshot of what is currently fed, for diffing.
 	anchors  map[netip.Prefix]struct{}
 	flows    map[netip.Prefix]struct{} // both families; EC chosen per-prefix family
@@ -50,11 +42,6 @@ type Feed struct {
 	nextHop6 netip.Addr                // v6 redirect target (for the 20-byte i6ec)
 	resync   bool
 }
-
-// WithObserved wires the local physical-presence gate (REFACTOR step 5): fn returns the
-// agent's most recent trustworthy VPP ARP/ND member set (MemberObserver.Latest). Anchors
-// for physically-absent HOST members are withheld. nil disables the gate (advertise all).
-func (f *Feed) WithObserved(fn func() []netip.Prefix) *Feed { f.observed = fn; return f }
 
 // NewFeed wires a Feed over a fresh Client for the api socket path.
 func NewFeed(path string, log *slog.Logger) *Feed {
@@ -137,41 +124,6 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 	desA := make(map[netip.Prefix]struct{}, len(st.Anchors))
 	for _, a := range st.Anchors {
 		desA[a.Prefix] = struct{}{}
-	}
-	// Local physical anti-blackhole gate (REFACTOR step 5): withhold a HOST member's
-	// anchor unless the agent physically observes that member (VPP ARP/ND). intent (the
-	// desired anchor) ∧ physical (the observation) — both local to the agent, no coverer
-	// tap round-trip. Fail-static: a nil observation (never read / VPP unhealthy) gates
-	// nothing (advertise all). Non-host anchors (a /24 bare-metal block) are not a
-	// physical-presence signal → never gated (mirrors the server's shouldWithdraw). The
-	// existing diff turns a withheld member into a DEL (withdraw) and a re-appeared one
-	// into an ADD, so the gate self-heals as the physical set changes.
-	if f.observed != nil {
-		if obs := f.observed(); obs != nil {
-			present := make(map[netip.Prefix]struct{}, len(obs))
-			for _, p := range obs {
-				present[p] = struct{}{}
-			}
-			withheld := 0
-			var sample netip.Prefix
-			for p := range desA {
-				if model.IsHost(p) {
-					if _, ok := present[p]; !ok {
-						delete(desA, p)
-						if withheld == 0 {
-							sample = p
-						}
-						withheld++
-					}
-				}
-			}
-			if withheld > 0 {
-				// Scale-safe: log counts + one sample, not the full sets (a member-scale
-				// edge could withhold thousands — never dump them all).
-				f.log.Info("anchor gate: withholding physically-absent members",
-					"withheld", withheld, "sample", sample, "observed_count", len(present))
-			}
-		}
 	}
 	desF := make(map[netip.Prefix]struct{}, len(st.FlowRedirects))
 	haveV4, haveV6 := false, false
