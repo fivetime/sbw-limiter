@@ -11,16 +11,14 @@ import (
 	"github.com/fivetime/sbw-limiter/internal/binapi/ip_types"
 )
 
-// Neighbors reads VPP's ARP/ND neighbor table — the L's PHYSICAL authority on
-// which member hosts are actually present on its member interface (DESIGN-liveness
-// §11 / REFACTOR-coverer-liveness-only.md). The agent turns the live neighbor set
-// into EdgeReport.ObservedMembers (the physical-presence signal the server consumes
-// for member-up/down + locality) and gates anchor advertisement locally on it
-// ("防盲写黑洞": advertise only members the data plane can actually see).
+// Neighbors reads VPP's ARP/ND neighbor table on the member interface. The agent
+// turns the live neighbor set into EdgeReport.ObservedMembers (the server's
+// member-up/down signal). It does NOT gate anchor advertisement — that gate is gone.
 //
-// Co-located with VPP over the same binary-API channel the policer/classify
-// materializers use — no BGP round-trip, no coverer tap: a directly-connected host
-// that answers ARP/ND has a resolved neighbor entry; a dead/absent host does not.
+// CAVEAT: a neighbor entry only exists for members L2-adjacent to this L, which is a
+// lab-topology accident (in production members arrive via fabric→R→L over BGP and are
+// never on L's neighbor segment). So this ObservedMembers basis is owed a rework onto
+// forwarding/FIB reachability (DESIGN-liveness §10); see MemberObserver's doc.
 type Neighbors struct {
 	ch govppapi.Channel
 }

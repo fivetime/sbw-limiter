@@ -104,9 +104,9 @@ func WithPoolHash(fn PoolHashFunc) ReporterOption { return func(r *Reporter) { r
 // the report so a determinate fault is typed + surfaced within one report interval.
 func WithFault(fn FaultSource) ReporterOption { return func(r *Reporter) { r.fault = fn } }
 
-// WithObservedMembers wires the physical member-presence source (VPP ARP/ND neighbor
-// table): Build carries its set as EdgeReport.ObservedMembers, the L's physical
-// authority the server consumes for member-up/down + locality (REFACTOR §2/§3).
+// WithObservedMembers wires the member-presence source (VPP ARP/ND neighbor table):
+// Build carries its set as EdgeReport.ObservedMembers, the server's member-up/down signal.
+// (Not an anchor gate. This source is owed a rework — see MemberObserver's doc.)
 func WithObservedMembers(fn ObservedMembersFunc) ReporterOption {
 	return func(r *Reporter) { r.observed = fn }
 }

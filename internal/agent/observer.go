@@ -9,32 +9,31 @@ import (
 	"github.com/fivetime/sbw-limiter/internal/vpp"
 )
 
-// MemberObserver reads the L's PHYSICAL member presence from VPP's ARP/ND neighbor
-// table on the member interface(s) — the L's physical authority (DESIGN-liveness §11 /
-// REFACTOR-coverer-liveness-only.md). ONE observation feeds two consumers: Observe() fills
-// EdgeReport.ObservedMembers (the server's member-up/down source) AND caches the result so
-// the anchor feed's local anti-blackhole gate reads it via Latest() without a second VPP
-// dump ("防盲写黑洞": advertise only members the data plane can actually see).
+// MemberObserver reads member presence from VPP's ARP/ND neighbor table on the member
+// interface(s) and caches it for the reporter: Observe() refreshes the cache, Latest()
+// exposes it, and it is wired to EdgeReport.ObservedMembers (the server's member-up/down
+// signal). It is NOT an anchor-advertisement gate — that gate ("physical gate") is gone;
+// anchors now flow desired→bird unconditionally.
+//
+// PENDING (do not treat as settled): this reads member liveness off the SAME host-macc
+// ARP/ND basis as the removed physical gate, which only reflects members that happen to be
+// L2-adjacent to this L — a lab-topology accident, not the production path (members arrive
+// via fabric→R→L over BGP and are never on L's neighbor segment). So this ObservedMembers
+// source is itself owed a rework onto a forwarding/FIB-reachability basis (DESIGN-liveness
+// §10); it is kept only because member-up/down has no replacement signal yet.
 //
 // Like FaultSensor, it opens a short-lived, reply-timeout-bounded channel per call so a
 // wedged/slow VPP main thread never blocks the report path (VPP single-main-thread
 // bottleneck). Best-effort: any VPP error yields nil ("no trustworthy read") — the report
-// omits the field and the gate falls static (advertises); the last GOOD read stays cached.
+// omits the field; the last GOOD read stays cached.
 type MemberObserver struct {
 	conn   *vpp.Conn
 	ifaces []string // member-facing interface names (e.g. host-macc)
 	log    *slog.Logger
 
-	mu       sync.Mutex
-	last     []netip.Prefix // most recent TRUSTWORTHY observation (nil until first success)
-	onChange func()         // fired (non-blocking) when the trustworthy set CHANGES
+	mu   sync.Mutex
+	last []netip.Prefix // most recent TRUSTWORTHY observation (nil until first success)
 }
-
-// SetOnChange wires a callback fired whenever a trustworthy observation DIFFERS from the
-// previous one — the agent wires it to birdWake so the anchor feed re-evaluates its local
-// gate PROMPTLY on a member appearing/leaving, rather than waiting for the next reconcile
-// timer. Prompt WITHDRAWAL on a member leaving is the anti-blackhole-critical half.
-func (o *MemberObserver) SetOnChange(fn func()) { o.onChange = fn }
 
 // NewMemberObserver builds an observer over a live VPP connection scoped to the
 // member-access interfaces. memberIfaces empty → Observe returns nil (disabled).
@@ -99,40 +98,20 @@ func (o *MemberObserver) Observe() []netip.Prefix {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].String() < out[j].String() })
-	// Cache this TRUSTWORTHY read (out is non-nil here) so the anchor feed's gate can read
-	// it via Latest() without a second VPP dump. Untrustworthy passes returned nil above
-	// and never reach here, so the cache always holds the last GOOD physical set.
+	// Cache this TRUSTWORTHY read (out is non-nil here) so the reporter can read it via
+	// Latest() without a second VPP dump. Untrustworthy passes returned nil above and never
+	// reach here, so the cache always holds the last GOOD physical set.
 	f := make([]netip.Prefix, len(out))
 	copy(f, out)
 	o.mu.Lock()
-	changed := !samePrefixSet(o.last, f)
 	o.last = f
 	o.mu.Unlock()
-	if changed && o.onChange != nil {
-		o.onChange() // wake the anchor feed to re-gate promptly (member appeared/left)
-	}
 	return out
 }
 
-// samePrefixSet reports whether two SORTED prefix slices are equal. Both Observe outputs
-// are sorted, so an element-wise compare suffices. A nil-vs-empty difference counts as a
-// change (first trustworthy read after startup).
-func samePrefixSet(a, b []netip.Prefix) bool {
-	if (a == nil) != (b == nil) || len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 // Latest returns the most recent TRUSTWORTHY observation (a copy), or nil if none has
-// succeeded yet. The anchor feed's local anti-blackhole gate reads it — sharing the
-// reporter's periodic dump rather than issuing its own. nil ⇒ the gate falls static
-// (advertise all, never blackhole a live member on an unread physical set).
+// succeeded yet. The reporter reads it to fill EdgeReport.ObservedMembers, sharing the
+// periodic dump rather than issuing its own. (nil ⇒ the report omits the field.)
 func (o *MemberObserver) Latest() []netip.Prefix {
 	if o == nil {
 		return nil

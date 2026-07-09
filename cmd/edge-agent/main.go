@@ -227,9 +227,10 @@ func main() {
 		}
 	}
 
-	// ONE physical member observer (REFACTOR step 3+5): its Observe() dump feeds the
-	// reporter's EdgeReport.ObservedMembers AND caches the result so the anchor feed's
-	// local anti-blackhole gate reads it via Latest() without a second VPP dump.
+	// Member observer: its Observe() dump feeds the reporter's EdgeReport.ObservedMembers
+	// (the server's member-up/down signal). It is NOT an anchor gate — that gate is gone;
+	// anchors flow desired→bird unconditionally. See MemberObserver's doc: this ObservedMembers
+	// source is itself owed a rework (host-macc ARP basis, lab-topology-bound).
 	memberObserver := agent.NewMemberObserver(conn, cfg.MemberInterfaces, log)
 
 	// Stats-segment VPP liveness (§6.44): read the probe plugin's /probe/heartbeat
@@ -302,15 +303,14 @@ func main() {
 		// (③ probe verdict) at report time so the server routes a DETERMINATE fault to its
 		// fast failover (§4.2.4) instead of the blanket soft-death debounce.
 		agent.WithFault(agent.NewFaultSensor(conn, cfg.PolicerInterfaces, probeBroken, vppLiveDead, log)),
-		// Physical member presence (REFACTOR §2/§3, DESIGN-liveness §11): read the
-		// member interface's VPP ARP/ND neighbor table. The L's physical authority
-		// the server consumes for member-up/down + locality, and the agent's own
-		// local anti-blackhole gate. Build reads the CACHED set (Latest), never a
-		// live dump: the dump is a VPP binary-API call that blocks on an
-		// unresponsive/wedged VPP until the reply timeout, and it must not stall the
-		// report — least of all the event-driven vpp-gone report racing to the
-		// server (§6.44 live: it added ~8s to failover). A background loop (below)
-		// refreshes the cache; report/liveness hot paths stay dump-free.
+		// Member presence for the server's member-up/down signal: the member interface's
+		// VPP ARP/ND neighbor table. Build reads the CACHED set (Latest), never a live
+		// dump: the dump is a VPP binary-API call that blocks on an unresponsive/wedged
+		// VPP until the reply timeout, and it must not stall the report — least of all
+		// the event-driven vpp-gone report racing to the server (§6.44 live: it added ~8s
+		// to failover). A background loop (below) refreshes the cache; report/liveness hot
+		// paths stay dump-free. (This ObservedMembers source is owed a rework — see the
+		// MemberObserver doc — but it is NOT an anchor gate.)
 		agent.WithObservedMembers(memberObserver.Latest),
 		agent.WithReporterLogger(log),
 	)
@@ -331,10 +331,11 @@ func main() {
 		// to bird-vpp's `api` proto over the socket, no full-file `birdc configure`.
 		// Lazy connect; (re)connect triggers a HELLO+EOR resync, the proto's grace
 		// window covers brief reconnects without flapping the routes.
-		// Local physical anti-blackhole gate (REFACTOR step 5): only advertise anchors for
-		// members the agent physically observes (VPP ARP/ND, via the shared observer's
-		// cached Latest). intent ∧ physical, both local to the agent — replaces the old
-		// coverer-tap ∧ server shouldWithdraw gate.
+		// Anchors + egress flowspec are fed straight from desired, UNCONDITIONALLY — there
+		// is no advertisement gate here. (Anti-blackhole — don't traction traffic to a
+		// member L can't forward to — is owed a rework onto FIB reachability, DESIGN-liveness
+		// §10; the old agent-side "physical gate" and the server-side RIB-survival gate are
+		// both gone, so today advertisement is ungated.)
 		feed = birdfeed.NewFeed(cfg.BirdAPISocket, log)
 		log.Info("bird control plane via api socket (incremental feed)", "socket", cfg.BirdAPISocket)
 	} else if cfg.BirdAnchorsInclude != "" && cfg.BirdFlowspecInclude != "" {

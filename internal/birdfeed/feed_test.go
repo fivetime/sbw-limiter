@@ -166,7 +166,7 @@ func TestFeedV6BadNextHopFails(t *testing.T) {
 	}
 }
 
-// --- REFACTOR step 5: local physical anti-blackhole gate --------------------
+// --- peer-death resync (bird restart → re-feed unchanged desired state) -----
 
 func TestFeedPeerDeathResyncsUnchangedState(t *testing.T) {
 	f, s := newTestFeed()
