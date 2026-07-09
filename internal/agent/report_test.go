@@ -156,3 +156,58 @@ func TestReporterRunSinkErrorIsNotFatal(t *testing.T) {
 		}
 	}
 }
+
+// TestReporterWakeSendsImmediately pins the event-driven report path (§4.2.4
+// ★实测更新): a Wake produces a report at once, without waiting out the periodic
+// interval — this is what removes the 15s report-sampling term from
+// permanent-VPP-death failover.
+func TestReporterWakeSendsImmediately(t *testing.T) {
+	hc := NewHealthChecker("edge-w", fakeLive{healthy: true})
+	hc.Observe(model.EdgeDesiredState{Generation: 1}, Result{}, nil)
+	r := NewReporter("edge-w", hc)
+	sink := newFakeSink()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.Run(ctx, time.Hour, sink) // interval effectively never fires
+
+	r.Wake()
+	select {
+	case <-sink.gotC:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wake did not produce an immediate report (still waiting on the 1h ticker)")
+	}
+}
+
+// TestReporterWakeStormGuard pins the wakeMinInterval rate guard: a burst of
+// wakes right after a send is dropped (the ticker backstops), so a flapping
+// health signal cannot turn into a report storm. Wake itself never blocks.
+func TestReporterWakeStormGuard(t *testing.T) {
+	hc := NewHealthChecker("edge-s", fakeLive{healthy: true})
+	hc.Observe(model.EdgeDesiredState{Generation: 1}, Result{}, nil)
+	r := NewReporter("edge-s", hc)
+	sink := newFakeSink()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go r.Run(ctx, time.Hour, sink)
+
+	r.Wake() // first: sends
+	select {
+	case <-sink.gotC:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first wake did not send")
+	}
+	// Burst inside wakeMinInterval: all dropped (coalesce + guard). Wake must not block.
+	for i := 0; i < 50; i++ {
+		r.Wake()
+	}
+	select {
+	case <-sink.gotC:
+		t.Fatal("wake inside wakeMinInterval produced a report; storm guard broken")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if n := len(sink.reports()); n != 1 {
+		t.Fatalf("got %d reports, want exactly 1 (guarded burst)", n)
+	}
+}

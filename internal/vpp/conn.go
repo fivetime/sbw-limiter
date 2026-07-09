@@ -52,6 +52,15 @@ type Conn struct {
 	gen       atomic.Uint64
 	reconnect chan struct{}
 
+	// healthNotify coalesces health TRANSITIONS (healthy↔unhealthy) for the
+	// event-driven report path (DESIGN-liveness §4.2.4 ★实测更新): a VPP death is
+	// typed vpp-gone on the next report, and the 15s report SAMPLING was the
+	// dominant term of permanent-death failover (8–23s). Waking the reporter on
+	// the transition removes that term with zero steady-state cost. Buffered to
+	// one and sent non-blocking, so bursts coalesce; the consumer snapshots
+	// Healthy() when woken, so a lost duplicate signal never loses state.
+	healthNotify chan struct{}
+
 	readyMu   sync.Mutex
 	readyChan chan struct{} // closed once on first healthy connect
 	readyDone bool
@@ -134,6 +143,7 @@ func Connect(ctx context.Context, a adapter.VppAPI, opts ...Option) (*Conn, erro
 		log:          cfg.log,
 		done:         make(chan struct{}),
 		reconnect:    make(chan struct{}, 1),
+		healthNotify: make(chan struct{}, 1),
 		readyChan:    make(chan struct{}),
 		replyTimeout: cfg.replyTimeout,
 	}
@@ -176,11 +186,11 @@ func (c *Conn) handleEvent(ev core.ConnectionEvent) {
 	switch ev.State {
 	case core.Connected:
 		if err := c.checkCompat(); err != nil {
-			c.healthy.Store(false)
+			c.setHealthy(false)
 			c.log.Error("VPP connected but binding-incompatible; not ready", "err", err)
 			return
 		}
-		c.healthy.Store(true)
+		c.setHealthy(true)
 		gen := c.gen.Add(1)
 		if c.signalReady() {
 			c.log.Info("VPP connection established and compatible", "generation", gen)
@@ -191,15 +201,38 @@ func (c *Conn) handleEvent(ev core.ConnectionEvent) {
 			c.log.Warn("VPP reconnected (possible restart); signalling data-plane reinstall", "generation", gen)
 		}
 	case core.Disconnected:
-		c.healthy.Store(false)
+		c.setHealthy(false)
 		c.log.Warn("VPP disconnected; govpp will reconnect")
 	case core.Failed:
-		c.healthy.Store(false)
+		c.setHealthy(false)
 		c.log.Error("VPP connection failed", "err", ev.Error)
 	default:
 		c.log.Debug("VPP connection event", "state", ev.State)
 	}
 }
+
+// setHealthy updates the health flag and, on an actual TRANSITION, signals
+// HealthTransitions (non-blocking; coalesces). Same-value stores are silent so
+// e.g. a Failed following a Disconnected does not re-wake the reporter.
+func (c *Conn) setHealthy(v bool) {
+	if c.healthy.Swap(v) == v {
+		return
+	}
+	if c.healthNotify == nil {
+		return // zero-value Conn in a test that predates the channel
+	}
+	select {
+	case c.healthNotify <- struct{}{}:
+	default:
+	}
+}
+
+// HealthTransitions delivers a (coalesced) signal each time the connection's
+// health flips healthy↔unhealthy. Consumers snapshot Healthy() on wake — the
+// signal carries no payload, so coalescing loses nothing. Used to trigger an
+// event-driven EdgeReport so a VPP death/recovery reaches the controller
+// without waiting out the report interval (§4.2.4 ★实测更新).
+func (c *Conn) HealthTransitions() <-chan struct{} { return c.healthNotify }
 
 // signalReady closes readyChan on the first healthy connect, returning true
 // only that first time; subsequent (reconnect) calls return false.

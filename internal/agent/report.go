@@ -61,6 +61,13 @@ type PoolHashFunc func() uint64
 // (DESIGN-liveness §11). nil → the report carries no set (backward compatible).
 type ObservedMembersFunc func() []netip.Prefix
 
+// wakeMinInterval is the storm guard for event-driven (Wake) reports: a wake
+// landing within it of the previous send is dropped — the periodic ticker
+// backstops it, so dropping costs at most one interval of latency, never
+// correctness. Transitions are already rate-bounded upstream (govpp health-check
+// detection + kubelet restart backoff), so this is insurance, not load-bearing.
+const wakeMinInterval = time.Second
+
 // Reporter assembles the agent's EdgeReport uplink (B-03) from the soft-death
 // health (B-05) plus capacity/metering sources, and sends it periodically.
 type Reporter struct {
@@ -73,6 +80,11 @@ type Reporter struct {
 	observed ObservedMembersFunc
 	now      func() int64
 	log      *slog.Logger
+
+	// wake requests one out-of-cycle report (event-driven, e.g. a VPP health
+	// transition — §4.2.4 ★实测更新: removes the 15s report-sampling term from
+	// permanent-VPP-death failover). Buffered to one; Wake never blocks.
+	wake chan struct{}
 }
 
 // ReporterOption configures a Reporter.
@@ -110,8 +122,9 @@ func WithReporterLogger(l *slog.Logger) ReporterOption { return func(r *Reporter
 func NewReporter(edgeID model.EdgeID, health HealthSource, opts ...ReporterOption) *Reporter {
 	r := &Reporter{
 		edgeID: edgeID, health: health,
-		now: func() int64 { return time.Now().UnixMilli() },
-		log: slog.New(slog.DiscardHandler),
+		now:  func() int64 { return time.Now().UnixMilli() },
+		log:  slog.New(slog.DiscardHandler),
+		wake: make(chan struct{}, 1),
 	}
 	for _, o := range opts {
 		o(r)
@@ -164,25 +177,47 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	return rep, true
 }
 
-// Run sends a report every interval until ctx is cancelled. A send failure is
-// logged, not fatal — the next tick retries with fresh state (the controller's
-// soft-death detection tolerates a missed report via去抖, §4.7).
+// Wake requests one immediate out-of-cycle report. Non-blocking; concurrent
+// wakes coalesce (the report reflects state at build time, so a coalesced wake
+// loses nothing). Wakes within wakeMinInterval of the last send are dropped in
+// Run (storm guard); the periodic ticker backstops any dropped wake.
+func (r *Reporter) Wake() {
+	select {
+	case r.wake <- struct{}{}:
+	default:
+	}
+}
+
+// Run sends a report every interval until ctx is cancelled, plus immediately on
+// Wake (event-driven, rate-guarded). A send failure is logged, not fatal — the
+// next tick retries with fresh state (the controller's soft-death detection
+// tolerates a missed report via去抖, §4.7).
 func (r *Reporter) Run(ctx context.Context, interval time.Duration, sink ReportSink) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	var lastSend time.Time
+	send := func() {
+		rep, ok := r.Build()
+		if !ok {
+			return
+		}
+		if err := sink.SendReport(ctx, rep); err != nil {
+			r.log.Warn("edge report send failed", "err", err, "generation", rep.Generation)
+		}
+		lastSend = time.Now()
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			r.log.Info("reporter stopped")
 			return
 		case <-t.C:
-			rep, ok := r.Build()
-			if !ok {
-				continue
+			send()
+		case <-r.wake:
+			if time.Since(lastSend) < wakeMinInterval {
+				continue // storm guard; the ticker backstops
 			}
-			if err := sink.SendReport(ctx, rep); err != nil {
-				r.log.Warn("edge report send failed", "err", err, "generation", rep.Generation)
-			}
+			send()
 		}
 	}
 }

@@ -69,11 +69,12 @@ func TestReadyTimeoutWhenNeverConnects(t *testing.T) {
 // govpp connection, so the event-handling logic can be driven directly.
 func newTestConn(compat func() error) *Conn {
 	return &Conn{
-		log:         slog.New(slog.DiscardHandler),
-		done:        make(chan struct{}),
-		reconnect:   make(chan struct{}, 1),
-		readyChan:   make(chan struct{}),
-		checkCompat: compat,
+		log:          slog.New(slog.DiscardHandler),
+		done:         make(chan struct{}),
+		reconnect:    make(chan struct{}, 1),
+		healthNotify: make(chan struct{}, 1),
+		readyChan:    make(chan struct{}),
+		checkCompat:  compat,
 	}
 }
 
@@ -212,5 +213,68 @@ func TestIncompatibleReconnectDoesNotSignal(t *testing.T) {
 	}
 	if gotReconnect(c) {
 		t.Error("incompatible reconnect must not signal a reinstall")
+	}
+}
+
+// TestHealthTransitionsNotify pins the event-driven report trigger (§4.2.4
+// ★实测更新): each healthy↔unhealthy TRANSITION signals HealthTransitions
+// exactly once (coalesced, non-blocking); a same-state event (Failed after
+// Disconnected) is silent — so a flapping govpp event stream cannot amplify
+// into a wake storm at the source.
+func TestHealthTransitionsNotify(t *testing.T) {
+	c := newTestConn(func() error { return nil })
+	drained := func() bool {
+		select {
+		case <-c.HealthTransitions():
+			return true
+		default:
+			return false
+		}
+	}
+
+	c.handleEvent(core.ConnectionEvent{State: core.Connected}) // false→true
+	if !drained() {
+		t.Fatal("Connected transition did not signal")
+	}
+	c.handleEvent(core.ConnectionEvent{State: core.Disconnected}) // true→false
+	if !drained() {
+		t.Fatal("Disconnected transition did not signal")
+	}
+	// Same-state: Failed while already unhealthy → NO signal.
+	c.handleEvent(core.ConnectionEvent{State: core.Failed, Error: errors.New("x")})
+	if drained() {
+		t.Fatal("same-state Failed event signalled a transition")
+	}
+	// Recovery signals again.
+	c.handleEvent(core.ConnectionEvent{State: core.Connected}) // false→true
+	if !drained() {
+		t.Fatal("recovery transition did not signal")
+	}
+}
+
+// TestHealthTransitionsCoalesce: burst transitions while nobody is draining
+// collapse into (at most) one pending signal — the consumer snapshots Healthy()
+// on wake, so the collapsed signal loses no state.
+func TestHealthTransitionsCoalesce(t *testing.T) {
+	c := newTestConn(func() error { return nil })
+	for i := 0; i < 5; i++ {
+		c.handleEvent(core.ConnectionEvent{State: core.Connected})
+		c.handleEvent(core.ConnectionEvent{State: core.Disconnected})
+	}
+	n := 0
+	for {
+		select {
+		case <-c.HealthTransitions():
+			n++
+			continue
+		default:
+		}
+		break
+	}
+	if n != 1 {
+		t.Fatalf("pending signals = %d, want exactly 1 (coalesced)", n)
+	}
+	if c.Healthy() {
+		t.Fatal("final state should be unhealthy")
 	}
 }

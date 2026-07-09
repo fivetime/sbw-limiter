@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"net/netip"
 	"os"
@@ -37,6 +38,25 @@ const (
 	// is centuries of retries — i.e. "until VPP comes back or the agent stops".
 	vppReconnectAttempts = 1 << 30
 	vppReconnectInterval = time.Second
+
+	// Event-driven report delays (DESIGN-liveness §4.2.4 ★实测更新). A VPP health
+	// transition wakes the reporter so vpp-gone / recovery reaches the server
+	// without waiting out the 15s report sampling — the dominant term of
+	// permanent-VPP-death failover (8–23s → ~9s deterministic).
+	//
+	//   - DOWN: report fast, but jitter 0–2s so a CORRELATED mass VPP death (bad
+	//     image rollout) doesn't synchronize every edge's failover into one burst
+	//     — today's 15s sampling phase-spreads them naturally; keep some spread.
+	//   - UP: delay ~2.5s (+ the same jitter) — the post-reconnect report's fault
+	//     sensor dumps interfaces, and right after a VPP restart the main thread
+	//     is busy with the full data-plane reinstall; give it room to breathe.
+	//     Recovery still reaches the server in ~3–5s instead of ≤15s.
+	//
+	// Both stay well inside the server's vpp-gone restartGrace (5s) + report
+	// tolerance, so the flap-safety judgement (single container restart ~1s never
+	// fails over) is unchanged.
+	reportDownJitterMax = 2 * time.Second
+	reportUpDelay       = 2500 * time.Millisecond
 )
 
 func main() {
@@ -454,7 +474,33 @@ func main() {
 	go client.RunDirect(ctx, cfg.CapacityBps)                     // downlink: register + subscribe + dispatch, direct to server (REFACTOR step 4)
 	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // converge VPP to desired every interval
 	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)        // uplink: health/capacity report direct to server (B-03); client is the ReportSink
-	go func() {                                                   // L4 engine + socket probe: faster than the reconcile pass so a worker wedge / socket loss surfaces in seconds (§4.1)
+	go func() {                                                   // event-driven report: VPP health transition → wake the reporter (§4.2.4 ★实测更新)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-conn.HealthTransitions():
+			}
+			// Snapshot health NOW; the delay below may straddle another
+			// transition, which stays pending in the coalescing channel and is
+			// re-evaluated (with a fresh snapshot) on the next iteration — so a
+			// down→up race at worst sends one extra already-true report.
+			healthy := conn.Healthy()
+			delay := time.Duration(rand.Int64N(int64(reportDownJitterMax))) // de-correlate mass events
+			if healthy {
+				delay += reportUpDelay // let the post-restart reinstall breathe (see const doc)
+			}
+			log.Info("vpp health transition; scheduling event-driven report",
+				"healthy", healthy, "delay", delay.Round(time.Millisecond))
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(delay):
+				reporter.Wake()
+			}
+		}
+	}()
+	go func() { // L4 engine + socket probe: faster than the reconcile pass so a worker wedge / socket loss surfaces in seconds (§4.1)
 		t := time.NewTicker(3 * time.Second)
 		defer t.Stop()
 		for {
