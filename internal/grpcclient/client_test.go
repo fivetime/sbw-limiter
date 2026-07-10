@@ -111,7 +111,7 @@ func TestRunDispatchesDesiredState(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go c.Run(ctx)
+	go c.RunDirect(ctx, 0)
 
 	// Wait until subscribed, then push a desired state.
 	select {
@@ -141,7 +141,7 @@ func TestRunDispatchesDesiredDelta(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go c.Run(ctx)
+	go c.RunDirect(ctx, 0)
 	<-f.subbed
 
 	delta := model.EdgeDesiredDelta{
@@ -170,7 +170,7 @@ func TestRunRejectsDeltaSchemaMismatch(t *testing.T) {
 		WithBackoff(10*time.Millisecond))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go c.Run(ctx)
+	go c.RunDirect(ctx, 0)
 	<-f.subbed
 	bad, _ := json.Marshal(model.EdgeDesiredDelta{SchemaVersion: 999, EdgeID: "edge-2"})
 	f.pushCh <- &rpc.Directive{Kind: rpc.Directive_DESIRED_DELTA, Payload: bad}
@@ -187,7 +187,7 @@ func TestRunRejectsSchemaMismatch(t *testing.T) {
 	c := dialFake(t, f, "edge-2", WithDesired(func(model.EdgeDesiredState) { called <- struct{}{} }), WithBackoff(10*time.Millisecond))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go c.Run(ctx)
+	go c.RunDirect(ctx, 0)
 	<-f.subbed
 	bad, _ := json.Marshal(model.EdgeDesiredState{SchemaVersion: 999, EdgeID: "edge-2"})
 	f.pushCh <- &rpc.Directive{Kind: rpc.Directive_DESIRED_STATE, Payload: bad}

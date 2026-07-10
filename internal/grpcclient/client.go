@@ -211,21 +211,6 @@ func (c *Client) SendReport(ctx context.Context, r model.EdgeReport) error {
 	return err
 }
 
-// Run keeps a Subscribe stream open, dispatching directives, reconnecting with
-// backoff until ctx is cancelled. Blocks; run in a goroutine.
-func (c *Client) Run(ctx context.Context) {
-	for {
-		if err := c.subscribeOnce(ctx); err != nil && ctx.Err() == nil {
-			c.log.Warn("subscribe stream ended; reconnecting", "err", err, "backoff", c.backoff)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(c.backoff):
-		}
-	}
-}
-
 func (c *Client) subscribeOnce(ctx context.Context) error {
 	stream, err := c.svc.Subscribe(ctx, &rpc.SubscribeRequest{EdgeId: string(c.edge)})
 	if err != nil {
