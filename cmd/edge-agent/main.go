@@ -136,6 +136,10 @@ func main() {
 
 	// Observability (T-1003): the metrics observer runs AFTER health.Observe, so
 	// health.Last() reflects this pass. Record reconcile activity + health gauges.
+	// Bird-materialization health source (assigned after the materializer is set
+	// up below; read only from goroutines started after that assignment).
+	var birdFeedStatus func() (fails, lastOKUnixMs int64)
+
 	met := metrics.New(model.EdgeID(cfg.EdgeID))
 	recon.AddObserver(func(_ model.EdgeDesiredState, _ agent.Result, reconcileErr error) {
 		met.RecordReconcile(reconcileErr)
@@ -144,6 +148,9 @@ func main() {
 		}
 		st := store.Status()
 		met.RecordDesiredStatus(st.Frozen, st.Generation)
+		if birdFeedStatus != nil {
+			met.RecordBirdFeed(birdFeedStatus())
+		}
 	})
 
 	// ③ forwarding-broken (§4.2.7/§4.2.8) — see setupForwardingProbe.
@@ -194,6 +201,10 @@ func main() {
 		// paths stay dump-free. (This ObservedMembers source is owed a rework — see the
 		// MemberObserver doc — but it is NOT an anchor gate.)
 		agent.WithObservedMembers(memberObserver.Latest),
+		// Bird-feed health (anchors/flowspec traction convergence): sustained apply
+		// failure was log-only — surface it so the server can emit the
+		// bird-feed-degraded BSS event (policy-integrity, not a death signal).
+		agent.WithBirdFeedStatus(birdFeedStatus),
 		agent.WithReporterLogger(log),
 	)
 
@@ -214,6 +225,13 @@ func main() {
 		if birdApply != nil {
 			birdApply.Wake()
 		}
+	}
+	// Bird-materialization health source for the report/metrics (whichever
+	// materializer is active); stays nil when neither is configured.
+	if feed != nil {
+		birdFeedStatus = feed.Status
+	} else if birdApply != nil {
+		birdFeedStatus = birdApply.Status
 	}
 	// Canary (soft-death §4.7/6.13) — see setupCanary.
 	canaryCleanup, err := setupCanary(cfg, recon, health, log)

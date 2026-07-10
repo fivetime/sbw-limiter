@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/fivetime/sbw-contract/model"
@@ -41,6 +42,14 @@ type Feed struct {
 	nextHop  netip.Addr                // v4 redirect target (for the 8-byte EC)
 	nextHop6 netip.Addr                // v6 redirect target (for the 20-byte i6ec)
 	resync   bool
+
+	// Feed health for the report/metrics (read via Status from other goroutines).
+	// fails = CONSECUTIVE failed apply passes (connect/encode/flush); a sustained
+	// non-zero means traction convergence is silently stale — log-only was invisible
+	// to the server (billed-as-live ≠ enforced), so this feeds HealthReport +
+	// Prometheus + the server's bird-feed-degraded BSS event.
+	fails  atomic.Int64
+	lastOK atomic.Int64 // unix ms of the last fully-applied (flushed+committed) pass; 0 = never
 }
 
 // NewFeed wires a Feed over a fresh Client for the api socket path.
@@ -98,9 +107,21 @@ func (f *Feed) Run(ctx context.Context, interval time.Duration, provider Provide
 func (f *Feed) pass(provider Provider) {
 	st, ok := provider()
 	if !ok {
+		return // cold start / fail-static skip — not a feed failure
+	}
+	if err := f.apply(st); err != nil {
+		f.fails.Add(1)
 		return
 	}
-	_ = f.apply(st)
+	f.fails.Store(0)
+	f.lastOK.Store(time.Now().UnixMilli())
+}
+
+// Status returns the feed's health: consecutive failed apply passes and the unix-ms
+// timestamp of the last fully-applied pass (0 = never). Safe from any goroutine;
+// wired to HealthReport.BirdFeedFails/BirdFeedLastOKUnixMs + the agent metrics.
+func (f *Feed) Status() (fails int64, lastOKUnixMs int64) {
+	return f.fails.Load(), f.lastOK.Load()
 }
 
 func (f *Feed) apply(st model.EdgeDesiredState) error {

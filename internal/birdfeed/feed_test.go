@@ -1,6 +1,7 @@
 package birdfeed
 
 import (
+	"errors"
 	"log/slog"
 	"net/netip"
 	"testing"
@@ -10,14 +11,15 @@ import (
 
 // fakeSink captures frames instead of writing to a socket.
 type fakeSink struct {
-	conn   bool
-	frames [][]byte
+	conn     bool
+	frames   [][]byte
+	flushErr error // injected flush failure (nil = success)
 }
 
 func (s *fakeSink) connected() bool { return s.conn }
 func (s *fakeSink) connect() error  { s.conn = true; return nil }
 func (s *fakeSink) write(f []byte)  { s.frames = append(s.frames, append([]byte(nil), f...)) }
-func (s *fakeSink) flush() error    { return nil }
+func (s *fakeSink) flush() error    { return s.flushErr }
 func (s *fakeSink) close()          { s.conn = false }
 
 func newTestFeed() (*Feed, *fakeSink) {
@@ -194,5 +196,39 @@ func TestFeedPeerDeathResyncsUnchangedState(t *testing.T) {
 	add, del, hello, eor := countOps(s.frames)
 	if hello != 1 || eor != 1 || add != 3 || del != 0 {
 		t.Fatalf("post-death resync: hello=%d eor=%d add=%d del=%d (want 1/1/3/0)", hello, eor, add, del)
+	}
+}
+
+// TestFeedStatusCountsConsecutiveFailures locks the feed-health contract
+// (HealthReport.BirdFeedFails / metrics): a failed apply pass increments the
+// CONSECUTIVE counter, a successful (flushed+committed) pass resets it to 0 and
+// stamps lastOK — so a persistently broken feed is visible to the server
+// (bird-feed-degraded) instead of log-only.
+func TestFeedStatusCountsConsecutiveFailures(t *testing.T) {
+	f, s := newTestFeed()
+	st := model.EdgeDesiredState{
+		Anchors: []model.Anchor{anchor("11.0.0.1/32")},
+	}
+	provider := func() (model.EdgeDesiredState, bool) { return st, true }
+
+	// Two failing passes (flush error) → fails=2, lastOK still 0.
+	s.flushErr = errors.New("bird gone")
+	f.pass(provider)
+	f.pass(provider)
+	if fails, lastOK := f.Status(); fails != 2 || lastOK != 0 {
+		t.Fatalf("after 2 failed passes: fails=%d lastOK=%d, want 2/0", fails, lastOK)
+	}
+
+	// Recovery: flush succeeds → fails resets, lastOK stamped.
+	s.flushErr = nil
+	f.pass(provider)
+	if fails, lastOK := f.Status(); fails != 0 || lastOK == 0 {
+		t.Fatalf("after recovery: fails=%d lastOK=%d, want 0/nonzero", fails, lastOK)
+	}
+
+	// Cold-start skip (provider not ok) is NOT a failure.
+	f.pass(func() (model.EdgeDesiredState, bool) { return model.EdgeDesiredState{}, false })
+	if fails, _ := f.Status(); fails != 0 {
+		t.Fatalf("cold-start skip must not count as failure, fails=%d", fails)
 	}
 }

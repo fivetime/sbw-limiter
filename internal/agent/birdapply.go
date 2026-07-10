@@ -10,6 +10,7 @@ import (
 	"context"
 	"log/slog"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/fivetime/sbw-contract/model"
@@ -25,6 +26,18 @@ type BirdApplier struct {
 	flow    *anchors.Applier // the egress FlowSpec include (flowspec4/flowspec6 blocks)
 	log     *slog.Logger
 	wake    chan struct{}
+
+	// Apply health for the report/metrics (same contract as birdfeed.Feed.Status):
+	// consecutive failed passes + last fully-applied pass, so the legacy include
+	// path is not blind either.
+	fails  atomic.Int64
+	lastOK atomic.Int64 // unix ms; 0 = never
+}
+
+// Status returns consecutive failed apply passes and the unix-ms timestamp of the
+// last fully-applied pass (0 = never). Safe from any goroutine.
+func (b *BirdApplier) Status() (fails int64, lastOKUnixMs int64) {
+	return b.fails.Load(), b.lastOK.Load()
 }
 
 // NewBirdApplier wires the two appliers (built by the caller over one
@@ -94,7 +107,11 @@ func (b *BirdApplier) Run(ctx context.Context, interval time.Duration, provider 
 		}
 		if err := b.ApplyOnce(st); err != nil {
 			b.log.Error("bird apply pass failed", "err", err)
+			b.fails.Add(1)
+			return
 		}
+		b.fails.Store(0)
+		b.lastOK.Store(time.Now().UnixMilli())
 	}
 	pass()
 	for {

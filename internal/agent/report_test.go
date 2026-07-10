@@ -254,3 +254,23 @@ func TestBuildSkipsObservedOnVPPGone(t *testing.T) {
 type faultFunc func() (model.FaultKind, string)
 
 func (f faultFunc) Fault() (model.FaultKind, string) { return f() }
+
+// TestBuildCarriesBirdFeedStatus: the reporter overlays the bird-materialization
+// health (WithBirdFeedStatus) onto HealthReport so a stale traction feed reaches
+// the server (bird-feed-degraded BSS event) instead of staying log-only.
+func TestBuildCarriesBirdFeedStatus(t *testing.T) {
+	hc := NewHealthChecker("e", fakeLive{healthy: true})
+	hc.Observe(model.EdgeDesiredState{Generation: 1}, Result{}, nil)
+	r := NewReporter("e", hc, WithBirdFeedStatus(func() (int64, int64) { return 4, 123_456 }))
+	rep, ok := r.Build()
+	if !ok {
+		t.Fatal("Build ready")
+	}
+	if rep.Health.BirdFeedFails != 4 || rep.Health.BirdFeedLastOKUnixMs != 123_456 {
+		t.Fatalf("bird-feed overlay = %d/%d, want 4/123456",
+			rep.Health.BirdFeedFails, rep.Health.BirdFeedLastOKUnixMs)
+	}
+	if err := rep.Validate(); err != nil {
+		t.Fatalf("report with bird-feed fields fails contract validation: %v", err)
+	}
+}

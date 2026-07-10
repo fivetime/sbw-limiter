@@ -72,6 +72,7 @@ type Reporter struct {
 	health   HealthSource
 	capacity CapacityFunc
 	poolHash PoolHashFunc
+	birdFeed func() (fails, lastOKUnixMs int64)
 	fault    FaultSource
 	observed ObservedMembersFunc
 	now      func() int64
@@ -103,6 +104,15 @@ func WithFault(fn FaultSource) ReporterOption { return func(r *Reporter) { r.fau
 // (Not an anchor gate. This source is owed a rework — see MemberObserver's doc.)
 func WithObservedMembers(fn ObservedMembersFunc) ReporterOption {
 	return func(r *Reporter) { r.observed = fn }
+}
+
+// WithBirdFeedStatus wires the bird-materialization health source (birdfeed.Feed.Status
+// or BirdApplier.Status): Build overlays HealthReport.BirdFeedFails/BirdFeedLastOKUnixMs
+// so a persistently failing traction feed (anchors + egress flowspec) is VISIBLE to the
+// server (bird-feed-degraded BSS event) instead of log-only. Reads two atomics — never
+// touches bird/VPP, so it cannot stall the report hot path.
+func WithBirdFeedStatus(fn func() (fails, lastOKUnixMs int64)) ReporterOption {
+	return func(r *Reporter) { r.birdFeed = fn }
 }
 
 // WithReporterClock overrides the timestamp source (tests).
@@ -163,6 +173,12 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	}
 	if r.poolHash != nil {
 		rep.InstalledPoolHash = r.poolHash()
+	}
+	// Bird-feed health (two atomics, never touches bird/VPP): a sustained non-zero
+	// fails means anchors/flowspec convergence is silently stale — the server turns
+	// it into the bird-feed-degraded/-recovered BSS events (policy-integrity signal).
+	if r.birdFeed != nil {
+		rep.Health.BirdFeedFails, rep.Health.BirdFeedLastOKUnixMs = r.birdFeed()
 	}
 	// ObservedMembers is a fresh VPP binary-API dump (ARP/ND). Skip it when VPP is
 	// GONE: the dump would just block on the dead API until the reply timeout,
