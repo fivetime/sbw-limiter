@@ -30,23 +30,19 @@ type Interface struct {
 
 // List dumps all interfaces.
 func (i *Interfaces) List() ([]Interface, error) {
-	reqCtx := i.ch.SendMultiRequest(&vppif.SwInterfaceDump{SwIfIndex: interface_types.InterfaceIndex(NoTable)})
 	var out []Interface
-	for {
-		d := &vppif.SwInterfaceDetails{}
-		stop, err := reqCtx.ReceiveReply(d)
-		if err != nil {
-			return nil, fmt.Errorf("vpp: sw_interface_dump: %w", err)
-		}
-		if stop {
-			break
-		}
-		out = append(out, Interface{
-			Name:      d.InterfaceName,
-			SwIfIndex: uint32(d.SwIfIndex),
-			Up:        d.Flags&interfaceFlagAdminUp != 0,
-			LinkUp:    d.Flags&interfaceFlagLinkUp != 0,
+	err := dumpAll(i.ch, "sw_interface_dump",
+		&vppif.SwInterfaceDump{SwIfIndex: interface_types.InterfaceIndex(NoTable)},
+		func(d *vppif.SwInterfaceDetails) {
+			out = append(out, Interface{
+				Name:      d.InterfaceName,
+				SwIfIndex: uint32(d.SwIfIndex),
+				Up:        d.Flags&interfaceFlagAdminUp != 0,
+				LinkUp:    d.Flags&interfaceFlagLinkUp != 0,
+			})
 		})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }

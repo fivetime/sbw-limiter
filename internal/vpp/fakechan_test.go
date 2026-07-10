@@ -1,6 +1,8 @@
 package vpp
 
 import (
+	"reflect"
+	"strings"
 	"time"
 
 	govppapi "go.fd.io/govpp/api"
@@ -51,8 +53,20 @@ func (c *fakeChannel) lastSent() govppapi.Message {
 type fakeRequestCtx struct{ fn replyFn }
 
 func (r *fakeRequestCtx) ReceiveReply(reply govppapi.Message) error {
-	if r.fn == nil {
-		return nil // zero-value reply (retval 0)
+	if r.fn != nil {
+		if err := r.fn(reply); err != nil {
+			return err
+		}
 	}
-	return r.fn(reply)
+	// Mirror the REAL govpp channel (core/channel.go): ReceiveReply itself reflects
+	// the Retval field of any *_reply message and returns VPPApiError on non-zero.
+	// The production code relies on that (exec has no manual Retval check), so a
+	// test that scripts a non-zero Retval must see the same error the real channel
+	// would produce.
+	if strings.HasSuffix(reply.GetMessageName(), "_reply") {
+		if f := reflect.Indirect(reflect.ValueOf(reply)).FieldByName("Retval"); f.IsValid() && f.CanInt() {
+			return govppapi.RetvalToVPPApiError(int32(f.Int()))
+		}
+	}
+	return nil
 }

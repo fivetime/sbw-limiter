@@ -23,11 +23,8 @@ func (c *Conn) CliInband(cmd string, timeout time.Duration) (string, error) {
 		ch.SetReplyTimeout(timeout)
 	}
 	reply := &vlib.CliInbandReply{}
-	if err := ch.SendRequest(&vlib.CliInband{Cmd: cmd}).ReceiveReply(reply); err != nil {
-		return "", fmt.Errorf("vpp: cli_inband %q: %w", cmd, err)
-	}
-	if reply.Retval != 0 {
-		return reply.Reply, fmt.Errorf("vpp: cli_inband %q: retval %d", cmd, reply.Retval)
+	if err := exec(ch, fmt.Sprintf("cli_inband %q", cmd), &vlib.CliInband{Cmd: cmd}, reply); err != nil {
+		return "", err
 	}
 	return reply.Reply, nil
 }

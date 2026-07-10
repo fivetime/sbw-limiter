@@ -33,31 +33,23 @@ func NewNeighbors(ch govppapi.Channel) *Neighbors { return &Neighbors{ch: ch} }
 func (n *Neighbors) DumpHosts(swIfIndex uint32) ([]netip.Prefix, error) {
 	var out []netip.Prefix
 	for _, af := range []ip_types.AddressFamily{ip_types.ADDRESS_IP4, ip_types.ADDRESS_IP6} {
-		reqCtx := n.ch.SendMultiRequest(&ipn.IPNeighborDump{
-			SwIfIndex: interface_types.InterfaceIndex(swIfIndex),
-			Af:        af,
-		})
-		for {
-			d := &ipn.IPNeighborDetails{}
-			stop, err := reqCtx.ReceiveReply(d)
-			if err != nil {
-				return nil, fmt.Errorf("vpp: ip_neighbor_dump(af=%d): %w", af, err)
-			}
-			if stop {
-				break
-			}
+		req := &ipn.IPNeighborDump{SwIfIndex: interface_types.InterfaceIndex(swIfIndex), Af: af}
+		err := dumpAll(n.ch, fmt.Sprintf("ip_neighbor_dump(af=%d)", af), req, func(d *ipn.IPNeighborDetails) {
 			addr, ok := netip.AddrFromSlice(d.Neighbor.IPAddress.ToIP())
 			if !ok {
-				continue
+				return
 			}
 			addr = addr.Unmap() // ToIP() already narrows v4 to 4 bytes; belt-and-suspenders
 			// Skip link-local (fe80::/10, 169.254/16): a member advertises its ROUTABLE
 			// address; its link-local is ND/RA noise that never matches a pool member's
 			// anchor and would pollute EdgeReport.ObservedMembers.
 			if addr.IsLinkLocalUnicast() {
-				continue
+				return
 			}
 			out = append(out, netip.PrefixFrom(addr, addr.BitLen()))
+		})
+		if err != nil {
+			return nil, err
 		}
 	}
 	return out, nil

@@ -110,11 +110,8 @@ func (p *Policers) Add(spec model.PolicerSpec) (uint32, error) {
 	}
 	req := &policer.PolicerAdd{Name: spec.Name, Infos: cfg}
 	reply := &policer.PolicerAddReply{}
-	if err := p.ch.SendRequest(req).ReceiveReply(reply); err != nil {
-		return 0, fmt.Errorf("vpp: policer_add %q: %w", spec.Name, err)
-	}
-	if reply.Retval != 0 {
-		return 0, fmt.Errorf("vpp: policer_add %q failed: retval %d", spec.Name, reply.Retval)
+	if err := exec(p.ch, fmt.Sprintf("policer_add %q", spec.Name), req, reply); err != nil {
+		return 0, err
 	}
 
 	if spec.BindWorker {
@@ -138,26 +135,14 @@ func (p *Policers) Update(index uint32, spec model.PolicerSpec) error {
 	if err != nil {
 		return err
 	}
-	reply := &policer.PolicerUpdateReply{}
-	if err := p.ch.SendRequest(&policer.PolicerUpdate{PolicerIndex: index, Infos: cfg}).ReceiveReply(reply); err != nil {
-		return fmt.Errorf("vpp: policer_update %d: %w", index, err)
-	}
-	if reply.Retval != 0 {
-		return fmt.Errorf("vpp: policer_update %d failed: retval %d", index, reply.Retval)
-	}
-	return nil
+	return exec(p.ch, fmt.Sprintf("policer_update %d", index),
+		&policer.PolicerUpdate{PolicerIndex: index, Infos: cfg}, &policer.PolicerUpdateReply{})
 }
 
 // Delete removes a policer by index.
 func (p *Policers) Delete(index uint32) error {
-	reply := &policer.PolicerDelReply{}
-	if err := p.ch.SendRequest(&policer.PolicerDel{PolicerIndex: index}).ReceiveReply(reply); err != nil {
-		return fmt.Errorf("vpp: policer_del %d: %w", index, err)
-	}
-	if reply.Retval != 0 {
-		return fmt.Errorf("vpp: policer_del %d failed: retval %d", index, reply.Retval)
-	}
-	return nil
+	return exec(p.ch, fmt.Sprintf("policer_del %d", index),
+		&policer.PolicerDel{PolicerIndex: index}, &policer.PolicerDelReply{})
 }
 
 // Bind enables or disables pinning a policer to a single worker thread, which
@@ -167,15 +152,9 @@ func (p *Policers) Bind(index, worker uint32, enable bool) error {
 }
 
 func (p *Policers) bind(index, worker uint32, enable bool) error {
-	reply := &policer.PolicerBindV2Reply{}
-	req := &policer.PolicerBindV2{PolicerIndex: index, WorkerIndex: worker, BindEnable: enable}
-	if err := p.ch.SendRequest(req).ReceiveReply(reply); err != nil {
-		return fmt.Errorf("vpp: policer_bind_v2 %d: %w", index, err)
-	}
-	if reply.Retval != 0 {
-		return fmt.Errorf("vpp: policer_bind_v2 %d failed: retval %d", index, reply.Retval)
-	}
-	return nil
+	return exec(p.ch, fmt.Sprintf("policer_bind_v2 %d", index),
+		&policer.PolicerBindV2{PolicerIndex: index, WorkerIndex: worker, BindEnable: enable},
+		&policer.PolicerBindV2Reply{})
 }
 
 // PolicerInfo is one enumerated policer (for reconciliation, T-501). policer
@@ -189,32 +168,20 @@ type PolicerInfo struct {
 // DeleteByName removes a policer by name via policer_add_del — policer dump
 // does not expose the index, so reconciliation deletes orphans by name.
 func (p *Policers) DeleteByName(name string) error {
-	reply := &policer.PolicerAddDelReply{}
-	if err := p.ch.SendRequest(&policer.PolicerAddDel{IsAdd: false, Name: name}).ReceiveReply(reply); err != nil {
-		return fmt.Errorf("vpp: policer_add_del(del) %q: %w", name, err)
-	}
-	if reply.Retval != 0 {
-		return fmt.Errorf("vpp: policer delete %q failed: retval %d", name, reply.Retval)
-	}
-	return nil
+	return exec(p.ch, fmt.Sprintf("policer_add_del(del) %q", name),
+		&policer.PolicerAddDel{IsAdd: false, Name: name}, &policer.PolicerAddDelReply{})
 }
 
 // Dump enumerates the policers currently in VPP. The agent uses this to find
 // orphans and missing pool policers during reconciliation; names encode the
 // pool id (model.ParsePolicerName).
 func (p *Policers) Dump() ([]PolicerInfo, error) {
-	reqCtx := p.ch.SendMultiRequest(&policer.PolicerDump{})
 	var out []PolicerInfo
-	for {
-		details := &policer.PolicerDetails{}
-		stop, err := reqCtx.ReceiveReply(details)
-		if err != nil {
-			return nil, fmt.Errorf("vpp: policer_dump: %w", err)
-		}
-		if stop {
-			break
-		}
-		out = append(out, PolicerInfo{Name: details.Name, CIR: details.Cir, CB: details.Cb})
+	err := dumpAll(p.ch, "policer_dump", &policer.PolicerDump{}, func(d *policer.PolicerDetails) {
+		out = append(out, PolicerInfo{Name: d.Name, CIR: d.Cir, CB: d.Cb})
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }

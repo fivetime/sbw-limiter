@@ -184,11 +184,8 @@ func (c *Classify) AddTable(spec TableSpec) (uint32, error) {
 		Mask:           mask,
 	}
 	reply := &classify.ClassifyAddDelTableReply{}
-	if err := c.ch.SendRequest(req).ReceiveReply(reply); err != nil {
-		return 0, fmt.Errorf("vpp: classify_add_del_table (%v): %w", spec.Mask, err)
-	}
-	if reply.Retval != 0 {
-		return 0, fmt.Errorf("vpp: classify_add_del_table (%v) failed: retval %d", spec.Mask, reply.Retval)
+	if err := exec(c.ch, fmt.Sprintf("classify_add_del_table (%v)", spec.Mask), req, reply); err != nil {
+		return 0, err
 	}
 	return reply.NewTableIndex, nil
 }
@@ -202,27 +199,13 @@ func (c *Classify) LinkTable(tableIndex, nextTableIndex uint32) error {
 		NextTableIndex: nextTableIndex,
 		MissNextIndex:  NoTable,
 	}
-	reply := &classify.ClassifyAddDelTableReply{}
-	if err := c.ch.SendRequest(req).ReceiveReply(reply); err != nil {
-		return fmt.Errorf("vpp: link table %d->%d: %w", tableIndex, nextTableIndex, err)
-	}
-	if reply.Retval != 0 {
-		return fmt.Errorf("vpp: link table %d->%d failed: retval %d", tableIndex, nextTableIndex, reply.Retval)
-	}
-	return nil
+	return exec(c.ch, fmt.Sprintf("link table %d->%d", tableIndex, nextTableIndex), req, &classify.ClassifyAddDelTableReply{})
 }
 
 // DeleteTable removes a mask table by index.
 func (c *Classify) DeleteTable(tableIndex uint32) error {
 	req := &classify.ClassifyAddDelTable{IsAdd: false, TableIndex: tableIndex, NextTableIndex: NoTable, MissNextIndex: NoTable}
-	reply := &classify.ClassifyAddDelTableReply{}
-	if err := c.ch.SendRequest(req).ReceiveReply(reply); err != nil {
-		return fmt.Errorf("vpp: delete table %d: %w", tableIndex, err)
-	}
-	if reply.Retval != 0 {
-		return fmt.Errorf("vpp: delete table %d failed: retval %d", tableIndex, reply.Retval)
-	}
-	return nil
+	return exec(c.ch, fmt.Sprintf("delete table %d", tableIndex), req, &classify.ClassifyAddDelTableReply{})
 }
 
 // AddSession installs a member session: a prefix mapped to a hit target on the
@@ -276,14 +259,7 @@ func (c *Classify) DelSessionByKey(tableIndex uint32, mask model.MaskKind, key [
 		MatchLen:     uint32(len(full)),
 		Match:        full,
 	}
-	reply := &classify.ClassifyAddDelSessionReply{}
-	if err := c.ch.SendRequest(req).ReceiveReply(reply); err != nil {
-		return fmt.Errorf("vpp: classify_add_del_session(del key): %w", err)
-	}
-	if reply.Retval != 0 {
-		return fmt.Errorf("vpp: classify session delete failed: retval %d", reply.Retval)
-	}
-	return nil
+	return exec(c.ch, "classify_add_del_session(del key)", req, &classify.ClassifyAddDelSessionReply{})
 }
 
 // FindTablesByMask enumerates VPP's classify tables and maps each back to its
@@ -292,8 +268,8 @@ func (c *Classify) DelSessionByKey(tableIndex uint32, mask model.MaskKind, key [
 // indices, and the agent's in-memory map is lost on restart).
 func (c *Classify) FindTablesByMask() (map[model.MaskKind]uint32, error) {
 	idsReply := &classify.ClassifyTableIdsReply{}
-	if err := c.ch.SendRequest(&classify.ClassifyTableIds{}).ReceiveReply(idsReply); err != nil {
-		return nil, fmt.Errorf("vpp: classify_table_ids: %w", err)
+	if err := exec(c.ch, "classify_table_ids", &classify.ClassifyTableIds{}, idsReply); err != nil {
+		return nil, err
 	}
 	out := make(map[model.MaskKind]uint32)
 	for _, id := range idsReply.Ids {
@@ -335,14 +311,7 @@ func (c *Classify) session(isAdd bool, tableIndex uint32, mask model.MaskKind, p
 		MatchLen:     uint32(len(match)),
 		Match:        match,
 	}
-	reply := &classify.ClassifyAddDelSessionReply{}
-	if err := c.ch.SendRequest(req).ReceiveReply(reply); err != nil {
-		return fmt.Errorf("vpp: classify_add_del_session %s: %w", prefix, err)
-	}
-	if reply.Retval != 0 {
-		return fmt.Errorf("vpp: classify_add_del_session %s failed: retval %d", prefix, reply.Retval)
-	}
-	return nil
+	return exec(c.ch, fmt.Sprintf("classify_add_del_session %s", prefix), req, &classify.ClassifyAddDelSessionReply{})
 }
 
 // SetPolicerInterface attaches (isAdd) or detaches the ip4/ip6 classify chain
@@ -358,14 +327,7 @@ func (c *Classify) SetPolicerInterface(swIfIndex uint32, ip4Table, ip6Table uint
 		L2TableIndex:  NoTable,
 		IsAdd:         isAdd,
 	}
-	reply := &classify.PolicerClassifySetInterfaceReply{}
-	if err := c.ch.SendRequest(req).ReceiveReply(reply); err != nil {
-		return fmt.Errorf("vpp: policer_classify_set_interface %d: %w", swIfIndex, err)
-	}
-	if reply.Retval != 0 {
-		return fmt.Errorf("vpp: policer_classify_set_interface %d failed: retval %d", swIfIndex, reply.Retval)
-	}
-	return nil
+	return exec(c.ch, fmt.Sprintf("policer_classify_set_interface %d", swIfIndex), req, &classify.PolicerClassifySetInterfaceReply{})
 }
 
 // PolicerClassifyAttachment is one interface→table binding (for verification
@@ -382,18 +344,12 @@ func (c *Classify) DumpPolicerClassify(family model.Family) ([]PolicerClassifyAt
 	if family == model.FamilyIPv6 {
 		t = classify.POLICER_CLASSIFY_API_TABLE_IP6
 	}
-	reqCtx := c.ch.SendMultiRequest(&classify.PolicerClassifyDump{Type: t})
 	var out []PolicerClassifyAttachment
-	for {
-		d := &classify.PolicerClassifyDetails{}
-		stop, err := reqCtx.ReceiveReply(d)
-		if err != nil {
-			return nil, fmt.Errorf("vpp: policer_classify_dump: %w", err)
-		}
-		if stop {
-			break
-		}
+	err := dumpAll(c.ch, "policer_classify_dump", &classify.PolicerClassifyDump{Type: t}, func(d *classify.PolicerClassifyDetails) {
 		out = append(out, PolicerClassifyAttachment{SwIfIndex: uint32(d.SwIfIndex), TableIndex: d.TableIndex})
+	})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -418,18 +374,13 @@ type SessionInfo struct {
 // shared-bucket verification: multiple members sharing one policer all report
 // the same HitNextIndex).
 func (c *Classify) DumpSessions(tableIndex uint32) ([]SessionInfo, error) {
-	reqCtx := c.ch.SendMultiRequest(&classify.ClassifySessionDump{TableID: tableIndex})
 	var out []SessionInfo
-	for {
-		d := &classify.ClassifySessionDetails{}
-		stop, err := reqCtx.ReceiveReply(d)
-		if err != nil {
-			return nil, fmt.Errorf("vpp: classify_session_dump %d: %w", tableIndex, err)
-		}
-		if stop {
-			break
-		}
-		out = append(out, SessionInfo{HitNextIndex: d.HitNextIndex, Match: d.Match})
+	err := dumpAll(c.ch, fmt.Sprintf("classify_session_dump %d", tableIndex),
+		&classify.ClassifySessionDump{TableID: tableIndex}, func(d *classify.ClassifySessionDetails) {
+			out = append(out, SessionInfo{HitNextIndex: d.HitNextIndex, Match: d.Match})
+		})
+	if err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -480,11 +431,8 @@ func (c *Classify) LookupHits(table uint32, mask model.MaskKind, prefixes []neti
 			Match:    buf,
 		}
 		reply := &probe.ProbeClassifyLookupReply{}
-		if err := c.ch.SendRequest(req).ReceiveReply(reply); err != nil {
-			return nil, fmt.Errorf("vpp: probe_classify_lookup: %w", err)
-		}
-		if reply.Retval != 0 {
-			return nil, fmt.Errorf("vpp: probe_classify_lookup failed: retval %d", reply.Retval)
+		if err := exec(c.ch, "probe_classify_lookup", req, reply); err != nil {
+			return nil, err
 		}
 		if len(reply.Hits) != end-start {
 			return nil, fmt.Errorf("vpp: probe_classify_lookup: got %d hits, want %d", len(reply.Hits), end-start)
@@ -497,11 +445,8 @@ func (c *Classify) LookupHits(table uint32, mask model.MaskKind, prefixes []neti
 // TableInfo reads back one table's layout via classify_table_info.
 func (c *Classify) TableInfo(tableIndex uint32) (TableInfo, error) {
 	reply := &classify.ClassifyTableInfoReply{}
-	if err := c.ch.SendRequest(&classify.ClassifyTableInfo{TableID: tableIndex}).ReceiveReply(reply); err != nil {
-		return TableInfo{}, fmt.Errorf("vpp: classify_table_info %d: %w", tableIndex, err)
-	}
-	if reply.Retval != 0 {
-		return TableInfo{}, fmt.Errorf("vpp: classify_table_info %d failed: retval %d", tableIndex, reply.Retval)
+	if err := exec(c.ch, fmt.Sprintf("classify_table_info %d", tableIndex), &classify.ClassifyTableInfo{TableID: tableIndex}, reply); err != nil {
+		return TableInfo{}, err
 	}
 	return TableInfo{
 		TableID:        reply.TableID,
