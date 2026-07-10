@@ -56,9 +56,6 @@ func TestReporterBuildAssemblesValidReport(t *testing.T) {
 	cap := model.CapacityReport{NICCapacityBps: 100e9, SoldBandwidthBps: 40e9, ObservedBps: 12e9}
 	r := NewReporter("edge-2", hc,
 		WithCapacity(func() model.CapacityReport { return cap }),
-		WithMetering(func() []model.PoolMetering {
-			return []model.PoolMetering{{PoolID: 200, Direction: model.DirectionEgress, ConformBytes: 99}}
-		}),
 		WithReporterClock(func() int64 { return 555 }))
 
 	rep, ok := r.Build()
@@ -80,9 +77,6 @@ func TestReporterBuildAssemblesValidReport(t *testing.T) {
 	if rep.Capacity != cap {
 		t.Errorf("capacity = %+v, want %+v", rep.Capacity, cap)
 	}
-	if len(rep.Metering) != 1 || rep.Metering[0].ConformBytes != 99 {
-		t.Errorf("metering wrong: %+v", rep.Metering)
-	}
 	// The assembled report must satisfy the frozen contract (S-04).
 	if err := rep.Validate(); err != nil {
 		t.Errorf("assembled report fails contract validation: %v", err)
@@ -92,13 +86,13 @@ func TestReporterBuildAssemblesValidReport(t *testing.T) {
 func TestReporterBuildWithoutOptionalSources(t *testing.T) {
 	hc := NewHealthChecker("e", fakeLive{healthy: false})
 	hc.Observe(model.EdgeDesiredState{Generation: 1}, Result{}, nil) // vpp down
-	r := NewReporter("e", hc)                                        // no capacity/metering
+	r := NewReporter("e", hc)                                        // no capacity source
 	rep, ok := r.Build()
 	if !ok {
 		t.Fatal("Build ready")
 	}
-	if rep.Capacity != (model.CapacityReport{}) || rep.Metering != nil {
-		t.Errorf("optional sources should be zero/nil: %+v", rep)
+	if rep.Capacity != (model.CapacityReport{}) {
+		t.Errorf("optional capacity should be zero: %+v", rep)
 	}
 	if !rep.Health.SoftDead() {
 		t.Errorf("vpp-down health should be soft-dead: %+v", rep.Health)

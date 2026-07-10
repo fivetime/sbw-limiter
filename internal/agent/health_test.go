@@ -32,24 +32,22 @@ func TestClassify(t *testing.T) {
 		vppHealthy bool
 		res        Result
 		err        error
-		fibDrift   int
 		wantState  model.SoftDeathState
 		wantSoft   bool
 	}{
-		{"healthy", true, clean, nil, 0, model.HealthHealthy, false},
-		{"drift repaired", true, repaired, nil, 0, model.HealthDegraded, false},
-		{"fib drift", true, clean, nil, 5, model.HealthDegraded, false},
-		{"vpp down", false, clean, nil, 0, model.HealthDataPlaneDown, true},
+		{"healthy", true, clean, nil, model.HealthHealthy, false},
+		{"drift repaired", true, repaired, nil, model.HealthDegraded, false},
+		{"vpp down", false, clean, nil, model.HealthDataPlaneDown, true},
 		// A reconcile error while the connection is ALIVE (vppHealthy) is "this pass could not
 		// complete" (a slow/timed-out dump under load), NOT a dead data plane → self-healing
 		// Degraded (retry), NOT SoftDead. Real death is caught by the connection-EOF case +
 		// the active forwarding probe, latency-independent (§4.2.7).
-		{"reconcile error, conn alive = degraded retry", true, clean, errors.New("boom"), 0, model.HealthDegraded, false},
-		{"vpp down dominates drift", false, repaired, nil, 9, model.HealthDataPlaneDown, true},
+		{"reconcile error, conn alive = degraded retry", true, clean, errors.New("boom"), model.HealthDegraded, false},
+		{"vpp down dominates repair", false, repaired, nil, model.HealthDataPlaneDown, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			rep := Classify("edge-2", desired, c.vppHealthy, c.res, c.err, c.fibDrift, 123)
+			rep := Classify("edge-2", desired, c.vppHealthy, c.res, c.err, 123)
 			if rep.State != c.wantState {
 				t.Errorf("state = %v, want %v", rep.State, c.wantState)
 			}
@@ -74,9 +72,7 @@ func TestClassify(t *testing.T) {
 
 func TestHealthCheckerObserveAndLast(t *testing.T) {
 	live := &fakeLive{healthy: true}
-	drift := 0
 	hc := NewHealthChecker("edge-2", live,
-		WithFIBDrift(func() int { return drift }),
 		WithClock(func() int64 { return 42 }))
 
 	if _, seen := hc.Last(); seen {
@@ -96,26 +92,10 @@ func TestHealthCheckerObserveAndLast(t *testing.T) {
 		t.Fatalf("expected degraded with 1 repair, got %+v", rep)
 	}
 
-	// FIB drift surfaces via the wired source.
-	drift = 3
-	hc.Observe(desiredN(1, 1), Result{}, nil)
-	if rep, _ := hc.Last(); rep.State != model.HealthDegraded || rep.FIBDrift != 3 {
-		t.Fatalf("expected degraded with fib drift 3, got %+v", rep)
-	}
-
 	// VPP link drops → dataplane down.
-	drift = 0
 	live.healthy = false
 	hc.Observe(desiredN(1, 1), Result{}, nil)
 	if rep, _ := hc.Last(); rep.State != model.HealthDataPlaneDown || !rep.SoftDead() {
 		t.Fatalf("expected dataplane-down/softdead, got %+v", rep)
-	}
-}
-
-func TestHealthCheckerNilFIBDriftIsZero(t *testing.T) {
-	hc := NewHealthChecker("e", fakeLive{healthy: true}) // no WithFIBDrift
-	hc.Observe(desiredN(0, 0), Result{}, nil)
-	if rep, _ := hc.Last(); rep.FIBDrift != 0 || rep.State != model.HealthHealthy {
-		t.Fatalf("nil fibDrift should yield 0/healthy, got %+v", rep)
 	}
 }

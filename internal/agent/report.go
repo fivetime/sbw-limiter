@@ -37,9 +37,6 @@ type HealthSource interface {
 // (§3.1). nil → a zero CapacityReport.
 type CapacityFunc func() model.CapacityReport
 
-// MeteringFunc reports per-pool policer accounting (T-1001). nil → no metering.
-type MeteringFunc func() []model.PoolMetering
-
 // FaultSource types the edge's data-plane fault kind LIVE (DESIGN-liveness §4.2.3),
 // consulted at report-build time so a determinate fault (vpp-gone / link-down) reaches
 // the controller within one report interval, not one (slower) reconcile interval.
@@ -74,7 +71,6 @@ type Reporter struct {
 	edgeID   model.EdgeID
 	health   HealthSource
 	capacity CapacityFunc
-	metering MeteringFunc
 	poolHash PoolHashFunc
 	fault    FaultSource
 	observed ObservedMembersFunc
@@ -93,8 +89,6 @@ type ReporterOption func(*Reporter)
 // WithCapacity wires the headroom source.
 func WithCapacity(fn CapacityFunc) ReporterOption { return func(r *Reporter) { r.capacity = fn } }
 
-// WithMetering wires the per-pool metering source (T-1001).
-func WithMetering(fn MeteringFunc) ReporterOption { return func(r *Reporter) { r.metering = fn } }
 
 // WithPoolHash wires the installed pool-set hash source (reconciler.InstalledPoolHash):
 // the report carries it so the controller can detect drift and resync.
@@ -166,9 +160,6 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	}
 	if r.capacity != nil {
 		rep.Capacity = r.capacity()
-	}
-	if r.metering != nil {
-		rep.Metering = r.metering()
 	}
 	if r.poolHash != nil {
 		rep.InstalledPoolHash = r.poolHash()

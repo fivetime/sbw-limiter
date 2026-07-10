@@ -71,9 +71,9 @@ type Config struct {
 
 	// MemberInterfaces names the VPP interface(s) where pool MEMBERS physically
 	// attach (the L's member-access leg, e.g. host-macc). The agent reads their
-	// ARP/ND neighbor table as the L's PHYSICAL member-presence authority
-	// (DESIGN-liveness §11 / REFACTOR-coverer-liveness-only.md) and reports it as
-	// EdgeReport.ObservedMembers. Distinct from PolicerInterfaces, which also
+	// ARP/ND neighbor table and reports it as EdgeReport.ObservedMembers (the
+	// server's member-up/down signal; the ARP basis is owed a rework, see
+	// DESIGN-liveness §2/§10). Distinct from PolicerInterfaces, which also
 	// includes the uplink (whose neighbors are fabric/mesh, not members). Env
 	// BWPOOL_MEMBER_INTERFACES is comma-separated; empty disables physical
 	// observation (the report simply omits the set — backward compatible).

@@ -21,13 +21,13 @@ type Liveness interface {
 //
 //   - VPP link down, or the reconcile itself failed → DataPlaneDown: local
 //     repair is impossible, the controller must promote the backup (§4.3/§4.7).
-//   - VPP up but the pass had to repair drift (rules lost/destroyed) or the FIB
-//     drifted → Degraded: a soft-death symptom that self-healed this cycle.
-//   - VPP up, nothing to repair, FIB agrees → Healthy.
+//   - VPP up but the pass had to repair drift (rules lost/destroyed) → Degraded:
+//     a soft-death symptom that self-healed this cycle.
+//   - VPP up, nothing to repair → Healthy.
 //
 // The reconcile is the dataplane-penetrating probe (it dumps actual VPP state to
 // compute drift), so its result IS the ground truth — no second scan needed.
-func Classify(edgeID model.EdgeID, desired model.EdgeDesiredState, vppHealthy bool, res Result, reconcileErr error, fibDrift int, nowMs int64) model.HealthReport {
+func Classify(edgeID model.EdgeID, desired model.EdgeDesiredState, vppHealthy bool, res Result, reconcileErr error, nowMs int64) model.HealthReport {
 	rep := model.HealthReport{
 		EdgeID:            edgeID,
 		GenerationApplied: desired.Generation,
@@ -39,7 +39,6 @@ func Classify(edgeID model.EdgeID, desired model.EdgeDesiredState, vppHealthy bo
 		PolicersActual:    res.PolicersActual,
 		SessionsActual:    res.SessionsActual,
 		RepairActions:     res.Total(),
-		FIBDrift:          fibDrift,
 	}
 
 	switch {
@@ -62,9 +61,6 @@ func Classify(edgeID model.EdgeID, desired model.EdgeDesiredState, vppHealthy bo
 	case rep.RepairActions > 0:
 		rep.State = model.HealthDegraded
 		rep.Reason = "data-plane drift repaired locally (soft-death symptom)"
-	case fibDrift != 0:
-		rep.State = model.HealthDegraded
-		rep.Reason = "FIB route-count drift (linux-cp soft death)"
 	default:
 		rep.State = model.HealthHealthy
 	}
@@ -77,11 +73,6 @@ func Classify(edgeID model.EdgeID, desired model.EdgeDesiredState, vppHealthy bo
 type HealthChecker struct {
 	edgeID model.EdgeID
 	live   Liveness
-
-	// fibDrift returns the current accounting three-way route-count drift; nil
-	// (no accounting wired) is treated as 0. The route audit (T-502) owns FIB
-	// drift; this just folds it into the unified report.
-	fibDrift func() int
 
 	// deltasDropped returns the reconciler's cumulative dropped-delta count (deltaQ
 	// overflow, DESIGN §9.1); nil is treated as 0. Folded into the report so the
@@ -121,12 +112,6 @@ func (h *HealthChecker) SetForcedDataPlaneDown(on bool) bool {
 // HealthOption configures a HealthChecker.
 type HealthOption func(*HealthChecker)
 
-// WithFIBDrift wires a live FIB-drift source (e.g. the route audit) into the
-// report.
-func WithFIBDrift(fn func() int) HealthOption {
-	return func(h *HealthChecker) { h.fibDrift = fn }
-}
-
 // WithClock overrides the timestamp source (tests).
 func WithClock(now func() int64) HealthOption {
 	return func(h *HealthChecker) { h.now = now }
@@ -159,11 +144,7 @@ func NewHealthChecker(edgeID model.EdgeID, live Liveness, opts ...HealthOption) 
 // Observe classifies one reconcile pass into the latest report. Wire it via
 // Reconciler.AddObserver(hc.Observe).
 func (h *HealthChecker) Observe(desired model.EdgeDesiredState, res Result, reconcileErr error) {
-	drift := 0
-	if h.fibDrift != nil {
-		drift = h.fibDrift()
-	}
-	rep := Classify(h.edgeID, desired, h.live.Healthy(), res, reconcileErr, drift, h.now())
+	rep := Classify(h.edgeID, desired, h.live.Healthy(), res, reconcileErr, h.now())
 	if h.deltasDropped != nil {
 		rep.DeltasDropped = h.deltasDropped()
 	}

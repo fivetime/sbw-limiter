@@ -30,10 +30,6 @@ type DesiredFunc func(model.EdgeDesiredState)
 // gapped delta and relies on the controller's full DESIRED_STATE resync.
 type DeltaFunc func(model.EdgeDesiredDelta)
 
-// DirectiveFunc receives a non-desired-state directive (failover/urgent); the
-// raw JSON payload is passed through for the agent to interpret.
-type DirectiveFunc func(kind rpc.Directive_Kind, generation uint64, payload []byte)
-
 // Client is the agent's connection to the control plane (REFACTOR step 4: the server
 // directly; formerly a coverer).
 type Client struct {
@@ -41,11 +37,10 @@ type Client struct {
 	svc  rpc.AgentServiceClient
 	edge model.EdgeID
 
-	onDesired   DesiredFunc
-	onDelta     DeltaFunc
-	onDirective DirectiveFunc
-	backoff     time.Duration
-	log         *slog.Logger
+	onDesired DesiredFunc
+	onDelta   DeltaFunc
+	backoff   time.Duration
+	log       *slog.Logger
 
 	// chunkAsm reassembles a chunked full DESIRED_STATE (DESIRED_STATE_CHUNK). It is
 	// owned by the single dispatch goroutine (the Recv loop), so it needs no lock. A
@@ -267,9 +262,9 @@ func (c *Client) dispatch(d *rpc.Directive) {
 			c.onDelta(delta)
 		}
 	default:
-		if c.onDirective != nil {
-			c.onDirective(d.Kind, d.Generation, d.Payload)
-		}
+		// No non-desired-state directive kinds are dispatched to the agent today
+		// (failover etc. are server-side). Unknown kinds are ignored.
+		c.log.Debug("ignoring unhandled directive kind", "kind", d.Kind)
 	}
 }
 

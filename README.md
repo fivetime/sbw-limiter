@@ -18,7 +18,7 @@
 
 - `cmd/edge-agent/`：edge-agent 进程入口。
 - `internal/agent/`：desired store、reconcile 主循环、delta apply、health、report、metering。
-- `internal/grpcclient/`、`internal/homing/`：agent 侧 gRPC client 和多 controller re-home。
+- `internal/grpcclient/`：agent 侧直连 server 的 gRPC client(register/subscribe/report)。
 - `internal/vpp/`：govpp 物化 policer、classify、interface、stats。
 - `internal/anchors/`、`internal/flowspec/`、`internal/bird/`：BIRD include 渲染和 reload。
 - `internal/accounting/`：路由/计数对账辅助。

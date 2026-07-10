@@ -648,10 +648,6 @@ func main() {
 		}
 	}()
 
-	// TODO(C-05 触发源 / B-04 audit): wire the BIRD route audit (agent.RouteAudit)
-	// + anchor reloader and controller-down/up fail-static signalling once the
-	// accounting checker is composed here.
-
 	log.Info("edge-agent running; subscribed to controller. Send SIGTERM/SIGINT to stop.")
 	<-ctx.Done()
 	log.Info("edge-agent received shutdown signal; stopping")

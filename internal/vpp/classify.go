@@ -1,6 +1,7 @@
 package vpp
 
 import (
+	"bytes"
 	"fmt"
 	"net/netip"
 
@@ -303,7 +304,7 @@ func (c *Classify) FindTablesByMask() (map[model.MaskKind]uint32, error) {
 		for _, mk := range allMaskKinds {
 			ms, _ := specOf(mk)
 			skip, match, mask := ms.tableMask()
-			if info.SkipNVectors == skip && info.MatchNVectors == match && bytesEqual(info.Mask, mask) {
+			if info.SkipNVectors == skip && info.MatchNVectors == match && bytes.Equal(info.Mask, mask) {
 				out[mk] = id
 				break
 			}
@@ -315,18 +316,6 @@ func (c *Classify) FindTablesByMask() (map[model.MaskKind]uint32, error) {
 var allMaskKinds = []model.MaskKind{
 	model.MaskIP4Dst32, model.MaskIP4Dst24, model.MaskIP6Dst128,
 	model.MaskIP4Src32, model.MaskIP4Src24, model.MaskIP6Src128,
-}
-
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func (c *Classify) session(isAdd bool, tableIndex uint32, mask model.MaskKind, prefix netip.Prefix, hitNext uint32) error {
