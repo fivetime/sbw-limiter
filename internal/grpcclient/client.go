@@ -37,10 +37,12 @@ type Client struct {
 	svc  rpc.AgentServiceClient
 	edge model.EdgeID
 
-	onDesired DesiredFunc
-	onDelta   DeltaFunc
-	backoff   time.Duration
-	log       *slog.Logger
+	onDesired  DesiredFunc
+	onDelta    DeltaFunc
+	onConnUp   func() // controller reached (registered)
+	onConnDown func() // controller lost (register failed / Subscribe stream ended)
+	backoff    time.Duration
+	log        *slog.Logger
 
 	// chunkAsm reassembles a chunked full DESIRED_STATE (DESIRED_STATE_CHUNK). It is
 	// owned by the single dispatch goroutine (the Recv loop), so it needs no lock. A
@@ -79,6 +81,15 @@ func WithDesired(fn DesiredFunc) Option { return func(c *Client) { c.onDesired =
 
 // WithDelta wires the incremental DESIRED_DELTA handler (the hot path).
 func WithDelta(fn DeltaFunc) Option { return func(c *Client) { c.onDelta = fn } }
+
+// WithConnState wires fail-static connection transitions: onDown fires when the
+// controller becomes unreachable (register fails, or the Subscribe stream ends),
+// onUp when it is (re)reached. Wire to DesiredStore.ControllerDown/ControllerUp so
+// the held desired state is reported FROZEN (T-505) while contact is lost — the
+// reconcile loop keeps converging to it regardless (fail-static, DESIGN.md §6.4).
+func WithConnState(up, down func()) Option {
+	return func(c *Client) { c.onConnUp = up; c.onConnDown = down }
+}
 
 // WithBackoff sets the reconnect backoff (default 1s).
 func WithBackoff(d time.Duration) Option { return func(c *Client) { c.backoff = d } }
@@ -160,10 +171,13 @@ func (c *Client) RunDirect(ctx context.Context, capacityBps uint64) {
 				return
 			}
 			c.log.Warn("register failed; retrying", "err", err, "backoff", c.backoff)
+			c.connState(false) // controller unreachable → held state is now FROZEN
 		} else {
 			c.log.Info("registered with server (direct)")
+			c.connState(true) // reached the controller
 			if err := c.subscribeOnce(ctx); err != nil && ctx.Err() == nil {
 				c.log.Warn("subscribe stream ended; reconnecting", "err", err, "backoff", c.backoff)
+				c.connState(false) // lost the stream → FROZEN until re-reached
 			}
 		}
 		select {
@@ -171,6 +185,17 @@ func (c *Client) RunDirect(ctx context.Context, capacityBps uint64) {
 			return
 		case <-time.After(c.backoff):
 		}
+	}
+}
+
+// connState fires the fail-static up/down hooks (nil-safe). Accept/Merge also mark
+// the store healthy on any push; this additionally flips it FROZEN the moment
+// contact is lost, so the freeze is observable (T-505) before the next push would.
+func (c *Client) connState(up bool) {
+	if up && c.onConnUp != nil {
+		c.onConnUp()
+	} else if !up && c.onConnDown != nil {
+		c.onConnDown()
 	}
 }
 

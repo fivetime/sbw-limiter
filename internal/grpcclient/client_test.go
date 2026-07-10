@@ -3,9 +3,11 @@ package grpcclient
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,6 +31,7 @@ type fakeServer struct {
 	coverers []byte // JSON model.CovererAssignment returned by Register
 	pushCh   chan *rpc.Directive
 	subbed   chan struct{}
+	subErr   error // when set, Subscribe returns it immediately (simulate a broken stream)
 }
 
 func newFakeServer() *fakeServer {
@@ -47,6 +50,9 @@ func (f *fakeServer) Subscribe(_ *rpc.SubscribeRequest, stream rpc.AgentService_
 	select {
 	case f.subbed <- struct{}{}:
 	default:
+	}
+	if f.subErr != nil {
+		return f.subErr // broken stream while the client's ctx is still alive
 	}
 	for {
 		select {
@@ -322,5 +328,34 @@ func TestAcceptChunkDropsStaleEpoch(t *testing.T) {
 	wj, _ := json.Marshal(newWant)
 	if string(gj) != string(wj) {
 		t.Fatal("stale straggler leaked into reassembly")
+	}
+}
+
+// TestRunDirectConnStateFiresHooks verifies the fail-static wiring: RunDirect fires
+// onConnUp after a successful register and onConnDown when the Subscribe stream ends
+// while the ctx is still alive (a real disconnect, not a shutdown).
+func TestRunDirectConnStateFiresHooks(t *testing.T) {
+	f := newFakeServer()
+	f.subErr = errors.New("stream boom") // Subscribe fails immediately → contact lost, ctx alive
+	var ups, downs atomic.Int32
+	c := dialFake(t, f, "edge-1",
+		WithConnState(func() { ups.Add(1) }, func() { downs.Add(1) }),
+		WithBackoff(10*time.Millisecond))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.RunDirect(ctx, 100)
+
+	// Register succeeds (up) then Subscribe fails (down), looping under backoff.
+	deadline := time.After(2 * time.Second)
+	for {
+		if ups.Load() >= 1 && downs.Load() >= 1 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("connState hooks not fired: ups=%d downs=%d", ups.Load(), downs.Load())
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 }

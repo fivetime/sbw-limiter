@@ -503,6 +503,10 @@ func main() {
 	client, err := grpcclient.Dial(serverEndpoint, model.EdgeID(cfg.EdgeID),
 		grpcclient.WithDesired(onDesired),
 		grpcclient.WithDelta(recon.SubmitDelta), // hot path: queue deltas to the reconcile goroutine
+		// Fail-static (T-505): flip the held desired state to FROZEN the moment the
+		// controller connection is lost (reported via DesiredStore.Status). The
+		// reconcile loop keeps converging to the last-good state regardless.
+		grpcclient.WithConnState(store.ControllerUp, store.ControllerDown),
 		grpcclient.WithLogger(log),
 	)
 	if err != nil {
