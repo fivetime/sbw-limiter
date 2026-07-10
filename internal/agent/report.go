@@ -62,14 +62,15 @@ const wakeMinInterval = time.Second
 // Reporter assembles the agent's EdgeReport uplink (B-03) from the soft-death
 // health (B-05) plus capacity/metering sources, and sends it periodically.
 type Reporter struct {
-	edgeID   model.EdgeID
-	health   HealthSource
-	capacity CapacityFunc
-	poolHash PoolHashFunc
-	birdFeed func() (fails, lastOKUnixMs int64)
-	fault    FaultSource
-	now      func() int64
-	log      *slog.Logger
+	edgeID        model.EdgeID
+	health        HealthSource
+	capacity      CapacityFunc
+	poolHash      PoolHashFunc
+	birdFeed      func() (fails, lastOKUnixMs int64)
+	desiredCounts func() (policers, sessions int, ok bool)
+	fault         FaultSource
+	now           func() int64
+	log           *slog.Logger
 
 	// wake requests one out-of-cycle report (event-driven, e.g. a VPP health
 	// transition — §4.2.4 ★实测更新: removes the 15s report-sampling term from
@@ -90,6 +91,18 @@ func WithPoolHash(fn PoolHashFunc) ReporterOption { return func(r *Reporter) { r
 // WithFault wires the live fault-kind sensor (§4.2.3): Build overlays its verdict onto
 // the report so a determinate fault is typed + surfaced within one report interval.
 func WithFault(fn FaultSource) ReporterOption { return func(r *Reporter) { r.fault = fn } }
+
+// WithDesiredCounts wires a CURRENT-held-desired counts source (len of the
+// store's policers/classify sessions — pure memory). Build overlays them onto
+// HealthReport.PolicersDesired/SessionsDesired, which otherwise carry the LAST
+// full-reconcile Result (up to a reconcile interval stale): after a DELTA the
+// agent echoes the new AppliedVersion at once but the stale desired counts made
+// the server's B-02 audit see a phantom expected≠desired "delivery-loss" during
+// routine pool churn (§6.52 #5). Same definition as the server's ExpectedCounts,
+// so applied==desired ⇒ gap≡0.
+func WithDesiredCounts(fn func() (policers, sessions int, ok bool)) ReporterOption {
+	return func(r *Reporter) { r.desiredCounts = fn }
+}
 
 // WithBirdFeedStatus wires the bird-materialization health source (birdfeed.Feed.Status
 // or BirdApplier.Status): Build overlays HealthReport.BirdFeedFails/BirdFeedLastOKUnixMs
@@ -162,6 +175,12 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	// it into the bird-feed-degraded/-recovered BSS events (policy-integrity signal).
 	if r.birdFeed != nil {
 		rep.Health.BirdFeedFails, rep.Health.BirdFeedLastOKUnixMs = r.birdFeed()
+	}
+	// Desired counts from the CURRENT held state (fresh across deltas; §6.52 #5).
+	if r.desiredCounts != nil {
+		if pol, sess, ok := r.desiredCounts(); ok {
+			rep.Health.PolicersDesired, rep.Health.SessionsDesired = pol, sess
+		}
 	}
 	return rep, true
 }

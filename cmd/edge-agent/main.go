@@ -199,6 +199,10 @@ func main() {
 		// bird-feed-degraded BSS event (policy-integrity, not a death signal).
 		// Indirect through a closure: birdFeedStatus is assigned BELOW (after the
 		// materializer is chosen), so passing it directly here would capture nil.
+		agent.WithDesiredCounts(func() (int, int, bool) {
+			st, ok := store.Desired()
+			return len(st.Policers), len(st.ClassifySessions), ok
+		}),
 		agent.WithBirdFeedStatus(func() (int64, int64) {
 			if birdFeedStatus == nil {
 				return 0, 0
