@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"net/netip"
@@ -145,86 +146,10 @@ func main() {
 		met.RecordDesiredStatus(st.Frozen, st.Generation)
 	})
 
-	// ③ forwarding-broken (§4.2.7/§4.2.8): device-level active forwarding check —
-	// ForwardingProbeFails consecutive black-holed rounds → forwarding-broken (device
-	// up, links up, but a silent black-hole). Two sources, selected by config:
-	//   - plugin gauge (§4.2.8, preferred): the `probe` VPP plugin resolves the target
-	//     in the FIB on its own process node and publishes reachability to the stats
-	//     segment; the agent reads it over shared memory, never touching VPP's single
-	//     main thread — a busy VPP can't self-time-out the probe (the cli_inband ping's
-	//     fatal flaw under load).
-	//   - cli_inband ping (§4.2.7, legacy fallback): pings the target through the data
-	//     plane. Immune to the policer (a low-rate echo is below any pool rate).
-	// Disabled if no target set.
-	var probeBroken func() bool
-	if cfg.ForwardingProbeTarget != "" {
-		var fp *agent.ForwardingProbe
-		if cfg.ForwardingProbePlugin {
-			// Its own read-only stats connection (shared memory, decoupled from the
-			// metering reader's lifetime). A connect failure disables ③ but not the agent.
-			if probeStats, serr := vpp.NewStatsReader(cfg.VPPStatsSocket); serr != nil {
-				log.Error("forwarding probe (plugin) disabled: VPP stats connect failed",
-					"err", serr, "socket", cfg.VPPStatsSocket)
-			} else {
-				defer func() { _ = probeStats.Close() }()
-				gauge := "/probe/fib/" + cfg.ForwardingProbeStatName + "/reachable"
-				// The `probe fib add` CLI needs a prefix; a bare next-hop address
-				// (the natural way to express the target) gets its host length.
-				probePrefix := cfg.ForwardingProbeTarget
-				if !strings.Contains(probePrefix, "/") {
-					if a, perr := netip.ParseAddr(probePrefix); perr == nil {
-						if a.Is4() {
-							probePrefix += "/32"
-						} else {
-							probePrefix += "/128"
-						}
-					}
-				}
-				// Register the target once — a main-thread setup call (not the detection
-				// loop). Idempotent-ish: an "already exists" on agent restart is benign,
-				// and a fresh VPP (post-restart) is self-healed by the lazy re-register
-				// in the round below.
-				register := func() error {
-					_, cerr := conn.CliInband(fmt.Sprintf("probe fib add %s table %d name %s",
-						probePrefix, cfg.ForwardingProbeTable, cfg.ForwardingProbeStatName),
-						cfg.ForwardingProbeTimeout.Std())
-					return cerr
-				}
-				if rerr := register(); rerr != nil {
-					log.Warn("probe target register at startup returned error (continuing; gauge read is source of truth)", "err", rerr)
-				}
-				fp = agent.NewForwardingProbe(func() (int, error) {
-					v, gerr := probeStats.ReadGauge(gauge)
-					if gerr != nil {
-						// Gauge absent = target unregistered (fresh VPP after a restart).
-						// Re-register best-effort and report "could not run" (verdict
-						// unchanged), so a VPP restart never false-positives a black-hole.
-						_ = register()
-						return 0, gerr
-					}
-					return int(v), nil
-				}, cfg.ForwardingProbeInterval.Std(), cfg.ForwardingProbeFails, log)
-				log.Info("forwarding probe enabled (plugin gauge, §4.2.8)", "target", cfg.ForwardingProbeTarget,
-					"gauge", gauge, "interval", cfg.ForwardingProbeInterval.Std(), "fails", cfg.ForwardingProbeFails)
-			}
-		} else {
-			fp = agent.NewForwardingProbe(
-				func() (int, error) {
-					_, recv, err := conn.Ping(cfg.ForwardingProbeTarget, 3, 0.1, cfg.ForwardingProbeTimeout.Std())
-					return recv, err
-				},
-				cfg.ForwardingProbeInterval.Std(), cfg.ForwardingProbeFails, log)
-			log.Info("forwarding probe enabled (cli_inband ping, §4.2.7 legacy)", "target", cfg.ForwardingProbeTarget,
-				"interval", cfg.ForwardingProbeInterval.Std(), "fails", cfg.ForwardingProbeFails)
-		}
-		if fp != nil {
-			// VPP restart (generation bump) disarms the probe until first
-			// reachability: the post-restart FIB-rebuild window (bird/vppfib
-			// re-feed, tens of seconds) must not read as a black-hole (§6.44).
-			fp.BindDataplaneGeneration(conn.Generation)
-			go fp.Run(ctx)
-			probeBroken = fp.Broken
-		}
+	// ③ forwarding-broken (§4.2.7/§4.2.8) — see setupForwardingProbe.
+	probeBroken, probeCleanup := setupForwardingProbe(ctx, cfg, conn, log)
+	if probeCleanup != nil {
+		defer probeCleanup()
 	}
 
 	// Member observer: its Observe() dump feeds the reporter's EdgeReport.ObservedMembers
@@ -233,54 +158,11 @@ func main() {
 	// source is itself owed a rework (host-macc ARP basis, lab-topology-bound).
 	memberObserver := agent.NewMemberObserver(conn, cfg.MemberInterfaces, log)
 
-	// Stats-segment VPP liveness (§6.44): read the probe plugin's /probe/heartbeat
-	// over its own stats connection. A stalled heartbeat = main-thread wedge; a
-	// disconnected stats socket = process death (govpp fsnotify, immediate). This
-	// judges VPP off the main thread, covering govpp's binary-API health-check
-	// blind spots (30s reply-timeout stall + wedge). Best-effort: if the dedicated
-	// stats connection can't be established, liveness is skipped and Fault() falls
-	// back to conn.Healthy() alone (pre-§6.44 behavior). Detection only — never
-	// touches the govpp binary-API connection. Fault() consults Dead(); the
-	// transition hook (wired below, after the reporter exists) wakes the report.
-	// wedgeGrace 3s = 3× the probe 1s scan cadence: tolerates the cooperative
-	// vlib_process being skipped by a genuinely busy (not wedged) main thread,
-	// while catching a real stall promptly. A ~1s container self-heal shows up as a
-	// stats disconnect (process death path), not a stall, and is absorbed by the
-	// server's restartGrace like any vpp-gone. OnTransition + Run are wired below,
-	// after the reporter exists.
-	var vppLive *agent.VppLiveness
-	var vppLiveDead func() bool
-	if liveStats0, lerr := vpp.NewStatsReader(cfg.VPPStatsSocket); lerr != nil {
-		log.Error("vpp liveness disabled: dedicated stats connect failed (falling back to conn.Healthy)",
-			"err", lerr, "socket", cfg.VPPStatsSocket)
-	} else {
-		// Swappable reader: a rapid VPP restart can leave govpp's fsnotify-based
-		// reconnect stuck on a stale segment (frozen heartbeat → falsely wedged); the
-		// stale-reconnect hook rebuilds it while dead. Guard reads/swaps with a mutex.
-		liveStats := liveStats0
-		var liveMu sync.Mutex
-		defer func() { liveMu.Lock(); _ = liveStats.Close(); liveMu.Unlock() }()
-		vppLive = agent.NewVppLiveness(
-			func() (uint64, error) {
-				liveMu.Lock()
-				r := liveStats
-				liveMu.Unlock()
-				return r.ReadGauge("/probe/heartbeat")
-			},
-			vpp.IsStatsDisconnected, time.Second, 3*time.Second, log)
-		vppLive.OnStaleReconnect(func() {
-			nr, rerr := vpp.NewStatsReader(cfg.VPPStatsSocket)
-			if rerr != nil {
-				log.Warn("vpp liveness: stale-segment stats reconnect failed", "err", rerr)
-				return
-			}
-			liveMu.Lock()
-			_ = liveStats.Close()
-			liveStats = nr
-			liveMu.Unlock()
-			log.Info("vpp liveness: rebuilt stats reader (recovering from a possibly stale segment)")
-		}, 8*time.Second)
-		vppLiveDead = vppLive.Dead
+	// Stats-segment VPP liveness (§6.44) — see setupVppLiveness. OnTransition + Run
+	// are wired below, after the reporter exists.
+	vppLive, vppLiveDead, liveCleanup := setupVppLiveness(cfg, log)
+	if liveCleanup != nil {
+		defer liveCleanup()
 	}
 
 	reporter := agent.NewReporter(model.EdgeID(cfg.EdgeID), health,
@@ -315,41 +197,14 @@ func main() {
 		agent.WithReporterLogger(log),
 	)
 
-	// BIRD materialization (B-03 apply): only when the include paths are
-	// configured — anchors (/32 carriers to MX204) + egress FlowSpec (to R),
-	// applied with check+configure+rollback discipline.
-	//
-	// Use a self-reconnecting BIRD client: a BIRD restart (e.g. after a VPP crash
-	// recreates the lcp interfaces and the node supervisor restarts BIRD) kills
-	// the control socket, and a one-shot client would wedge on ErrClosed forever.
-	// The wrapper redials transparently on the next apply pass and re-pushes the
-	// includes. It dials lazily, so the agent can also start before BIRD is up.
-	var birdApply *agent.BirdApplier
-	var feed *birdfeed.Feed
-	if cfg.BirdFeedMode == "api" {
-		// New path (DESIGN-bird-api.md): stream anchors + egress flowspec incrementally
-		// to bird-vpp's `api` proto over the socket, no full-file `birdc configure`.
-		// Lazy connect; (re)connect triggers a HELLO+EOR resync, the proto's grace
-		// window covers brief reconnects without flapping the routes.
-		// Anchors + egress flowspec are fed straight from desired, UNCONDITIONALLY — there
-		// is no advertisement gate here. (Anti-blackhole — don't traction traffic to a
-		// member L can't forward to — is owed a rework onto FIB reachability, DESIGN-liveness
-		// §10; the old agent-side "physical gate" and the server-side RIB-survival gate are
-		// both gone, so today advertisement is ungated.)
-		feed = birdfeed.NewFeed(cfg.BirdAPISocket, log)
-		log.Info("bird control plane via api socket (incremental feed)", "socket", cfg.BirdAPISocket)
-	} else if cfg.BirdAnchorsInclude != "" && cfg.BirdFlowspecInclude != "" {
-		bc := bird.NewReconnecting(cfg.BIRDSocketPath, log)
-		defer func() { _ = bc.Close() }()
-		birdApply = agent.NewBirdApplier(
-			anchors.NewApplier(cfg.BirdAnchorsInclude, bc, anchors.WithLogger(log)),
-			anchors.NewApplier(cfg.BirdFlowspecInclude, bc, anchors.WithLogger(log)),
-			log,
-		)
-		if err := birdApply.EnsureFiles(); err != nil {
-			log.Error("bird include init failed", "err", err)
-			os.Exit(1)
-		}
+	// BIRD materialization (B-03 apply) — see setupBirdMaterializers.
+	feed, birdApply, birdCleanup, err := setupBirdMaterializers(cfg, log)
+	if err != nil {
+		log.Error("bird include init failed", "err", err)
+		os.Exit(1)
+	}
+	if birdCleanup != nil {
+		defer birdCleanup()
 	}
 	// Wake whichever bird materializer is active (a fresh push / pool change applies now).
 	birdWake := func() {
@@ -360,70 +215,14 @@ func main() {
 			birdApply.Wake()
 		}
 	}
-	// Canary (soft-death §4.7/6.13): advertise CanaryPrefix tagged with CanaryLC
-	// via BIRD while the data plane is healthy; withdraw it on HealthDataPlaneDown
-	// so the controller's RIB tap sees CanaryDown and (with the agent's own
-	// healthDead report) trips soft-death failover — catching a dead data plane
-	// that BGP/heartbeat alone cannot see. The canary IS a blackhole /32+large-
-	// community route = exactly a model.Anchor, so it reuses the anchors apply
-	// machinery (atomic write + check + reconfigure + rollback + skip-if-unchanged).
-	if cfg.CanaryInclude != "" && cfg.CanaryPrefix != "" && cfg.CanaryLC != "" {
-		cpfx, err := netip.ParsePrefix(cfg.CanaryPrefix)
-		if err != nil {
-			log.Error("invalid canary prefix", "prefix", cfg.CanaryPrefix, "err", err)
-			os.Exit(1)
-		}
-		clc, err := parseLC(cfg.CanaryLC)
-		if err != nil {
-			log.Error("invalid canary LC", "lc", cfg.CanaryLC, "err", err)
-			os.Exit(1)
-		}
-		advContent := renderCanary(cpfx, clc, true) // protocol with the route
-		wdContent := renderCanary(cpfx, clc, false) // protocol, no route = withdrawn
-		cbc := bird.NewReconnecting(cfg.BIRDSocketPath, log)
-		defer func() { _ = cbc.Close() }()
-		// anchors.Applier is a generic "managed BIRD include" (atomic write + check
-		// + configure + rollback + skip-if-unchanged); we feed it raw canary bytes
-		// via ApplyBytes (its Apply([]Anchor) would emit an "anchors4" protocol that
-		// collides with the real anchors include — the canary uses its own
-		// "canary4"/"canary6" protocol).
-		canaryApplier := anchors.NewApplier(cfg.CanaryInclude, cbc, anchors.WithLogger(log))
-		if err := canaryApplier.EnsureFileBytes(wdContent); err != nil {
-			log.Error("canary include init failed", "err", err)
-			os.Exit(1)
-		}
-		// Advertise once up front (assume healthy until a reconcile proves the
-		// data plane dead); the observer below self-corrects on the first pass.
-		if _, err := canaryApplier.ApplyBytes(advContent); err != nil {
-			log.Warn("canary initial advertise failed", "err", err)
-		}
-		// Health-driven toggle. Added AFTER health.Observe, so health.Last()
-		// reflects this pass. ApplyBytes skips reconfigure when content is
-		// unchanged, so BIRD is only touched on an actual healthy<->dead flip.
-		lastAdvertised := true
-		recon.AddObserver(func(_ model.EdgeDesiredState, _ agent.Result, _ error) {
-			advertised := true
-			// Withdraw on SoftDead (now phase-aware, §4.1): the data-plane link down,
-			// OR a Degraded phase (wedged worker / erroring applies) the ControlPing is
-			// blind to. This is the BGP half of the canary∧healthDead conjunction; the
-			// gRPC half (SoftDead in the report) tracks the same predicate.
-			if rep, ok := health.Last(); ok && rep.SoftDead() {
-				advertised = false
-			}
-			content := advContent
-			if !advertised {
-				content = wdContent
-			}
-			if _, err := canaryApplier.ApplyBytes(content); err != nil {
-				log.Warn("canary apply failed", "advertised", advertised, "err", err)
-				return
-			}
-			if advertised != lastAdvertised {
-				log.Info("canary advertisement toggled", "advertised", advertised)
-				lastAdvertised = advertised
-			}
-		})
-		log.Info("canary enabled (soft-death)", "prefix", cpfx, "lc", cfg.CanaryLC, "include", cfg.CanaryInclude)
+	// Canary (soft-death §4.7/6.13) — see setupCanary.
+	canaryCleanup, err := setupCanary(cfg, recon, health, log)
+	if err != nil {
+		log.Error("canary setup failed", "err", err)
+		os.Exit(1)
+	}
+	if canaryCleanup != nil {
+		defer canaryCleanup()
 	}
 
 	// Controller connection via the homing director (L-06): the agent boots from
@@ -530,22 +329,10 @@ func main() {
 	}
 
 	// Start the loops. Each blocks until ctx is cancelled.
-	go client.RunDirect(ctx, cfg.CapacityBps)                     // downlink: register + subscribe + dispatch, direct to server (REFACTOR step 4)
-	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // converge VPP to desired every interval
-	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)        // uplink: health/capacity report direct to server (B-03); client is the ReportSink
-	go func() {                                                   // observed-members cache refresh (off the report/liveness hot path; §6.44)
-		t := time.NewTicker(cfg.ReportInterval.Std())
-		defer t.Stop()
-		memberObserver.Observe() // prime the cache
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				memberObserver.Observe() // a wedged VPP blocks THIS loop, not the report
-			}
-		}
-	}()
+	go client.RunDirect(ctx, cfg.CapacityBps)                                // downlink: register + subscribe + dispatch, direct to server (REFACTOR step 4)
+	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired)            // converge VPP to desired every interval
+	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)                   // uplink: health/capacity report direct to server (B-03); client is the ReportSink
+	go runObservedMembersLoop(ctx, memberObserver, cfg.ReportInterval.Std()) // cache refresh off the report/liveness hot path (§6.44)
 	// Stats-segment liveness transitions (§6.44) wake the reporter too, with the
 	// same de-correlation jitter as the govpp health path. Wedge/death is already
 	// debounced inside VppLiveness (wedgeGrace / disconnect), so no extra delay on
@@ -562,101 +349,386 @@ func main() {
 		})
 		go vppLive.Run(ctx)
 	}
-	go func() { // event-driven report: VPP health transition → wake the reporter (§4.2.4 ★实测更新)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-conn.HealthTransitions():
-			}
-			// Snapshot health NOW; the delay below may straddle another
-			// transition, which stays pending in the coalescing channel and is
-			// re-evaluated (with a fresh snapshot) on the next iteration — so a
-			// down→up race at worst sends one extra already-true report.
-			healthy := conn.Healthy()
-			delay := time.Duration(rand.Int64N(int64(reportDownJitterMax))) // de-correlate mass events
-			if healthy {
-				delay += reportUpDelay // let the post-restart reinstall breathe (see const doc)
-			}
-			log.Info("vpp health transition; scheduling event-driven report",
-				"healthy", healthy, "delay", delay.Round(time.Millisecond))
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(delay):
-				reporter.Wake()
-			}
-		}
-	}()
-	go func() { // L4 engine + socket probe: faster than the reconcile pass so a worker wedge / socket loss surfaces in seconds (§4.1)
-		t := time.NewTicker(3 * time.Second)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				met.RecordPhase(phaseTracker.Tick())
-			}
-		}
-	}()
+	go runHealthTransitionReports(ctx, conn, reporter, log) // event-driven report: VPP health transition → wake the reporter (§4.2.4 ★实测更新)
+	go runPhaseTicker(ctx, phaseTracker, met)               // L4 engine + socket probe: a worker wedge / socket loss surfaces in seconds (§4.1)
 	if feed != nil {
 		go feed.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // anchors+FlowSpec → bird api proto (incremental)
 	} else if birdApply != nil {
 		go birdApply.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // anchors+FlowSpec → BIRD (legacy configure)
 	}
 
-	// Metering export (T-1001): read VPP policer counters every interval and push
-	// raw cumulative samples to Kafka (→ ClickHouse → BSS). Telemetry decoupled
-	// from the control plane; a setup failure disables metering but never the agent.
-	if cfg.MeteringEnable && len(cfg.KafkaBrokers) > 0 {
-		if statsReader, err := vpp.NewStatsReader(cfg.VPPStatsSocket); err != nil {
-			log.Error("metering disabled: VPP stats connect failed", "err", err, "socket", cfg.VPPStatsSocket)
-		} else if sink, err := kafkasink.New(kafkasink.Config{
-			Brokers: cfg.KafkaBrokers, Topic: cfg.KafkaTopic,
-			Username: cfg.KafkaSASLUser, Password: cfg.KafkaSASLPass, Mechanism: cfg.KafkaSASLMech,
-			TLSCAFile: cfg.KafkaTLSCAFile, TLSInsecureSkipVerify: cfg.KafkaTLSInsecure,
-			Plaintext: cfg.KafkaPlaintext,
-		}); err != nil {
-			log.Error("metering disabled: kafka sink init failed", "err", err)
-			_ = statsReader.Close()
-		} else {
-			meter := agent.NewMetering(model.EdgeID(cfg.EdgeID), statsReader, recon.PolicerIndexes, sink,
-				agent.WithMeteringLogger(log))
-			go meter.Run(ctx, cfg.MeteringInterval.Std())
-			log.Info("metering export started", "brokers", cfg.KafkaBrokers, "topic", cfg.KafkaTopic,
-				"interval", cfg.MeteringInterval.Std())
-		}
-	}
-
-	// Chaos hook (6.13): SIGUSR1 toggles forced data-plane-down, injecting a
-	// soft-death (the agent withdraws the canary + reports healthDead) WHILE VPP
-	// keeps forwarding — so the canary withdrawal reaches the controller's tap and
-	// the soft-death conjunction (canaryDown ∧ healthDead) trips an auto-failover.
-	// A real VPP outage cannot demo this here because the canary BGP rides through
-	// VPP and the hard PeerDown path fires first.
-	go func() {
-		ch := make(chan os.Signal, 1)
-		signal.Notify(ch, syscall.SIGUSR1)
-		forced := false
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ch:
-				forced = !forced
-				health.SetForcedDataPlaneDown(forced)
-				recon.Wake() // re-run health+canary now, not on the next timer tick
-				log.Warn("CHAOS: forced data-plane-down toggled (6.13 soft-death inject)", "forced", forced)
-			}
-		}
-	}()
+	startMetering(ctx, cfg, recon, log) // metering export (T-1001): VPP policer counters → Kafka
+	go runChaosHook(ctx, health, recon, log)
 
 	log.Info("edge-agent running; subscribed to controller. Send SIGTERM/SIGINT to stop.")
 	<-ctx.Done()
 	log.Info("edge-agent received shutdown signal; stopping")
 	// Give in-flight loops a moment to observe ctx cancellation before exit.
 	time.Sleep(100 * time.Millisecond)
+}
+
+// runObservedMembersLoop refreshes the member observer's cache every interval —
+// the VPP ARP/ND dump runs on THIS loop, never on the report/liveness hot path,
+// so a wedged VPP blocks the refresh, not the report (§6.44).
+func runObservedMembersLoop(ctx context.Context, mo *agent.MemberObserver, interval time.Duration) {
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	mo.Observe() // prime the cache
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			mo.Observe()
+		}
+	}
+}
+
+// runHealthTransitionReports turns govpp binary-API health transitions into
+// event-driven reports (§4.2.4 ★实测更新): a transition wakes the reporter so
+// vpp-gone / recovery reaches the server without waiting out the 15s sampling.
+// Down gets the de-correlation jitter; up additionally waits reportUpDelay so
+// the post-restart reinstall can breathe (see the const doc).
+func runHealthTransitionReports(ctx context.Context, conn *vpp.Conn, reporter *agent.Reporter, log *slog.Logger) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-conn.HealthTransitions():
+		}
+		// Snapshot health NOW; the delay below may straddle another
+		// transition, which stays pending in the coalescing channel and is
+		// re-evaluated (with a fresh snapshot) on the next iteration — so a
+		// down→up race at worst sends one extra already-true report.
+		healthy := conn.Healthy()
+		delay := time.Duration(rand.Int64N(int64(reportDownJitterMax))) // de-correlate mass events
+		if healthy {
+			delay += reportUpDelay // let the post-restart reinstall breathe (see const doc)
+		}
+		log.Info("vpp health transition; scheduling event-driven report",
+			"healthy", healthy, "delay", delay.Round(time.Millisecond))
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+			reporter.Wake()
+		}
+	}
+}
+
+// runPhaseTicker drives the L4 engine + socket probe faster than the reconcile
+// pass, so a worker wedge / socket loss surfaces in seconds (§4.1).
+func runPhaseTicker(ctx context.Context, pt *agent.PhaseTracker, met *metrics.Metrics) {
+	t := time.NewTicker(3 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			met.RecordPhase(pt.Tick())
+		}
+	}
+}
+
+// startMetering wires the metering export (T-1001): read VPP policer counters
+// every interval and push raw cumulative samples to Kafka (→ ClickHouse → BSS).
+// Telemetry decoupled from the control plane; a setup failure disables metering
+// but never the agent. No-op unless enabled with brokers configured.
+func startMetering(ctx context.Context, cfg agent.Config, recon *agent.Reconciler, log *slog.Logger) {
+	if !cfg.MeteringEnable || len(cfg.KafkaBrokers) == 0 {
+		return
+	}
+	statsReader, err := vpp.NewStatsReader(cfg.VPPStatsSocket)
+	if err != nil {
+		log.Error("metering disabled: VPP stats connect failed", "err", err, "socket", cfg.VPPStatsSocket)
+		return
+	}
+	sink, err := kafkasink.New(kafkasink.Config{
+		Brokers: cfg.KafkaBrokers, Topic: cfg.KafkaTopic,
+		Username: cfg.KafkaSASLUser, Password: cfg.KafkaSASLPass, Mechanism: cfg.KafkaSASLMech,
+		TLSCAFile: cfg.KafkaTLSCAFile, TLSInsecureSkipVerify: cfg.KafkaTLSInsecure,
+		Plaintext: cfg.KafkaPlaintext,
+	})
+	if err != nil {
+		log.Error("metering disabled: kafka sink init failed", "err", err)
+		_ = statsReader.Close()
+		return
+	}
+	meter := agent.NewMetering(model.EdgeID(cfg.EdgeID), statsReader, recon.PolicerIndexes, sink,
+		agent.WithMeteringLogger(log))
+	go meter.Run(ctx, cfg.MeteringInterval.Std())
+	log.Info("metering export started", "brokers", cfg.KafkaBrokers, "topic", cfg.KafkaTopic,
+		"interval", cfg.MeteringInterval.Std())
+}
+
+// runChaosHook is the 6.13 chaos hook: SIGUSR1 toggles forced data-plane-down,
+// injecting a soft-death (the agent withdraws the canary + reports healthDead)
+// WHILE VPP keeps forwarding — so the canary withdrawal reaches the controller's
+// tap and the soft-death conjunction (canaryDown ∧ healthDead) trips an
+// auto-failover. A real VPP outage cannot demo this here because the canary BGP
+// rides through VPP and the hard PeerDown path fires first.
+func runChaosHook(ctx context.Context, health *agent.HealthChecker, recon *agent.Reconciler, log *slog.Logger) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGUSR1)
+	forced := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ch:
+			forced = !forced
+			health.SetForcedDataPlaneDown(forced)
+			recon.Wake() // re-run health+canary now, not on the next timer tick
+			log.Warn("CHAOS: forced data-plane-down toggled (6.13 soft-death inject)", "forced", forced)
+		}
+	}
+}
+
+// setupBirdMaterializers wires the BIRD materialization (B-03 apply): anchors
+// (/32 carriers to MX204) + egress FlowSpec (to R), applied with
+// check+configure+rollback discipline. Two mutually-exclusive paths:
+//   - feed (BirdFeedMode=="api", DESIGN-bird-api.md): stream anchors + egress
+//     flowspec incrementally to bird-vpp's `api` proto over the socket, no
+//     full-file `birdc configure`. Lazy connect; (re)connect triggers a
+//     HELLO+EOR resync, the proto's grace window covers brief reconnects without
+//     flapping the routes. Anchors + egress flowspec are fed straight from
+//     desired, UNCONDITIONALLY — there is no advertisement gate (anti-blackhole
+//     turned out to be a non-problem; DESIGN-liveness §2/§10).
+//   - birdApply (legacy include-file configure), only when both include paths are
+//     configured. Uses a self-reconnecting BIRD client: a BIRD restart (e.g.
+//     after a VPP crash recreates the lcp interfaces and the node supervisor
+//     restarts BIRD) kills the control socket, and a one-shot client would wedge
+//     on ErrClosed forever; the wrapper redials transparently on the next apply
+//     pass. It dials lazily, so the agent can also start before BIRD is up.
+//
+// cleanup, when non-nil, closes the legacy path's BIRD client — main defers it.
+func setupBirdMaterializers(cfg agent.Config, log *slog.Logger) (*birdfeed.Feed, *agent.BirdApplier, func(), error) {
+	if cfg.BirdFeedMode == "api" {
+		feed := birdfeed.NewFeed(cfg.BirdAPISocket, log)
+		log.Info("bird control plane via api socket (incremental feed)", "socket", cfg.BirdAPISocket)
+		return feed, nil, nil, nil
+	}
+	if cfg.BirdAnchorsInclude != "" && cfg.BirdFlowspecInclude != "" {
+		bc := bird.NewReconnecting(cfg.BIRDSocketPath, log)
+		birdApply := agent.NewBirdApplier(
+			anchors.NewApplier(cfg.BirdAnchorsInclude, bc, anchors.WithLogger(log)),
+			anchors.NewApplier(cfg.BirdFlowspecInclude, bc, anchors.WithLogger(log)),
+			log,
+		)
+		if err := birdApply.EnsureFiles(); err != nil {
+			_ = bc.Close()
+			return nil, nil, nil, err
+		}
+		return nil, birdApply, func() { _ = bc.Close() }, nil
+	}
+	return nil, nil, nil, nil
+}
+
+// setupCanary wires the canary (soft-death §4.7/6.13): advertise CanaryPrefix
+// tagged with CanaryLC via BIRD while the data plane is healthy; withdraw it on
+// HealthDataPlaneDown so the controller's RIB tap sees CanaryDown and (with the
+// agent's own healthDead report) trips soft-death failover — catching a dead
+// data plane that BGP/heartbeat alone cannot see. The canary IS a blackhole
+// /32+large-community route = exactly a model.Anchor, so it reuses the anchors
+// apply machinery (atomic write + check + reconfigure + rollback +
+// skip-if-unchanged). No-op (nil, nil) unless all three canary settings are set.
+// cleanup, when non-nil, closes the canary's BIRD client — main defers it.
+func setupCanary(cfg agent.Config, recon *agent.Reconciler, health *agent.HealthChecker, log *slog.Logger) (func(), error) {
+	if cfg.CanaryInclude == "" || cfg.CanaryPrefix == "" || cfg.CanaryLC == "" {
+		return nil, nil
+	}
+	cpfx, err := netip.ParsePrefix(cfg.CanaryPrefix)
+	if err != nil {
+		return nil, fmt.Errorf("invalid canary prefix %q: %w", cfg.CanaryPrefix, err)
+	}
+	clc, err := parseLC(cfg.CanaryLC)
+	if err != nil {
+		return nil, fmt.Errorf("invalid canary LC %q: %w", cfg.CanaryLC, err)
+	}
+	advContent := renderCanary(cpfx, clc, true) // protocol with the route
+	wdContent := renderCanary(cpfx, clc, false) // protocol, no route = withdrawn
+	cbc := bird.NewReconnecting(cfg.BIRDSocketPath, log)
+	// anchors.Applier is a generic "managed BIRD include" (atomic write + check
+	// + configure + rollback + skip-if-unchanged); we feed it raw canary bytes
+	// via ApplyBytes (its Apply([]Anchor) would emit an "anchors4" protocol that
+	// collides with the real anchors include — the canary uses its own
+	// "canary4"/"canary6" protocol).
+	canaryApplier := anchors.NewApplier(cfg.CanaryInclude, cbc, anchors.WithLogger(log))
+	if err := canaryApplier.EnsureFileBytes(wdContent); err != nil {
+		_ = cbc.Close()
+		return nil, fmt.Errorf("canary include init: %w", err)
+	}
+	// Advertise once up front (assume healthy until a reconcile proves the
+	// data plane dead); the observer below self-corrects on the first pass.
+	if _, err := canaryApplier.ApplyBytes(advContent); err != nil {
+		log.Warn("canary initial advertise failed", "err", err)
+	}
+	// Health-driven toggle. Added AFTER health.Observe, so health.Last()
+	// reflects this pass. ApplyBytes skips reconfigure when content is
+	// unchanged, so BIRD is only touched on an actual healthy<->dead flip.
+	lastAdvertised := true
+	recon.AddObserver(func(_ model.EdgeDesiredState, _ agent.Result, _ error) {
+		advertised := true
+		// Withdraw on SoftDead (now phase-aware, §4.1): the data-plane link down,
+		// OR a Degraded phase (wedged worker / erroring applies) the ControlPing is
+		// blind to. This is the BGP half of the canary∧healthDead conjunction; the
+		// gRPC half (SoftDead in the report) tracks the same predicate.
+		if rep, ok := health.Last(); ok && rep.SoftDead() {
+			advertised = false
+		}
+		content := advContent
+		if !advertised {
+			content = wdContent
+		}
+		if _, err := canaryApplier.ApplyBytes(content); err != nil {
+			log.Warn("canary apply failed", "advertised", advertised, "err", err)
+			return
+		}
+		if advertised != lastAdvertised {
+			log.Info("canary advertisement toggled", "advertised", advertised)
+			lastAdvertised = advertised
+		}
+	})
+	log.Info("canary enabled (soft-death)", "prefix", cpfx, "lc", cfg.CanaryLC, "include", cfg.CanaryInclude)
+	return func() { _ = cbc.Close() }, nil
+}
+
+// setupVppLiveness wires the stats-segment VPP liveness (§6.44): it reads the
+// probe plugin's /probe/heartbeat over its own stats connection. A stalled
+// heartbeat = main-thread wedge; a disconnected stats socket = process death
+// (govpp fsnotify, immediate). This judges VPP off the main thread, covering
+// govpp's binary-API health-check blind spots (30s reply-timeout stall + wedge).
+// Best-effort: if the dedicated stats connection can't be established, liveness
+// is skipped (nil, nil, nil) and FaultSensor falls back to conn.Healthy() alone
+// (pre-§6.44 behavior). Detection only — never touches the govpp binary-API
+// connection. wedgeGrace 3s = 3× the probe 1s scan cadence: tolerates the
+// cooperative vlib_process being skipped by a genuinely busy (not wedged) main
+// thread, while catching a real stall promptly. A ~1s container self-heal shows
+// up as a stats disconnect (process death path), not a stall, and is absorbed by
+// the server's restartGrace like any vpp-gone. cleanup closes the (current)
+// stats reader — main defers it at the call site.
+func setupVppLiveness(cfg agent.Config, log *slog.Logger) (vppLive *agent.VppLiveness, dead func() bool, cleanup func()) {
+	liveStats, lerr := vpp.NewStatsReader(cfg.VPPStatsSocket)
+	if lerr != nil {
+		log.Error("vpp liveness disabled: dedicated stats connect failed (falling back to conn.Healthy)",
+			"err", lerr, "socket", cfg.VPPStatsSocket)
+		return nil, nil, nil
+	}
+	// Swappable reader: a rapid VPP restart can leave govpp's fsnotify-based
+	// reconnect stuck on a stale segment (frozen heartbeat → falsely wedged); the
+	// stale-reconnect hook rebuilds it while dead. Guard reads/swaps with a mutex.
+	var liveMu sync.Mutex
+	cleanup = func() { liveMu.Lock(); _ = liveStats.Close(); liveMu.Unlock() }
+	vppLive = agent.NewVppLiveness(
+		func() (uint64, error) {
+			liveMu.Lock()
+			r := liveStats
+			liveMu.Unlock()
+			return r.ReadGauge("/probe/heartbeat")
+		},
+		vpp.IsStatsDisconnected, time.Second, 3*time.Second, log)
+	vppLive.OnStaleReconnect(func() {
+		nr, rerr := vpp.NewStatsReader(cfg.VPPStatsSocket)
+		if rerr != nil {
+			log.Warn("vpp liveness: stale-segment stats reconnect failed", "err", rerr)
+			return
+		}
+		liveMu.Lock()
+		_ = liveStats.Close()
+		liveStats = nr
+		liveMu.Unlock()
+		log.Info("vpp liveness: rebuilt stats reader (recovering from a possibly stale segment)")
+	}, 8*time.Second)
+	return vppLive, vppLive.Dead, cleanup
+}
+
+// setupForwardingProbe wires ③ forwarding-broken (§4.2.7/§4.2.8): a device-level
+// active forwarding check — ForwardingProbeFails consecutive black-holed rounds →
+// forwarding-broken (device up, links up, but a silent black-hole). Two sources,
+// selected by config:
+//   - plugin gauge (§4.2.8, preferred): the `probe` VPP plugin resolves the target
+//     in the FIB on its own process node and publishes reachability to the stats
+//     segment; the agent reads it over shared memory, never touching VPP's single
+//     main thread — a busy VPP can't self-time-out the probe (the cli_inband ping's
+//     fatal flaw under load).
+//   - cli_inband ping (§4.2.7, legacy fallback): pings the target through the data
+//     plane. Immune to the policer (a low-rate echo is below any pool rate).
+//
+// Disabled (nil, nil) if no target set. cleanup, when non-nil, closes the probe's
+// dedicated stats reader — main defers it at the call site.
+func setupForwardingProbe(ctx context.Context, cfg agent.Config, conn *vpp.Conn, log *slog.Logger) (broken func() bool, cleanup func()) {
+	if cfg.ForwardingProbeTarget == "" {
+		return nil, nil
+	}
+	var fp *agent.ForwardingProbe
+	if cfg.ForwardingProbePlugin {
+		// Its own read-only stats connection (shared memory, decoupled from the
+		// metering reader's lifetime). A connect failure disables ③ but not the agent.
+		if probeStats, serr := vpp.NewStatsReader(cfg.VPPStatsSocket); serr != nil {
+			log.Error("forwarding probe (plugin) disabled: VPP stats connect failed",
+				"err", serr, "socket", cfg.VPPStatsSocket)
+		} else {
+			cleanup = func() { _ = probeStats.Close() }
+			gauge := "/probe/fib/" + cfg.ForwardingProbeStatName + "/reachable"
+			// The `probe fib add` CLI needs a prefix; a bare next-hop address
+			// (the natural way to express the target) gets its host length.
+			probePrefix := cfg.ForwardingProbeTarget
+			if !strings.Contains(probePrefix, "/") {
+				if a, perr := netip.ParseAddr(probePrefix); perr == nil {
+					if a.Is4() {
+						probePrefix += "/32"
+					} else {
+						probePrefix += "/128"
+					}
+				}
+			}
+			// Register the target once — a main-thread setup call (not the detection
+			// loop). Idempotent-ish: an "already exists" on agent restart is benign,
+			// and a fresh VPP (post-restart) is self-healed by the lazy re-register
+			// in the round below.
+			register := func() error {
+				_, cerr := conn.CliInband(fmt.Sprintf("probe fib add %s table %d name %s",
+					probePrefix, cfg.ForwardingProbeTable, cfg.ForwardingProbeStatName),
+					cfg.ForwardingProbeTimeout.Std())
+				return cerr
+			}
+			if rerr := register(); rerr != nil {
+				log.Warn("probe target register at startup returned error (continuing; gauge read is source of truth)", "err", rerr)
+			}
+			fp = agent.NewForwardingProbe(func() (int, error) {
+				v, gerr := probeStats.ReadGauge(gauge)
+				if gerr != nil {
+					// Gauge absent = target unregistered (fresh VPP after a restart).
+					// Re-register best-effort and report "could not run" (verdict
+					// unchanged), so a VPP restart never false-positives a black-hole.
+					_ = register()
+					return 0, gerr
+				}
+				return int(v), nil
+			}, cfg.ForwardingProbeInterval.Std(), cfg.ForwardingProbeFails, log)
+			log.Info("forwarding probe enabled (plugin gauge, §4.2.8)", "target", cfg.ForwardingProbeTarget,
+				"gauge", gauge, "interval", cfg.ForwardingProbeInterval.Std(), "fails", cfg.ForwardingProbeFails)
+		}
+	} else {
+		fp = agent.NewForwardingProbe(
+			func() (int, error) {
+				_, recv, err := conn.Ping(cfg.ForwardingProbeTarget, 3, 0.1, cfg.ForwardingProbeTimeout.Std())
+				return recv, err
+			},
+			cfg.ForwardingProbeInterval.Std(), cfg.ForwardingProbeFails, log)
+		log.Info("forwarding probe enabled (cli_inband ping, §4.2.7 legacy)", "target", cfg.ForwardingProbeTarget,
+			"interval", cfg.ForwardingProbeInterval.Std(), "fails", cfg.ForwardingProbeFails)
+	}
+	if fp != nil {
+		// VPP restart (generation bump) disarms the probe until first
+		// reachability: the post-restart FIB-rebuild window (bird/vppfib
+		// re-feed, tens of seconds) must not read as a black-hole (§6.44).
+		fp.BindDataplaneGeneration(conn.Generation)
+		go fp.Run(ctx)
+		broken = fp.Broken
+	}
+	return broken, cleanup
 }
 
 // renderCanary builds the canary BIRD include: a static "canary4"/"canary6"
