@@ -99,6 +99,18 @@ type Reconciler struct {
 	// no lock on the reconcile hot path. atomic.Value holds map[string]uint32.
 	polSnap atomic.Value
 
+	// Incremental ACTUAL counters (§6.52 #5 续集): the authoritative programmed
+	// counts come from countProgrammed at each FULL reconcile (up to a reconcile
+	// interval stale), while pools churn on the seconds-level DELTA path — the
+	// stale numbers made the B-02 audit see phantom desired≠actual "program-drift"
+	// on routine churn. The full pass ANCHORS these to VPP truth (Store); the
+	// delta path adjusts them at each successful mutate (Add) so the reported
+	// ACTUAL stays fresh across deltas. actAnchored gates the report overlay
+	// until the first anchor (before that, the Result counts stand).
+	actPol      atomic.Int64
+	actSess     atomic.Int64
+	actAnchored atomic.Bool
+
 	// observers are notified after each reconcile pass (B-05): the reconcile is
 	// itself the dataplane-penetrating probe, so the soft-death health report is
 	// driven off its result rather than a second VPP scan.
@@ -315,6 +327,11 @@ func (r *Reconciler) Reconcile(desired model.EdgeDesiredState) (Result, error) {
 		r.log.Warn("reconcile: programmed-count attestation failed (B-02)", "err", err)
 	} else {
 		res.PolicersActual, res.SessionsActual = pa, sa
+		// Anchor the incremental counters to VPP truth: overwrites any drift the
+		// delta-path adjustments accumulated (silent VPP rejects, missed paths).
+		r.actPol.Store(int64(pa))
+		r.actSess.Store(int64(sa))
+		r.actAnchored.Store(true)
 	}
 
 	// Publish the policer name→index map for the metering loop (T-1001). A fresh
@@ -865,4 +882,12 @@ func (r *Reconciler) runOnce(provider DesiredProvider) {
 			"sessions_moved", res.SessionsMoved)
 	}
 	r.notify(desired, res, nil)
+}
+
+// ActualCounts returns the incrementally-maintained programmed counts (anchored
+// to countProgrammed truth each full reconcile, adjusted on each successful
+// delta mutate). ok=false until the first anchor — the reporter then leaves the
+// last full-reconcile Result counts untouched.
+func (r *Reconciler) ActualCounts() (policers, sessions int, ok bool) {
+	return int(r.actPol.Load()), int(r.actSess.Load()), r.actAnchored.Load()
 }

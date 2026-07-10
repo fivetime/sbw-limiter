@@ -140,6 +140,7 @@ func (r *Reconciler) upsertPoolPolicers(p policerReconciler, specs []model.Polic
 				return added, updated, err
 			}
 			r.polIdx[spec.Name] = newIdx
+			r.actPol.Add(1)
 			added++
 			r.log.Info("delta: added policer", "name", spec.Name, "index", newIdx)
 			continue
@@ -171,6 +172,7 @@ func (r *Reconciler) deletePoolPolicers(p policerReconciler, pool model.PoolID) 
 			return deleted, err
 		}
 		delete(r.polIdx, name)
+		r.actPol.Add(-1)
 		deleted++
 		r.log.Info("delta: deleted policer", "name", name, "pool", pool)
 	}
@@ -202,6 +204,7 @@ func (r *Reconciler) deletePoolSessions(cl classifyReconciler, sessions []model.
 		if err := cl.DelSessionByKey(table, s.Mask, key); err != nil {
 			return deleted, err
 		}
+		r.actSess.Add(-1)
 		deleted++
 	}
 	return deleted, nil
@@ -250,6 +253,7 @@ func (r *Reconciler) upsertPoolSessions(cl classifyReconciler, pool model.PoolID
 		if err := cl.DelSessionByKey(table, s.Mask, key); err != nil {
 			return added, deleted, moved, err
 		}
+		r.actSess.Add(-1)
 		deleted++
 	}
 
@@ -278,6 +282,7 @@ func (r *Reconciler) upsertPoolSessions(cl classifyReconciler, pool model.PoolID
 			}
 		}
 		a, m, err := applySessionUpserts(cl, table, wants, actualHit)
+		r.actSess.Add(int64(a))
 		if err != nil {
 			return added, deleted, moved, err
 		}

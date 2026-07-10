@@ -68,6 +68,7 @@ type Reporter struct {
 	poolHash      PoolHashFunc
 	birdFeed      func() (fails, lastOKUnixMs int64)
 	desiredCounts func() (policers, sessions int, ok bool)
+	actualCounts  func() (policers, sessions int, ok bool)
 	fault         FaultSource
 	now           func() int64
 	log           *slog.Logger
@@ -102,6 +103,18 @@ func WithFault(fn FaultSource) ReporterOption { return func(r *Reporter) { r.fau
 // so applied==desired ⇒ gap≡0.
 func WithDesiredCounts(fn func() (policers, sessions int, ok bool)) ReporterOption {
 	return func(r *Reporter) { r.desiredCounts = fn }
+}
+
+// WithActualCounts wires the incrementally-maintained ACTUAL programmed counts
+// (Reconciler.ActualCounts: anchored to VPP truth each full reconcile, adjusted
+// per successful delta mutate). Build overlays them onto
+// HealthReport.PolicersActual/SessionsActual, which otherwise carry the LAST
+// full-reconcile count (up to a reconcile interval stale) — the desired-side
+// §6.52 #5 fix alone just relabeled the phantom to "program-drift" (fresh
+// desired vs stale actual); this is the symmetric other half. ok=false (before
+// the first anchor) leaves the Result counts untouched.
+func WithActualCounts(fn func() (policers, sessions int, ok bool)) ReporterOption {
+	return func(r *Reporter) { r.actualCounts = fn }
 }
 
 // WithBirdFeedStatus wires the bird-materialization health source (birdfeed.Feed.Status
@@ -180,6 +193,11 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	if r.desiredCounts != nil {
 		if pol, sess, ok := r.desiredCounts(); ok {
 			rep.Health.PolicersDesired, rep.Health.SessionsDesired = pol, sess
+		}
+	}
+	if r.actualCounts != nil {
+		if pol, sess, ok := r.actualCounts(); ok {
+			rep.Health.PolicersActual, rep.Health.SessionsActual = pol, sess
 		}
 	}
 	return rep, true

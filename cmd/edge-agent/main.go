@@ -203,6 +203,7 @@ func main() {
 			st, ok := store.Desired()
 			return len(st.Policers), len(st.ClassifySessions), ok
 		}),
+		agent.WithActualCounts(recon.ActualCounts),
 		agent.WithBirdFeedStatus(func() (int64, int64) {
 			if birdFeedStatus == nil {
 				return 0, 0

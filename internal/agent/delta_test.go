@@ -179,3 +179,54 @@ func TestInstalledPoolHashMatchesPoolSetHash(t *testing.T) {
 		t.Errorf("InstalledPoolHash = %d, want %d (distinct pools {200,201})", got, want)
 	}
 }
+
+// TestActualCountsTrackDeltas pins the §6.52 #5 sequel fix: the incrementally
+// maintained ACTUAL counters must follow the DELTA-path mutations (policer
+// add/delete, session upsert/delete) so the reported counts stay fresh between
+// full reconciles — the stale actuals made the B-02 audit see phantom
+// "program-drift" on routine churn once the desired side was freshened.
+func TestActualCountsTrackDeltas(t *testing.T) {
+	r := newReconciler()
+	fp := newFakePolicers()
+	fc := newFakeClassify()
+
+	// Before the first full-reconcile anchor: not ok (reporter leaves counts alone).
+	if _, _, ok := r.ActualCounts(); ok {
+		t.Fatal("ActualCounts must not be ok before the first anchor")
+	}
+	// Simulate the anchor a full reconcile performs after countProgrammed.
+	r.actPol.Store(1)
+	r.actSess.Store(1)
+	r.actAnchored.Store(true)
+
+	// Delta: add pool 300's policer + session.
+	if _, _, err := r.upsertPoolPolicers(guard(t, fp), []model.PolicerSpec{ingressSpec(300, 3_000_000)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := r.upsertPoolSessions(fc, 300, nil, []model.ClassifySession{member(300, "203.0.113.30/32")}); err != nil {
+		t.Fatal(err)
+	}
+	pol, sess, ok := r.ActualCounts()
+	if !ok || pol != 2 || sess != 2 {
+		t.Fatalf("after delta add: pol=%d sess=%d ok=%v, want 2/2/true", pol, sess, ok)
+	}
+
+	// Delta: remove pool 300 again (sessions then policer).
+	if _, err := r.deletePoolSessions(fc, []model.ClassifySession{member(300, "203.0.113.30/32")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.deletePoolPolicers(guard(t, fp), 300); err != nil {
+		t.Fatal(err)
+	}
+	pol, sess, _ = r.ActualCounts()
+	if pol != 1 || sess != 1 {
+		t.Fatalf("after delta remove: pol=%d sess=%d, want 1/1", pol, sess)
+	}
+
+	// Re-anchor overrides any drift (full reconcile wins).
+	r.actPol.Store(7)
+	r.actSess.Store(9)
+	if pol, sess, _ := r.ActualCounts(); pol != 7 || sess != 9 {
+		t.Fatalf("anchor must override: %d/%d", pol, sess)
+	}
+}
