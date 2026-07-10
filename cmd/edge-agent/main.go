@@ -205,7 +205,14 @@ func main() {
 		// Bird-feed health (anchors/flowspec traction convergence): sustained apply
 		// failure was log-only — surface it so the server can emit the
 		// bird-feed-degraded BSS event (policy-integrity, not a death signal).
-		agent.WithBirdFeedStatus(birdFeedStatus),
+		// Indirect through a closure: birdFeedStatus is assigned BELOW (after the
+		// materializer is chosen), so passing it directly here would capture nil.
+		agent.WithBirdFeedStatus(func() (int64, int64) {
+			if birdFeedStatus == nil {
+				return 0, 0
+			}
+			return birdFeedStatus()
+		}),
 		agent.WithReporterLogger(log),
 	)
 
