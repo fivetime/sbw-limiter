@@ -37,10 +37,15 @@ RUN set -eux; \
     git clone --depth 1 -b "$CONTRACT_REF" "https://${auth}${CONTRACT_REPO}.git" sbw-contract
 
 WORKDIR /src/sbw-limiter
+# Stamp buildinfo.{Version,Commit} at link time. Commit comes from the ACTUAL
+# cloned HEAD (git rev-parse), not the CACHEBUST arg — so `edge-agent -version`
+# and the startup log report exactly which commit was compiled (the old
+# `-X main.version` targeted a non-existent symbol → silently stayed 0.0.0-dev).
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
+    COMMIT="$(git rev-parse --short HEAD)"; \
     CGO_ENABLED=0 go build -trimpath \
-      -ldflags="-s -w -X main.version=${VERSION}" \
+      -ldflags="-s -w -X github.com/fivetime/sbw-contract/buildinfo.Version=${VERSION} -X github.com/fivetime/sbw-contract/buildinfo.Commit=${COMMIT}" \
       -o /out/edge-agent ./cmd/edge-agent
 
 ###############################################################################
