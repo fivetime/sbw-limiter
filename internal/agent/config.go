@@ -32,12 +32,12 @@ type Config struct {
 	// >2s to COMPLETE (not a wedge, just slow), which times out the reconcile pass →
 	// Degraded → canary withdrawn though forwarding is healthy. 0 → govpp default.
 	// See vpp.WithReplyTimeout / vpp-single-mainthread-bottleneck.
-	VPPReplyTimeout    config.Duration `json:"vpp_reply_timeout"`
+	VPPReplyTimeout config.Duration `json:"vpp_reply_timeout"`
 	// ControllerEndpoint is the SERVER endpoint the agent connects to DIRECTLY (REFACTOR
 	// step 4): register + subscribe (desired-state) + report all over one AgentService
 	// connection to sbw-server. Formerly a coverer address; the coverer no longer relays
 	// agent control (it taps passively). Env CONTROLLER_ENDPOINT.
-	ControllerEndpoint string          `json:"controller_endpoint"`
+	ControllerEndpoint string `json:"controller_endpoint"`
 	// ControllerEndpoints is retained for a multi-replica server behind DISTINCT addresses
 	// (bootstrap list; the agent uses the first). With a single server Service DNS the
 	// gRPC client's own reconnect suffices, so this is usually empty → [ControllerEndpoint].
@@ -68,16 +68,6 @@ type Config struct {
 	// no interface binding (classify tables exist but feed no traffic — control
 	// plane only / tests). Env POLICER_INTERFACES is comma-separated.
 	PolicerInterfaces []string `json:"policer_interfaces"`
-
-	// MemberInterfaces names the VPP interface(s) where pool MEMBERS physically
-	// attach (the L's member-access leg, e.g. host-macc). The agent reads their
-	// ARP/ND neighbor table and reports it as EdgeReport.ObservedMembers (the
-	// server's member-up/down signal; the ARP basis is owed a rework, see
-	// DESIGN-liveness §2/§10). Distinct from PolicerInterfaces, which also
-	// includes the uplink (whose neighbors are fabric/mesh, not members). Env
-	// BWPOOL_MEMBER_INTERFACES is comma-separated; empty disables physical
-	// observation (the report simply omits the set — backward compatible).
-	MemberInterfaces []string `json:"member_interfaces"`
 
 	// Canary (soft-death §4.7/6.13): when all three are set, the agent advertises
 	// CanaryPrefix tagged with CanaryLC via BIRD WHILE the data plane is healthy
@@ -214,9 +204,6 @@ func (c *Config) applyEnv() error {
 	c.BirdAPISocket = config.String("BIRD_API_SOCKET", c.BirdAPISocket)
 	if v := config.String("POLICER_INTERFACES", ""); v != "" {
 		c.PolicerInterfaces = splitCSV(v)
-	}
-	if v := config.String("MEMBER_INTERFACES", ""); v != "" {
-		c.MemberInterfaces = splitCSV(v)
 	}
 	c.CanaryInclude = config.String("CANARY_INCLUDE", c.CanaryInclude)
 	c.CanaryPrefix = config.String("CANARY_PREFIX", c.CanaryPrefix)

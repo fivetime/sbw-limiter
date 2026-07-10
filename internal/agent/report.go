@@ -3,7 +3,6 @@ package agent
 import (
 	"context"
 	"log/slog"
-	"net/netip"
 	"time"
 
 	"github.com/fivetime/sbw-contract/model"
@@ -53,11 +52,6 @@ type FaultSource interface {
 // (the report-driven backstop). nil → the report carries 0 (no attestation).
 type PoolHashFunc func() uint64
 
-// ObservedMembersFunc yields the member host prefixes the agent PHYSICALLY observes
-// on its member interface (VPP ARP/ND neighbor table) — the L's physical authority
-// (DESIGN-liveness §11). nil → the report carries no set (backward compatible).
-type ObservedMembersFunc func() []netip.Prefix
-
 // wakeMinInterval is the storm guard for event-driven (Wake) reports: a wake
 // landing within it of the previous send is dropped — the periodic ticker
 // backstops it, so dropping costs at most one interval of latency, never
@@ -74,7 +68,6 @@ type Reporter struct {
 	poolHash PoolHashFunc
 	birdFeed func() (fails, lastOKUnixMs int64)
 	fault    FaultSource
-	observed ObservedMembersFunc
 	now      func() int64
 	log      *slog.Logger
 
@@ -90,7 +83,6 @@ type ReporterOption func(*Reporter)
 // WithCapacity wires the headroom source.
 func WithCapacity(fn CapacityFunc) ReporterOption { return func(r *Reporter) { r.capacity = fn } }
 
-
 // WithPoolHash wires the installed pool-set hash source (reconciler.InstalledPoolHash):
 // the report carries it so the controller can detect drift and resync.
 func WithPoolHash(fn PoolHashFunc) ReporterOption { return func(r *Reporter) { r.poolHash = fn } }
@@ -98,13 +90,6 @@ func WithPoolHash(fn PoolHashFunc) ReporterOption { return func(r *Reporter) { r
 // WithFault wires the live fault-kind sensor (§4.2.3): Build overlays its verdict onto
 // the report so a determinate fault is typed + surfaced within one report interval.
 func WithFault(fn FaultSource) ReporterOption { return func(r *Reporter) { r.fault = fn } }
-
-// WithObservedMembers wires the member-presence source (VPP ARP/ND neighbor table):
-// Build carries its set as EdgeReport.ObservedMembers, the server's member-up/down signal.
-// (Not an anchor gate. This source is owed a rework — see MemberObserver's doc.)
-func WithObservedMembers(fn ObservedMembersFunc) ReporterOption {
-	return func(r *Reporter) { r.observed = fn }
-}
 
 // WithBirdFeedStatus wires the bird-materialization health source (birdfeed.Feed.Status
 // or BirdApplier.Status): Build overlays HealthReport.BirdFeedFails/BirdFeedLastOKUnixMs
@@ -157,10 +142,8 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	// State=DataPlaneDown so SoftDead() is true — the server's typed-fault dataDead()
 	// trusts the report on that healthDead signal alone and routes it to its fast
 	// debounce (§4.2.4). FaultNone leaves the reconcile classification untouched.
-	var faultKind model.FaultKind
 	if r.fault != nil {
 		if fk, reason := r.fault.Fault(); fk != model.FaultNone {
-			faultKind = fk
 			rep.Health.FaultKind = fk
 			rep.Health.State = model.HealthDataPlaneDown
 			if reason != "" {
@@ -179,15 +162,6 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	// it into the bird-feed-degraded/-recovered BSS events (policy-integrity signal).
 	if r.birdFeed != nil {
 		rep.Health.BirdFeedFails, rep.Health.BirdFeedLastOKUnixMs = r.birdFeed()
-	}
-	// ObservedMembers is a fresh VPP binary-API dump (ARP/ND). Skip it when VPP is
-	// GONE: the dump would just block on the dead API until the reply timeout,
-	// delaying the very vpp-gone report this event-driven build is rushing to the
-	// server (§6.44 live: a wedge judged in ~3s took ~18s to REACH the server
-	// because Build stalled here). vpp-gone means "no members observable" anyway;
-	// omit the field (server keeps the last set) rather than pay a doomed dump.
-	if r.observed != nil && faultKind != model.FaultVPPGone {
-		rep.ObservedMembers = r.observed()
 	}
 	return rep, true
 }

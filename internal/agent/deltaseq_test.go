@@ -124,7 +124,7 @@ func TestDeltaSequencerBufferBounded(t *testing.T) {
 // would-be successor stays buffered until a real advance — no silent skip.
 func TestDeltaSequencerApplyFailureHoldsChain(t *testing.T) {
 	h, seq := newSeq(t, 10)
-	h.failAt = 11 // applying gen11 fails
+	h.failAt = 11         // applying gen11 fails
 	seq.Submit(d(11, 12)) // buffered (ahead)
 	seq.Submit(d(10, 11)) // chains, but apply fails → no advance, no drain
 	if h.last != 10 {

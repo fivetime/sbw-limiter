@@ -160,12 +160,6 @@ func main() {
 		defer probeCleanup()
 	}
 
-	// Member observer: its Observe() dump feeds the reporter's EdgeReport.ObservedMembers
-	// (the server's member-up/down signal). It is NOT an anchor gate — that gate is gone;
-	// anchors flow desired→bird unconditionally. See MemberObserver's doc: this ObservedMembers
-	// source is itself owed a rework (host-macc ARP basis, lab-topology-bound).
-	memberObserver := agent.NewMemberObserver(conn, cfg.MemberInterfaces, log)
-
 	// Stats-segment VPP liveness (§6.44) — see setupVppLiveness. OnTransition + Run
 	// are wired below, after the reporter exists.
 	vppLive, vppLiveDead, liveCleanup := setupVppLiveness(cfg, log)
@@ -200,8 +194,6 @@ func main() {
 		// the event-driven vpp-gone report racing to the server (§6.44 live: it added ~8s
 		// to failover). A background loop (below) refreshes the cache; report/liveness hot
 		// paths stay dump-free. (This ObservedMembers source is owed a rework — see the
-		// MemberObserver doc — but it is NOT an anchor gate.)
-		agent.WithObservedMembers(memberObserver.Latest),
 		// Bird-feed health (anchors/flowspec traction convergence): sustained apply
 		// failure was log-only — surface it so the server can emit the
 		// bird-feed-degraded BSS event (policy-integrity, not a death signal).
@@ -355,10 +347,9 @@ func main() {
 	}
 
 	// Start the loops. Each blocks until ctx is cancelled.
-	go client.RunDirect(ctx, cfg.CapacityBps)                                // downlink: register + subscribe + dispatch, direct to server (REFACTOR step 4)
-	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired)            // converge VPP to desired every interval
-	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)                   // uplink: health/capacity report direct to server (B-03); client is the ReportSink
-	go runObservedMembersLoop(ctx, memberObserver, cfg.ReportInterval.Std()) // cache refresh off the report/liveness hot path (§6.44)
+	go client.RunDirect(ctx, cfg.CapacityBps)                     // downlink: register + subscribe + dispatch, direct to server (REFACTOR step 4)
+	go recon.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // converge VPP to desired every interval
+	go reporter.Run(ctx, cfg.ReportInterval.Std(), client)        // uplink: health/capacity report direct to server (B-03); client is the ReportSink
 	// Stats-segment liveness transitions (§6.44) wake the reporter too, with the
 	// same de-correlation jitter as the govpp health path. Wedge/death is already
 	// debounced inside VppLiveness (wedgeGrace / disconnect), so no extra delay on
@@ -391,23 +382,6 @@ func main() {
 	log.Info("edge-agent received shutdown signal; stopping")
 	// Give in-flight loops a moment to observe ctx cancellation before exit.
 	time.Sleep(100 * time.Millisecond)
-}
-
-// runObservedMembersLoop refreshes the member observer's cache every interval —
-// the VPP ARP/ND dump runs on THIS loop, never on the report/liveness hot path,
-// so a wedged VPP blocks the refresh, not the report (§6.44).
-func runObservedMembersLoop(ctx context.Context, mo *agent.MemberObserver, interval time.Duration) {
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	mo.Observe() // prime the cache
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			mo.Observe()
-		}
-	}
 }
 
 // runHealthTransitionReports turns govpp binary-API health transitions into
