@@ -623,51 +623,36 @@ func (r *Reconciler) reconcileClassify(cl classifyReconciler, desired []model.Cl
 		return c, fmt.Errorf("agent: find classify tables: %w", err)
 	}
 
-	// Group desired sessions by mask, keyed by their match bytes → hit target.
-	type want struct {
-		mask    model.MaskKind
-		prefix  netip.Prefix
-		hitNext uint32
-	}
-	byMask := map[model.MaskKind]map[string]want{} // mask → matchKey → want
-	for _, s := range desired {
-		idx, ok := r.polIdx[s.PolicerName]
-		if !ok {
-			return c, fmt.Errorf("agent: classify session %s references unknown policer %q (not reconciled?)", s.Prefix, s.PolicerName)
-		}
-		key, err := vpp.SessionKey(s.Mask, s.Prefix)
-		if err != nil {
-			return c, err
-		}
-		if byMask[s.Mask] == nil {
-			byMask[s.Mask] = map[string]want{}
-		}
-		byMask[s.Mask][hex.EncodeToString(key)] = want{s.Mask, s.Prefix, idx}
+	byMask, err := r.buildSessionWants(desired)
+	if err != nil {
+		return c, err
 	}
 
 	for mask, wants := range byMask {
-		table, ok := tables[mask]
-		if !ok {
-			table, err = cl.AddTable(vpp.TableSpec{Mask: mask, Nbuckets: r.classifyNbuckets, MemorySize: r.classifyMem})
-			if err != nil {
-				return c, err
-			}
-			tables[mask] = table
-			r.log.Info("reconcile: created classify table", "mask", mask, "index", table)
+		table, err := r.ensureTable(cl, tables, mask)
+		if err != nil {
+			return c, err
 		}
 
+		// FULL path: dump the WHOLE table so orphans (installed sessions no longer
+		// desired) can be swept — the divergence from the delta hot path, which
+		// point-looks-up only its own members and drives deletes from prev instead.
 		actual, err := cl.DumpSessions(table)
 		if err != nil {
 			return c, err
 		}
-		actualByKey := make(map[string]vpp.SessionInfo, len(actual))
+		actualHit := make(map[string]uint32, len(actual))
 		for _, s := range actual {
-			actualByKey[hex.EncodeToString(s.Match)] = s
+			actualHit[sessionMapKey(mask, hex.EncodeToString(s.Match))] = s.HitNextIndex
+		}
+		wantKeys := make(map[string]struct{}, len(wants))
+		for _, w := range wants {
+			wantKeys[w.key] = struct{}{}
 		}
 
-		// Delete orphans: sessions on the table not in desired.
-		for key, s := range actualByKey {
-			if _, keep := wants[key]; keep {
+		// Delete orphans: installed sessions on the table not in desired.
+		for _, s := range actual {
+			if _, keep := wantKeys[sessionMapKey(mask, hex.EncodeToString(s.Match))]; keep {
 				continue
 			}
 			if err := cl.DelSessionByKey(table, mask, s.Match); err != nil {
@@ -676,23 +661,13 @@ func (r *Reconciler) reconcileClassify(cl classifyReconciler, desired []model.Cl
 			c.deleted++
 		}
 
-		// Add missing / re-point moved.
-		for key, w := range wants {
-			cur, present := actualByKey[key]
-			switch {
-			case !present:
-				if err := cl.AddSession(table, w.mask, w.prefix, w.hitNext); err != nil {
-					return c, err
-				}
-				c.added++
-			case cur.HitNextIndex != w.hitNext:
-				// Same key, different policer → atomic overwrite (§5.3).
-				if err := cl.AddSession(table, w.mask, w.prefix, w.hitNext); err != nil {
-					return c, err
-				}
-				c.moved++
-			}
+		// Add missing / re-point moved (shared with the delta path).
+		a, m, err := applySessionUpserts(cl, table, wants, actualHit)
+		if err != nil {
+			return c, err
 		}
+		c.added += a
+		c.moved += m
 	}
 
 	// Prune EMPTIED-MASK tables: the byMask loop only visits masks the desired set

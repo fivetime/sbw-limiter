@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"net/netip"
 	"testing"
 
 	"github.com/fivetime/sbw-contract/model"
@@ -102,6 +103,41 @@ func TestApplyDeltaAddsAndRemovesPoolsScoped(t *testing.T) {
 	r.recomputePoolHash()
 	if got, want := r.InstalledPoolHash(), model.PoolSetHash([]model.PoolID{201, 300}); got != want {
 		t.Errorf("InstalledPoolHash = %d, want %d (set {201,300})", got, want)
+	}
+}
+
+// TestApplyDeltaV6IngressEgressNoCollision locks the fix for the ip6-dst-128 vs
+// ip6-src-128 map-key collision (now enforced by the SHARED buildSessionWants/
+// sessionMapKey in classifydiff.go): one member's ingress (dst) and egress (src)
+// v6 sessions share a BYTE-IDENTICAL VPP match key (vpp.SessionKey encodes only the
+// masked address, not the mask), so an un-namespaced desired map dropped one. Both
+// must materialize, in two SEPARATE mask tables.
+func TestApplyDeltaV6IngressEgressNoCollision(t *testing.T) {
+	r := newReconciler()
+	fc := newFakeClassify()
+	r.polIdx["pool500_in"] = 11
+	r.polIdx["pool500_out"] = 12
+
+	mbr := netip.MustParsePrefix("2001:db8::5/128")
+	next := []model.ClassifySession{
+		{PoolID: 500, Prefix: mbr, Direction: model.DirectionIngress, Mask: model.MaskIP6Dst128, PolicerName: model.PolicerName(500, model.DirectionIngress)},
+		{PoolID: 500, Prefix: mbr, Direction: model.DirectionEgress, Mask: model.MaskIP6Src128, PolicerName: model.PolicerName(500, model.DirectionEgress)},
+	}
+	a, dd, mv, err := r.upsertPoolSessions(fc, 500, nil, next)
+	if err != nil || a != 2 || dd != 0 || mv != 0 {
+		t.Fatalf("v6 ingress+egress upsert: a=%d dd=%d mv=%d err=%v (both dst-128 and src-128 must be added)", a, dd, mv, err)
+	}
+	tables, _ := fc.FindTablesByMask()
+	td, okd := tables[model.MaskIP6Dst128]
+	ts, oks := tables[model.MaskIP6Src128]
+	if !okd || !oks || td == ts {
+		t.Fatalf("want two distinct v6 tables, got dst=%v(%d) src=%v(%d)", okd, td, oks, ts)
+	}
+	if n := len(fc.sessions[td]); n != 1 {
+		t.Errorf("dst-128 table sessions = %d, want 1", n)
+	}
+	if n := len(fc.sessions[ts]); n != 1 {
+		t.Errorf("src-128 table sessions = %d, want 1", n)
 	}
 }
 

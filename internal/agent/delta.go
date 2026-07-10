@@ -215,54 +215,32 @@ func (r *Reconciler) deletePoolSessions(cl classifyReconciler, sessions []model.
 // touches (typically one or two), not the whole edge — so the cost is bounded by the
 // pool's masks/members, not N. prev is the pool's pre-delta members (the teardown
 // record for members no longer desired).
-// sessionMapKey namespaces a session's VPP match key by its mask. The SAME /128
-// address under different masks — notably ip6-dst-128 (ingress) vs ip6-src-128
-// (egress) of one member — produces a BYTE-IDENTICAL VPP match key (vpp.SessionKey
-// encodes only the masked address, dropping the mask/direction). An un-namespaced
-// desired map therefore collides a member's ingress and egress sessions: the second
-// overwrites the first, so only ONE mask's table is ever created — v6 ingress ended
-// up with no dst table at all and its traffic went unpoliced/uncounted. The VPP
-// match bytes are unchanged; this is purely the in-memory map key. (The full
-// reconcile path was already immune: it nests its desired map by mask.)
-func sessionMapKey(mask model.MaskKind, keyHex string) string {
-	return mask.String() + "\x00" + keyHex
-}
-
 func (r *Reconciler) upsertPoolSessions(cl classifyReconciler, pool model.PoolID, prev, next []model.ClassifySession) (added, deleted, moved int, err error) {
 	tables, err := cl.FindTablesByMask()
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("agent: delta: find tables: %w", err)
 	}
 
-	type want struct {
-		mask    model.MaskKind
-		prefix  netip.Prefix
-		hitNext uint32
+	byMask, err := r.buildSessionWants(next)
+	if err != nil {
+		return 0, 0, 0, err
 	}
-	// Desired key → want (within this pool), and the desired prefixes per mask
-	// (for the targeted point-lookup below).
-	wantByKey := map[string]want{}
-	wantPrefixes := map[model.MaskKind][]netip.Prefix{}
-	for _, s := range next {
-		idx, ok := r.polIdx[s.PolicerName]
-		if !ok {
-			return added, deleted, moved, fmt.Errorf("agent: delta: classify session %s references unknown policer %q", s.Prefix, s.PolicerName)
+	wantKeys := map[string]struct{}{}
+	for _, wants := range byMask {
+		for _, w := range wants {
+			wantKeys[w.key] = struct{}{}
 		}
-		key, err := vpp.SessionKey(s.Mask, s.Prefix)
-		if err != nil {
-			return added, deleted, moved, err
-		}
-		wantByKey[sessionMapKey(s.Mask, hex.EncodeToString(key))] = want{s.Mask, s.Prefix, idx}
-		wantPrefixes[s.Mask] = append(wantPrefixes[s.Mask], s.Prefix)
 	}
 
-	// Delete prev members of this pool no longer desired.
+	// Delete prev members of this pool no longer desired. DELTA divergence: the delta
+	// path cannot see the whole table, so it drives deletes from the pool's pre-delta
+	// member record (prev), not the full reconcile's orphan sweep.
 	for _, s := range prev {
 		key, err := vpp.SessionKey(s.Mask, s.Prefix)
 		if err != nil {
 			return added, deleted, moved, err
 		}
-		if _, keep := wantByKey[sessionMapKey(s.Mask, hex.EncodeToString(key))]; keep {
+		if _, keep := wantKeys[sessionMapKey(s.Mask, hex.EncodeToString(key))]; keep {
 			continue // still desired; handled below (add-or-move)
 		}
 		table, ok := tables[s.Mask]
@@ -275,58 +253,36 @@ func (r *Reconciler) upsertPoolSessions(cl classifyReconciler, pool model.PoolID
 		deleted++
 	}
 
-	// Read back the hit index installed for JUST this pool's desired members, so a
-	// member already present at a different hit index is re-pointed (moved), and an
-	// unchanged one is a no-op. This is an O(pool) point-lookup (probe plugin's
-	// probe_classify_lookup), NOT a whole-table dump — a member add/remove no longer
-	// serializes the edge-wide shared mask table across VPP's main thread.
-	actualHit := map[string]uint32{} // matchKey → installed hit index (absent = no session)
-	for mask, prefixes := range wantPrefixes {
-		table, ok := tables[mask]
-		if !ok {
-			continue // table not created yet → no sessions → all treated as adds
+	// Add missing / re-point moved, per mask. DELTA divergence: actualHit comes from an
+	// O(pool) POINT-LOOKUP (probe_classify_lookup) of just this pool's desired members,
+	// NOT a whole-table dump — a member add/remove no longer serializes the edge-wide
+	// shared mask table across VPP's main thread. The add/move decision itself is shared
+	// with the full reconcile (applySessionUpserts).
+	for mask, wants := range byMask {
+		table, err := r.ensureTable(cl, tables, mask)
+		if err != nil {
+			return added, deleted, moved, err
+		}
+		prefixes := make([]netip.Prefix, len(wants))
+		for i, w := range wants {
+			prefixes[i] = w.prefix
 		}
 		hits, err := cl.LookupHits(table, mask, prefixes)
 		if err != nil {
 			return added, deleted, moved, fmt.Errorf("agent: delta: lookup sessions: %w", err)
 		}
-		for i, p := range prefixes {
-			if hits[i] == vpp.NoTable {
-				continue // not installed
+		actualHit := make(map[string]uint32, len(wants))
+		for i, w := range wants {
+			if hits[i] != vpp.NoTable {
+				actualHit[w.key] = hits[i]
 			}
-			key, err := vpp.SessionKey(mask, p)
-			if err != nil {
-				return added, deleted, moved, err
-			}
-			actualHit[sessionMapKey(mask, hex.EncodeToString(key))] = hits[i]
 		}
-	}
-
-	// Add new / re-point moved. AddSession on an existing key is an atomic overwrite
-	// (§5.3), so a moved member is a single AddSession with the new hit index.
-	for keyHex, w := range wantByKey {
-		table, ok := tables[w.mask]
-		if !ok {
-			table, err = cl.AddTable(vpp.TableSpec{Mask: w.mask, Nbuckets: r.classifyNbuckets, MemorySize: r.classifyMem})
-			if err != nil {
-				return added, deleted, moved, err
-			}
-			tables[w.mask] = table
-			r.log.Info("delta: created classify table", "mask", w.mask, "index", table)
+		a, m, err := applySessionUpserts(cl, table, wants, actualHit)
+		if err != nil {
+			return added, deleted, moved, err
 		}
-		curHit, present := actualHit[keyHex]
-		switch {
-		case !present:
-			if err := cl.AddSession(table, w.mask, w.prefix, w.hitNext); err != nil {
-				return added, deleted, moved, err
-			}
-			added++
-		case curHit != w.hitNext:
-			if err := cl.AddSession(table, w.mask, w.prefix, w.hitNext); err != nil {
-				return added, deleted, moved, err
-			}
-			moved++
-		}
+		added += a
+		moved += m
 	}
 	_ = pool // pool is the scoping identity; sessions already filtered to it by caller
 	return added, deleted, moved, nil
