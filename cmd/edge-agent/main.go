@@ -148,9 +148,10 @@ func main() {
 		}
 		st := store.Status()
 		met.RecordDesiredStatus(st.Frozen, st.Generation)
-		if birdFeedStatus != nil {
-			met.RecordBirdFeed(birdFeedStatus())
-		}
+		// NOTE: the bird-feed gauge is NOT updated here — the reconcile cadence
+		// (60s) is far too coarse to see a sub-minute feed transient. It is
+		// refreshed on the 3s phase ticker instead (runPhaseTicker below), which
+		// matches the feed's own retry cadence.
 	})
 
 	// ③ forwarding-broken (§4.2.7/§4.2.8) — see setupForwardingProbe.
@@ -367,8 +368,8 @@ func main() {
 		})
 		go vppLive.Run(ctx)
 	}
-	go runHealthTransitionReports(ctx, conn, reporter, log) // event-driven report: VPP health transition → wake the reporter (§4.2.4 ★实测更新)
-	go runPhaseTicker(ctx, phaseTracker, met)               // L4 engine + socket probe: a worker wedge / socket loss surfaces in seconds (§4.1)
+	go runHealthTransitionReports(ctx, conn, reporter, log)   // event-driven report: VPP health transition → wake the reporter (§4.2.4 ★实测更新)
+	go runPhaseTicker(ctx, phaseTracker, met, birdFeedStatus) // L4 engine + socket probe (§4.1) + 3s bird-feed gauge refresh
 	if feed != nil {
 		go feed.Run(ctx, cfg.ReconcileInterval.Std(), store.Desired) // anchors+FlowSpec → bird api proto (incremental)
 	} else if birdApply != nil {
@@ -435,8 +436,11 @@ func runHealthTransitionReports(ctx context.Context, conn *vpp.Conn, reporter *a
 }
 
 // runPhaseTicker drives the L4 engine + socket probe faster than the reconcile
-// pass, so a worker wedge / socket loss surfaces in seconds (§4.1).
-func runPhaseTicker(ctx context.Context, pt *agent.PhaseTracker, met *metrics.Metrics) {
+// pass, so a worker wedge / socket loss surfaces in seconds (§4.1). It also
+// refreshes the bird-feed gauge at this 3s cadence (birdFeedStatus, nil if no
+// materializer) — the reconcile observer's 60s cadence is far too coarse to see
+// a sub-minute feed transient, which the lab regression exposed as a blind gauge.
+func runPhaseTicker(ctx context.Context, pt *agent.PhaseTracker, met *metrics.Metrics, birdFeedStatus func() (fails, lastOKUnixMs int64)) {
 	t := time.NewTicker(3 * time.Second)
 	defer t.Stop()
 	for {
@@ -445,6 +449,9 @@ func runPhaseTicker(ctx context.Context, pt *agent.PhaseTracker, met *metrics.Me
 			return
 		case <-t.C:
 			met.RecordPhase(pt.Tick())
+			if birdFeedStatus != nil {
+				met.RecordBirdFeed(birdFeedStatus())
+			}
 		}
 	}
 }
