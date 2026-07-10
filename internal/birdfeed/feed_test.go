@@ -27,7 +27,7 @@ func newTestFeed() (*Feed, *fakeSink) {
 	return &Feed{
 		client:  s,
 		log:     slog.New(slog.DiscardHandler),
-		anchors: map[netip.Prefix]struct{}{},
+		anchors: map[netip.Prefix][]byte{},
 		flows:   map[netip.Prefix]struct{}{},
 		resync:  true,
 	}, s
@@ -230,5 +230,72 @@ func TestFeedStatusCountsConsecutiveFailures(t *testing.T) {
 	f.pass(func() (model.EdgeDesiredState, bool) { return model.EdgeDesiredState{}, false })
 	if fails, _ := f.Status(); fails != 0 {
 		t.Fatalf("cold-start skip must not count as failure, fails=%d", fails)
+	}
+}
+
+// TestFeedAnchorCarriesCommunities pins the §6.56 fix: an anchor's RTBH
+// communities must ride the api feed as TLVs (they were dropped — upstream got
+// plain unicast and never dropped the victim traffic), and a community CHANGE
+// must re-announce the anchor (diff by prefix+attr signature, upsert in bird).
+func TestFeedAnchorCarriesCommunities(t *testing.T) {
+	f, s := newTestFeed()
+	rtbh := model.Community{ASN: 65000, Value: 666}
+	lc := model.LargeCommunity{GlobalAdmin: 4231457290, LocalData1: 666, LocalData2: 0}
+	st := model.EdgeDesiredState{
+		Anchors: []model.Anchor{{
+			Prefix:           netip.MustParsePrefix("172.16.8.7/32"),
+			Communities:      []model.Community{rtbh},
+			LargeCommunities: []model.LargeCommunity{lc},
+		}},
+	}
+	if err := f.apply(st); err != nil {
+		t.Fatal(err)
+	}
+	// One anchor ADD; its body must contain both community TLVs with BE payloads.
+	var add []byte
+	for _, fr := range s.frames {
+		if fr[1] == opAdd {
+			add = fr
+		}
+	}
+	if add == nil {
+		t.Fatal("no anchor ADD frame")
+	}
+	body := add[hdrLen:]
+	// body: net(1) px(1) key(4) blackholeTLV(2) then community TLVs.
+	at := body[2+4+2:]
+	if at[0] != attrCommunity || at[1] != 4 {
+		t.Fatalf("community TLV header = %d/%d, want %d/4", at[0], at[1], attrCommunity)
+	}
+	if got := []byte{at[2], at[3], at[4], at[5]}; got[0] != 0xFD || got[1] != 0xE8 || got[2] != 0x02 || got[3] != 0x9A {
+		t.Fatalf("community payload = % x, want fd e8 02 9a (65000:666 BE)", got)
+	}
+	lt := at[2+4:]
+	if lt[0] != attrLargeCommunity || lt[1] != 12 {
+		t.Fatalf("large-community TLV header = %d/%d, want %d/12", lt[0], lt[1], attrLargeCommunity)
+	}
+
+	// Community change (same prefix) → re-announce (one more ADD), not silence.
+	s.frames = nil
+	st.Anchors[0].Communities = []model.Community{{ASN: 65000, Value: 667}}
+	if err := f.apply(st); err != nil {
+		t.Fatal(err)
+	}
+	adds := 0
+	for _, fr := range s.frames {
+		if fr[1] == opAdd {
+			adds++
+		}
+	}
+	if adds != 1 {
+		t.Fatalf("community change must re-announce exactly once, got %d ADDs", adds)
+	}
+	// Unchanged pass → zero writes.
+	s.frames = nil
+	if err := f.apply(st); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.frames) != 0 {
+		t.Fatalf("steady state must be zero-diff, wrote %d frames", len(s.frames))
 	}
 }

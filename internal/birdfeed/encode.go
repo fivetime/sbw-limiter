@@ -17,6 +17,8 @@
 package birdfeed
 
 import (
+	"github.com/fivetime/sbw-contract/model"
+
 	"encoding/binary"
 	"net/netip"
 )
@@ -39,6 +41,14 @@ const (
 
 	attrBlackhole = 1 // len 0 — RTD_BLACKHOLE (anchor advertisement carrier)
 	attrExtComm   = 2 // len 8 (v4 redirect EC) or 20 (v6 redirect i6ec)
+	// attrCommunity / attrLargeCommunity carry an anchor's RTBH (or other)
+	// communities (§6.56 — the api feed used to drop them: upstream received the
+	// blackhole /32 as plain unicast and never dropped). Wire format matches
+	// bird-vpp proto/api api.h API_ATTR_COMMUNITY/LARGECOMM:
+	//   community:       n×4 bytes, each big-endian (u16 asn, u16 value)
+	//   large community: n×12 bytes, each 3×u32 big-endian (global, d1, d2)
+	attrCommunity      = 4
+	attrLargeCommunity = 5
 )
 
 // frame prepends the 8-byte header (big-endian / network order, matching bird's
@@ -68,21 +78,57 @@ func frameHello() []byte { return frame(opHello, nil) }
 func frameEOR() []byte   { return frame(opEOR, nil) }
 
 // frameAnchor encodes an anchor ADD/DEL: a unicast /32 (v4) or /128 (v6) carried
-// as a BLACKHOLE route (advertisement carrier only). op is opAdd or opDel.
-func frameAnchor(op uint8, p netip.Prefix) []byte {
+// as a BLACKHOLE route (advertisement carrier only). op is opAdd or opDel. attrs
+// is the pre-encoded community TLV bytes (anchorAttrBytes; nil for a plain
+// anchor) appended verbatim on ADD — DEL is keyed by prefix alone.
+func frameAnchor(op uint8, p netip.Prefix, attrs []byte) []byte {
 	a := p.Addr()
 	nt := byte(netIP4)
 	if a.Is6() {
 		nt = netIP6
 	}
 	key := addrBytes(a)
-	body := make([]byte, 0, 2+len(key)+2)
+	body := make([]byte, 0, 2+len(key)+2+len(attrs))
 	body = append(body, nt, byte(p.Bits()))
 	body = append(body, key...)
 	if op == opAdd {
 		body = append(body, attrBlackhole, 0) // TLV: type, len=0
+		body = append(body, attrs...)
 	}
 	return frame(op, body)
+}
+
+// anchorAttrBytes encodes an anchor's communities as api-proto TLVs (empty for a
+// plain anchor). The byte string doubles as the feed's diff signature: a
+// community change re-announces the anchor (idempotent upsert in bird). A TLV
+// length is a u8, capping one TLV at 63 standard / 21 large communities —
+// anchors carry ~1 (RTBH), so truncate defensively rather than fail the feed.
+func anchorAttrBytes(a model.Anchor) []byte {
+	if len(a.Communities) == 0 && len(a.LargeCommunities) == 0 {
+		return nil
+	}
+	var out []byte
+	if n := len(a.Communities); n > 0 {
+		if n > 63 {
+			n = 63
+		}
+		out = append(out, attrCommunity, byte(n*4))
+		for _, c := range a.Communities[:n] {
+			out = append(out, byte(c.ASN>>8), byte(c.ASN), byte(c.Value>>8), byte(c.Value))
+		}
+	}
+	if n := len(a.LargeCommunities); n > 0 {
+		if n > 21 {
+			n = 21
+		}
+		out = append(out, attrLargeCommunity, byte(n*12))
+		for _, lc := range a.LargeCommunities[:n] {
+			for _, w := range [3]uint32{lc.GlobalAdmin, lc.LocalData1, lc.LocalData2} {
+				out = append(out, byte(w>>24), byte(w>>16), byte(w>>8), byte(w))
+			}
+		}
+	}
+	return out
 }
 
 // frameFlow encodes a flowspec ADD/DEL: a source-prefix flow4/flow6 NLRI; on ADD

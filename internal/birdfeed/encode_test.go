@@ -17,7 +17,7 @@ func TestRedirectIP4EC(t *testing.T) {
 }
 
 func TestFrameAnchorAdd(t *testing.T) {
-	got := frameAnchor(opAdd, netip.MustParsePrefix("11.0.0.5/32"))
+	got := frameAnchor(opAdd, netip.MustParsePrefix("11.0.0.5/32"), nil)
 	// header(8): v=1 op=1 flags=0,0 len=0,0,0,16 ; body: net=1 px=32 key=11,0,0,5 attr=1,0
 	want := []byte{1, 1, 0, 0, 0, 0, 0, 16, netIP4, 32, 11, 0, 0, 5, attrBlackhole, 0}
 	if !bytes.Equal(got, want) {
@@ -26,7 +26,7 @@ func TestFrameAnchorAdd(t *testing.T) {
 }
 
 func TestFrameAnchorDel(t *testing.T) {
-	got := frameAnchor(opDel, netip.MustParsePrefix("11.0.0.5/32"))
+	got := frameAnchor(opDel, netip.MustParsePrefix("11.0.0.5/32"), nil)
 	want := []byte{1, opDel, 0, 0, 0, 0, 0, 14, netIP4, 32, 11, 0, 0, 5} // no attr on DEL
 	if !bytes.Equal(got, want) {
 		t.Fatalf("anchor DEL = % x\nwant            % x", got, want)
@@ -34,7 +34,7 @@ func TestFrameAnchorDel(t *testing.T) {
 }
 
 func TestFrameAnchorV6(t *testing.T) {
-	got := frameAnchor(opAdd, netip.MustParsePrefix("2001:db8::7/128"))
+	got := frameAnchor(opAdd, netip.MustParsePrefix("2001:db8::7/128"), nil)
 	if got[1] != opAdd || got[hdrLen] != netIP6 || got[hdrLen+1] != 128 {
 		t.Fatalf("v6 anchor header wrong: op=%d net=%d px=%d", got[1], got[hdrLen], got[hdrLen+1])
 	}

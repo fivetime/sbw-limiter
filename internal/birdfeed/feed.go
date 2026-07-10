@@ -1,6 +1,7 @@
 package birdfeed
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -36,8 +37,10 @@ type Feed struct {
 	log    *slog.Logger
 	wake   chan struct{}
 
-	// snapshot of what is currently fed, for diffing.
-	anchors  map[netip.Prefix]struct{}
+	// snapshot of what is currently fed, for diffing. anchors maps each fed
+	// prefix to its community-TLV bytes (anchorAttrBytes) — value change (e.g.
+	// RTBH community edit) re-announces, since bird's ADD is an idempotent upsert.
+	anchors  map[netip.Prefix][]byte
 	flows    map[netip.Prefix]struct{} // both families; EC chosen per-prefix family
 	nextHop  netip.Addr                // v4 redirect target (for the 8-byte EC)
 	nextHop6 netip.Addr                // v6 redirect target (for the 20-byte i6ec)
@@ -63,7 +66,7 @@ func NewFeed(path string, log *slog.Logger) *Feed {
 		path:    path,
 		log:     log,
 		wake:    make(chan struct{}, 1),
-		anchors: map[netip.Prefix]struct{}{},
+		anchors: map[netip.Prefix][]byte{},
 		flows:   map[netip.Prefix]struct{}{},
 		resync:  true,
 	}
@@ -142,9 +145,9 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 	// Desired sets. Anchors (v4+v6) and flowspec (v4+v6) are all fed; the redirect
 	// EC is chosen per source-prefix family — 8-byte redirect-to-IPv4 for a v4
 	// source, 20-byte redirect-to-IPv6 i6ec for a v6 source (DESIGN-bird-api §3.3).
-	desA := make(map[netip.Prefix]struct{}, len(st.Anchors))
+	desA := make(map[netip.Prefix][]byte, len(st.Anchors))
 	for _, a := range st.Anchors {
-		desA[a.Prefix] = struct{}{}
+		desA[a.Prefix] = anchorAttrBytes(a) // nil for a plain anchor; RTBH etc. ride as TLVs
 	}
 	desF := make(map[netip.Prefix]struct{}, len(st.FlowRedirects))
 	haveV4, haveV6 := false, false
@@ -207,10 +210,10 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 // fullResync: HELLO + all current routes + EOR. The proto marks everything stale
 // on HELLO, the re-announces clear it, EOR prunes whatever the agent dropped.
 // ecFor picks the redirect EC for a flow by its source-prefix family.
-func (f *Feed) fullResync(desA, desF map[netip.Prefix]struct{}, ecFor func(netip.Prefix) []byte) {
+func (f *Feed) fullResync(desA map[netip.Prefix][]byte, desF map[netip.Prefix]struct{}, ecFor func(netip.Prefix) []byte) {
 	f.client.write(frameHello())
-	for p := range desA {
-		f.client.write(frameAnchor(opAdd, p))
+	for p, attrs := range desA {
+		f.client.write(frameAnchor(opAdd, p, attrs))
 	}
 	for p := range desF {
 		f.client.write(frameFlow(opAdd, p, ecFor(p)))
@@ -220,15 +223,15 @@ func (f *Feed) fullResync(desA, desF map[netip.Prefix]struct{}, ecFor func(netip
 }
 
 // incremental: only the diff vs the last-fed snapshot (O(delta) into bird).
-func (f *Feed) incremental(desA, desF map[netip.Prefix]struct{}, ecFor func(netip.Prefix) []byte) {
-	for p := range desA {
-		if _, ok := f.anchors[p]; !ok {
-			f.client.write(frameAnchor(opAdd, p))
+func (f *Feed) incremental(desA map[netip.Prefix][]byte, desF map[netip.Prefix]struct{}, ecFor func(netip.Prefix) []byte) {
+	for p, attrs := range desA {
+		if prev, ok := f.anchors[p]; !ok || !bytes.Equal(prev, attrs) {
+			f.client.write(frameAnchor(opAdd, p, attrs)) // new, or communities changed (upsert)
 		}
 	}
 	for p := range f.anchors {
 		if _, ok := desA[p]; !ok {
-			f.client.write(frameAnchor(opDel, p))
+			f.client.write(frameAnchor(opDel, p, nil))
 		}
 	}
 	for p := range desF {
