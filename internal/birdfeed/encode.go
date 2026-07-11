@@ -17,10 +17,11 @@
 package birdfeed
 
 import (
-	"github.com/fivetime/sbw-contract/model"
-
 	"encoding/binary"
+	"log/slog"
 	"net/netip"
+
+	"github.com/fivetime/sbw-contract/model"
 )
 
 // Wire constants — keep in lockstep with bird proto/api/api.h.
@@ -103,13 +104,19 @@ func frameAnchor(op uint8, p netip.Prefix, attrs []byte) []byte {
 // community change re-announces the anchor (idempotent upsert in bird). A TLV
 // length is a u8, capping one TLV at 63 standard / 21 large communities —
 // anchors carry ~1 (RTBH), so truncate defensively rather than fail the feed.
-func anchorAttrBytes(a model.Anchor) []byte {
+// Truncation is NOT silent: dropping a policy/RTBH community without a trace could
+// leave a blackhole silently un-dropped upstream, so it is logged at WARN.
+func anchorAttrBytes(a model.Anchor, log *slog.Logger) []byte {
 	if len(a.Communities) == 0 && len(a.LargeCommunities) == 0 {
 		return nil
 	}
 	var out []byte
 	if n := len(a.Communities); n > 0 {
 		if n > 63 {
+			if log != nil {
+				log.Warn("birdfeed: anchor communities truncated to TLV cap — some dropped",
+					"prefix", a.Prefix, "have", n, "cap", 63)
+			}
 			n = 63
 		}
 		out = append(out, attrCommunity, byte(n*4))
@@ -119,6 +126,10 @@ func anchorAttrBytes(a model.Anchor) []byte {
 	}
 	if n := len(a.LargeCommunities); n > 0 {
 		if n > 21 {
+			if log != nil {
+				log.Warn("birdfeed: anchor large-communities truncated to TLV cap — some dropped",
+					"prefix", a.Prefix, "have", n, "cap", 21)
+			}
 			n = 21
 		}
 		out = append(out, attrLargeCommunity, byte(n*12))

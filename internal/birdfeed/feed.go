@@ -147,7 +147,7 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 	// source, 20-byte redirect-to-IPv6 i6ec for a v6 source (DESIGN-bird-api §3.3).
 	desA := make(map[netip.Prefix][]byte, len(st.Anchors))
 	for _, a := range st.Anchors {
-		desA[a.Prefix] = anchorAttrBytes(a) // nil for a plain anchor; RTBH etc. ride as TLVs
+		desA[a.Prefix] = anchorAttrBytes(a, f.log) // nil for a plain anchor; RTBH etc. ride as TLVs
 	}
 	desF := make(map[netip.Prefix]struct{}, len(st.FlowRedirects))
 	haveV4, haveV6 := false, false
