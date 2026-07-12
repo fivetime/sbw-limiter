@@ -32,7 +32,6 @@ func TestRecordHealth(t *testing.T) {
 		RepairActions:     4,
 		PolicersDesired:   6,
 		SessionsDesired:   12,
-		FIBDrift:          2,
 		GenerationApplied: 9,
 	})
 	if v := testutil.ToFloat64(m.healthState); v != float64(model.HealthDegraded) {
@@ -43,9 +42,6 @@ func TestRecordHealth(t *testing.T) {
 	}
 	if v := testutil.ToFloat64(m.repairs); v != 4 {
 		t.Errorf("repairs = %v, want 4", v)
-	}
-	if v := testutil.ToFloat64(m.fibDrift); v != 2 {
-		t.Errorf("fib_drift = %v, want 2", v)
 	}
 	if v := testutil.ToFloat64(m.generation); v != 9 {
 		t.Errorf("generation = %v, want 9", v)

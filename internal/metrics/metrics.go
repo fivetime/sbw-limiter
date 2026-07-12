@@ -26,7 +26,6 @@ type Metrics struct {
 
 	healthState     prometheus.Gauge // 0 healthy, 1 degraded, 2 data-plane-down
 	vppConnected    prometheus.Gauge // 1 up, 0 down
-	fibDrift        prometheus.Gauge
 	birdFeedFails   prometheus.Gauge
 	birdFeedLastOK  prometheus.Gauge
 	policersDesired prometheus.Gauge
@@ -49,7 +48,6 @@ func New(edge model.EdgeID) *Metrics {
 
 	m.healthState = f.gauge("sbw_agent_health_state", "Soft-death state: 0 healthy, 1 degraded, 2 data-plane-down (B-05).")
 	m.vppConnected = f.gauge("sbw_agent_vpp_connected", "VPP control-link liveness: 1 up, 0 down.")
-	m.fibDrift = f.gauge("sbw_agent_fib_drift", "Three-way route-count drift (T-502); 0 = consistent.")
 	m.birdFeedFails = f.gauge("sbw_agent_bird_feed_consecutive_failures", "Consecutive failed bird-materialization passes (anchors+flowspec feed); 0 = healthy. Sustained non-zero = traction convergence silently stale.")
 	m.birdFeedLastOK = f.gauge("sbw_agent_bird_feed_last_success_timestamp_seconds", "Unix time of the last fully-applied bird-feed pass; 0 = never.")
 	m.policersDesired = f.gauge("sbw_agent_policers_desired", "Policers in the current desired state.")
@@ -84,7 +82,6 @@ func (m *Metrics) RecordHealth(r model.HealthReport) {
 	}
 	m.repairs.Add(float64(r.RepairActions))
 	m.healthState.Set(float64(r.State))
-	m.fibDrift.Set(float64(r.FIBDrift))
 	m.policersDesired.Set(float64(r.PolicersDesired))
 	m.sessionsDesired.Set(float64(r.SessionsDesired))
 	m.generation.Set(float64(r.GenerationApplied))
