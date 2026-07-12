@@ -61,6 +61,18 @@ type Config struct {
 	BirdFeedMode  string `json:"bird_feed_mode"`
 	BirdAPISocket string `json:"bird_api_socket"` // api proto socket; default /run/bird/api.sock
 
+	// BirdFeedMaxOpsPerPass bounds how many anchor/flow frames the api feed writes
+	// before it flushes + yields (BirdFeedPace), so bird-vpp's vppfib drains between
+	// chunks instead of receiving a whole (re)dump as one in-flight burst. A full
+	// resync of a large homed set in ONE burst overran bird-vpp's vapi accumulation
+	// and os_panic'd under 60K churn — and a bird restart (socket EOF → resync) re-
+	// dumped the whole set into the just-restarted bird, re-crashing it (the self-
+	// sustaining loop). Pacing bounds the in-flight the re-dump imposes. A steady-
+	// state incremental pass smaller than this is unaffected (one flush at the end,
+	// as before). 0 disables pacing (whole pass in one burst — legacy behaviour).
+	BirdFeedMaxOpsPerPass int             `json:"bird_feed_max_ops_per_pass"`
+	BirdFeedPace          config.Duration `json:"bird_feed_pace"` // yield between chunks; 0 → flush only, no sleep
+
 	// PolicerInterfaces names the VPP interfaces whose ingress carries pool
 	// traffic to be policed (the L node's lower leg facing R, §5.3 data plane).
 	// The reconciler attaches the policer-classify mask chain to each so that
@@ -121,19 +133,21 @@ type Config struct {
 // DefaultConfig returns the edge-agent defaults from DESIGN.md §4/§5/§7.
 func DefaultConfig() Config {
 	return Config{
-		Log:               logx.Config{Level: "info", Format: logx.FormatJSON},
-		BIRDSocketPath:    "/run/bird.ctl",
-		VPPAPISocket:      "/run/vpp/api.sock",
-		VPPHealthTimeout:  config.Duration(30 * time.Second),
-		VPPReplyTimeout:   config.Duration(5 * time.Second),
-		BirdAPISocket:     "/run/bird/api.sock",
-		ReconcileInterval: config.Duration(60 * time.Second),
-		ReportInterval:    config.Duration(15 * time.Second),
-		MetricsListenAddr: ":9102",
-		MeteringInterval:  config.Duration(30 * time.Second),
-		VPPStatsSocket:    "/run/vpp/stats.sock",
-		KafkaTopic:        "sbw.metering",
-		KafkaSASLMech:     "SCRAM-SHA-256",
+		Log:                   logx.Config{Level: "info", Format: logx.FormatJSON},
+		BIRDSocketPath:        "/run/bird.ctl",
+		VPPAPISocket:          "/run/vpp/api.sock",
+		VPPHealthTimeout:      config.Duration(30 * time.Second),
+		VPPReplyTimeout:       config.Duration(5 * time.Second),
+		BirdAPISocket:         "/run/bird/api.sock",
+		BirdFeedMaxOpsPerPass: 1000,
+		BirdFeedPace:          config.Duration(10 * time.Millisecond),
+		ReconcileInterval:     config.Duration(60 * time.Second),
+		ReportInterval:        config.Duration(15 * time.Second),
+		MetricsListenAddr:     ":9102",
+		MeteringInterval:      config.Duration(30 * time.Second),
+		VPPStatsSocket:        "/run/vpp/stats.sock",
+		KafkaTopic:            "sbw.metering",
+		KafkaSASLMech:         "SCRAM-SHA-256",
 
 		ForwardingProbeInterval: config.Duration(3 * time.Second),
 		ForwardingProbeFails:    3,
@@ -202,6 +216,12 @@ func (c *Config) applyEnv() error {
 	c.BirdFlowspecInclude = config.String("BIRD_FLOWSPEC_INCLUDE", c.BirdFlowspecInclude)
 	c.BirdFeedMode = config.String("BIRD_FEED", c.BirdFeedMode)
 	c.BirdAPISocket = config.String("BIRD_API_SOCKET", c.BirdAPISocket)
+	if c.BirdFeedMaxOpsPerPass, err = config.Int("BIRD_FEED_MAX_OPS_PER_PASS", c.BirdFeedMaxOpsPerPass); err != nil {
+		return err
+	}
+	if c.BirdFeedPace, err = config.DurationEnv("BIRD_FEED_PACE", c.BirdFeedPace); err != nil {
+		return err
+	}
 	if v := config.String("POLICER_INTERFACES", ""); v != "" {
 		c.PolicerInterfaces = splitCSV(v)
 	}

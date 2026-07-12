@@ -231,6 +231,18 @@ func main() {
 	} else if birdApply != nil {
 		birdFeedStatus = birdApply.Status
 	}
+	// §6.63 phase-aware liveness (the bird-vpp blind spot): while the bird feed is
+	// failing/reconnecting (bird down or re-dumping after a restart), report
+	// PhaseReconciling so the server's hard-death grace rides out the restart instead
+	// of failing over a live edge. birdFeedStatus is assigned just above; the closure
+	// is only called later (phase ticker / reconcile Observe), so it is set by then.
+	phaseTracker.SetBirdBusy(func() bool {
+		if birdFeedStatus == nil {
+			return false
+		}
+		fails, _ := birdFeedStatus()
+		return fails > 0
+	})
 	// Canary (soft-death §4.7/6.13) — see setupCanary.
 	canaryCleanup, err := setupCanary(cfg, recon, health, log)
 	if err != nil {
@@ -509,8 +521,10 @@ func runChaosHook(ctx context.Context, health *agent.HealthChecker, recon *agent
 // cleanup, when non-nil, closes the legacy path's BIRD client — main defers it.
 func setupBirdMaterializers(cfg agent.Config, log *slog.Logger) (*birdfeed.Feed, *agent.BirdApplier, func(), error) {
 	if cfg.BirdFeedMode == "api" {
-		feed := birdfeed.NewFeed(cfg.BirdAPISocket, log)
-		log.Info("bird control plane via api socket (incremental feed)", "socket", cfg.BirdAPISocket)
+		feed := birdfeed.NewFeed(cfg.BirdAPISocket, log,
+			birdfeed.WithPacing(cfg.BirdFeedMaxOpsPerPass, cfg.BirdFeedPace.Std()))
+		log.Info("bird control plane via api socket (incremental feed)", "socket", cfg.BirdAPISocket,
+			"feed_max_ops_per_pass", cfg.BirdFeedMaxOpsPerPass, "feed_pace", cfg.BirdFeedPace.Std())
 		return feed, nil, nil, nil
 	}
 	if cfg.BirdAnchorsInclude != "" && cfg.BirdFlowspecInclude != "" {

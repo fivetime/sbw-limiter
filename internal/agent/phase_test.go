@@ -18,10 +18,13 @@ func TestComputePhase(t *testing.T) {
 		{"socket lost → dead", PhaseInputs{SocketUp: false, EverConnected: true}, model.PhaseDead},
 		{"apply err → degraded", PhaseInputs{SocketUp: true, EverConnected: true, ApplyErr: errApply}, model.PhaseDegraded},
 		{"busy → reconciling", PhaseInputs{SocketUp: true, EverConnected: true, Pending: 5}, model.PhaseReconciling},
+		{"bird busy → reconciling", PhaseInputs{SocketUp: true, EverConnected: true, BirdBusy: true}, model.PhaseReconciling},
 		{"synced → ready", PhaseInputs{SocketUp: true, EverConnected: true}, model.PhaseReady},
 		// precedence
 		{"dead dominates", PhaseInputs{SocketUp: false, EverConnected: true, Pending: 5}, model.PhaseDead},
+		{"dead dominates bird-busy", PhaseInputs{SocketUp: false, EverConnected: true, BirdBusy: true}, model.PhaseDead},
 		{"apply-err beats busy", PhaseInputs{SocketUp: true, EverConnected: true, Pending: 5, ApplyErr: errApply}, model.PhaseDegraded},
+		{"apply-err beats bird-busy", PhaseInputs{SocketUp: true, EverConnected: true, BirdBusy: true, ApplyErr: errApply}, model.PhaseDegraded},
 	}
 	for _, c := range cases {
 		if got := ComputePhase(c.in); got != c.want {
@@ -66,5 +69,25 @@ func TestPhaseTracker(t *testing.T) {
 	conn.up = false
 	if p := pt.Tick(); p != model.PhaseDead {
 		t.Fatalf("socket lost = %q, want Dead", p)
+	}
+}
+
+// SetBirdBusy folds the bird-feed busy signal into the phase (§6.63): a synced
+// edge (no own deltas) whose bird is down/re-dumping reports Reconciling, not
+// Ready — so the server's hard-death grace rides out the bird restart. Sampled on
+// every recompute (Tick + Observe).
+func TestPhaseTrackerBirdBusy(t *testing.T) {
+	conn := &phaseConn{up: true}
+	pt := NewPhaseTracker(conn, nil)
+	pt.SetApplyState(0, nil) // own deltas drained → would be Ready
+
+	busy := true
+	pt.SetBirdBusy(func() bool { return busy })
+	if p := pt.Tick(); p != model.PhaseReconciling {
+		t.Fatalf("bird busy: Tick = %q, want Reconciling", p)
+	}
+	busy = false // bird caught up
+	if p := pt.Tick(); p != model.PhaseReady {
+		t.Fatalf("bird idle: Tick = %q, want Ready", p)
 	}
 }

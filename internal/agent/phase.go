@@ -19,6 +19,14 @@ type PhaseInputs struct {
 	EverConnected bool  // have we ever been SocketUp (startup-Pending vs lost-Dead)
 	Pending       int   // desired-actual deltas still to apply (>0 = busy applying)
 	ApplyErr      error // last reconcile pass error (a real failure, not slowness)
+	// BirdBusy is true while the bird api feed is failing/reconnecting — bird is down
+	// or re-dumping after a restart (§6.63 blind spot). The VPP socket + policer/
+	// classify backlog above are BLIND to bird-vpp, the process that actually stalls/
+	// crashes under a large anchor+flowspec push; without this a bird restart drains
+	// the agent's own deltas to 0 → Ready while bird's ctrl-tap is still down, so the
+	// server takes the FAST hard-death path and false-fails-over a live edge. Reporting
+	// Reconciling here makes the server's §6.63 grace ride out the bird restart.
+	BirdBusy bool
 }
 
 // ComputePhase reduces the facts to one phase. Pure + total — the whole point is to
@@ -33,8 +41,8 @@ func ComputePhase(in PhaseInputs) model.DataPlanePhase {
 		return model.PhasePending // startup / first connect not yet healthy
 	case in.ApplyErr != nil:
 		return model.PhaseDegraded // applies erroring (a real failure the agent observed)
-	case in.Pending > 0:
-		return model.PhaseReconciling // busy applying — a slow main thread is normal here
+	case in.Pending > 0 || in.BirdBusy:
+		return model.PhaseReconciling // busy applying (own deltas or bird still churning) — a slow main thread is normal here
 	default:
 		return model.PhaseReady // synced
 	}
@@ -54,6 +62,11 @@ type PhaseTracker struct {
 	pending       int
 	applyErr      error
 	phase         model.DataPlanePhase
+	// birdBusy (nil-safe) reports whether the bird api feed is failing/reconnecting
+	// (bird down or re-dumping) — folded into the phase so a bird restart reads as
+	// Reconciling, not Ready (§6.63 blind spot). Sampled on every recompute so both
+	// the reconcile Observe and the fast phase ticker pick it up.
+	birdBusy func() bool
 }
 
 // recomputeLocked recomputes the phase from the current cached inputs. mu held.
@@ -62,11 +75,16 @@ func (pt *PhaseTracker) recomputeLocked() {
 	if up {
 		pt.everConnected = true
 	}
+	birdBusy := false
+	if pt.birdBusy != nil {
+		birdBusy = pt.birdBusy()
+	}
 	next := ComputePhase(PhaseInputs{
 		SocketUp:      up,
 		EverConnected: pt.everConnected,
 		Pending:       pt.pending,
 		ApplyErr:      pt.applyErr,
+		BirdBusy:      birdBusy,
 	})
 	if next != pt.phase {
 		pt.log.Info("data-plane phase", "from", pt.phase, "to", next,
@@ -82,6 +100,17 @@ func NewPhaseTracker(conn Liveness, log *slog.Logger) *PhaseTracker {
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &PhaseTracker{conn: conn, log: log, phase: model.PhasePending}
+}
+
+// SetBirdBusy wires a bird-materialization busy signal — true while the api feed is
+// failing/reconnecting (bird down or re-dumping after a restart). While it returns
+// true the phase is Reconciling, so the server's §6.63 hard-death grace rides out a
+// bird restart instead of failing over a live edge. Call once at startup before the
+// phase tickers run. nil clears it (legacy: phase blind to bird-vpp).
+func (pt *PhaseTracker) SetBirdBusy(fn func() bool) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	pt.birdBusy = fn
 }
 
 // SetApplyState records the latest reconcile pass outcome (pending = desired-actual

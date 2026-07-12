@@ -46,6 +46,16 @@ type Feed struct {
 	nextHop6 netip.Addr                // v6 redirect target (for the 20-byte i6ec)
 	resync   bool
 
+	// Pacing (opt-in via WithPacing): flush + yield every maxOps frames so bird-vpp's
+	// vppfib drains between chunks instead of taking a whole (re)dump as one in-flight
+	// burst. maxOps<=0 = legacy (whole pass in one burst). lastConnect/connectStreak
+	// back off successive resyncs when bird reconnects rapidly (crash-looping). All
+	// feed-goroutine-only (apply runs on the single Run loop).
+	maxOps        int
+	pace          time.Duration
+	lastConnect   time.Time
+	connectStreak int
+
 	// Feed health for the report/metrics (read via Status from other goroutines).
 	// fails = CONSECUTIVE failed apply passes (connect/encode/flush); a sustained
 	// non-zero means traction convergence is silently stale — log-only was invisible
@@ -55,8 +65,29 @@ type Feed struct {
 	lastOK atomic.Int64 // unix ms of the last fully-applied (flushed+committed) pass; 0 = never
 }
 
+// reconnect-backoff bounds (WithPacing only): space out successive full resyncs
+// when bird reconnects within the window, growing per clustered reconnect up to max.
+const (
+	reconnectBackoffWindow = 5 * time.Second
+	reconnectBackoffStep   = 250 * time.Millisecond
+	reconnectBackoffMax    = 2 * time.Second
+)
+
+// FeedOption configures a Feed.
+type FeedOption func(*Feed)
+
+// WithPacing bounds the api feed to maxOps frames per flush, yielding pace between
+// chunks so a large (re)dump does not slam bird-vpp as one in-flight burst (the
+// 60K-churn os_panic amplifier). maxOps<=0 disables pacing (legacy one-burst pass).
+func WithPacing(maxOps int, pace time.Duration) FeedOption {
+	return func(f *Feed) {
+		f.maxOps = maxOps
+		f.pace = pace
+	}
+}
+
 // NewFeed wires a Feed over a fresh Client for the api socket path.
-func NewFeed(path string, log *slog.Logger) *Feed {
+func NewFeed(path string, log *slog.Logger, opts ...FeedOption) *Feed {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
@@ -69,6 +100,9 @@ func NewFeed(path string, log *slog.Logger) *Feed {
 		anchors: map[netip.Prefix][]byte{},
 		flows:   map[netip.Prefix]struct{}{},
 		resync:  true,
+	}
+	for _, o := range opts {
+		o(f)
 	}
 	// Bird-death wake (the bird-restart hole): the client's watcher detects the
 	// peer closing the socket (bird restart/stop) and wakes the feed, so the next
@@ -140,6 +174,7 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 		}
 		f.log.Info("bird feed: connected", "socket", f.path)
 		f.resync = true
+		f.backoffReconnect()
 	}
 
 	// Desired sets. Anchors (v4+v6) and flowspec (v4+v6) are all fed; the redirect
@@ -187,12 +222,43 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 		return ec4[:]
 	}
 
+	// Paced write: flush + yield every maxOps frames so bird-vpp's vppfib drains
+	// between chunks. Feeding a whole (re)dump as one in-flight burst overran bird-
+	// vpp's vapi accumulation → os_panic under 60K churn, and a bird restart re-
+	// dumped the whole set into the just-restarted bird, re-crashing it (the self-
+	// sustaining loop). write() flushes mid-pass, so a flush error there means bird
+	// went away — reconnect + full resync next pass. maxOps<=0 = one-burst (legacy).
+	n := 0
+	write := func(frame []byte) error {
+		f.client.write(frame)
+		if f.maxOps <= 0 {
+			return nil
+		}
+		if n++; n >= f.maxOps {
+			if err := f.client.flush(); err != nil {
+				return err
+			}
+			n = 0
+			if f.pace > 0 {
+				time.Sleep(f.pace)
+			}
+		}
+		return nil
+	}
+
 	// A change to EITHER redirect next-hop must re-announce every flow of that
 	// family (the EC is an attribute, not part of the diff key), so resync on both.
+	var werr error
 	if f.resync || st.RedirectNextHop != f.nextHop || st.RedirectNextHopV6 != f.nextHop6 {
-		f.fullResync(desA, desF, ecFor)
+		werr = f.fullResync(desA, desF, ecFor, write)
 	} else {
-		f.incremental(desA, desF, ecFor)
+		werr = f.incremental(desA, desF, ecFor, write)
+	}
+	if werr != nil {
+		f.log.Warn("bird feed: paced flush failed mid-pass, will reconnect + resync", "err", werr)
+		f.client.close()
+		f.resync = true
+		return werr
 	}
 
 	if err := f.client.flush(); err != nil {
@@ -209,39 +275,83 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 
 // fullResync: HELLO + all current routes + EOR. The proto marks everything stale
 // on HELLO, the re-announces clear it, EOR prunes whatever the agent dropped.
-// ecFor picks the redirect EC for a flow by its source-prefix family.
-func (f *Feed) fullResync(desA map[netip.Prefix][]byte, desF map[netip.Prefix]struct{}, ecFor func(netip.Prefix) []byte) {
-	f.client.write(frameHello())
+// ecFor picks the redirect EC for a flow by its source-prefix family. write paces
+// the stream (flush + yield per chunk) and returns the first mid-pass flush error.
+func (f *Feed) fullResync(desA map[netip.Prefix][]byte, desF map[netip.Prefix]struct{}, ecFor func(netip.Prefix) []byte, write func([]byte) error) error {
+	if err := write(frameHello()); err != nil {
+		return err
+	}
 	for p, attrs := range desA {
-		f.client.write(frameAnchor(opAdd, p, attrs))
+		if err := write(frameAnchor(opAdd, p, attrs)); err != nil {
+			return err
+		}
 	}
 	for p := range desF {
-		f.client.write(frameFlow(opAdd, p, ecFor(p)))
+		if err := write(frameFlow(opAdd, p, ecFor(p))); err != nil {
+			return err
+		}
 	}
-	f.client.write(frameEOR())
+	if err := write(frameEOR()); err != nil {
+		return err
+	}
 	f.resync = false
+	return nil
 }
 
-// incremental: only the diff vs the last-fed snapshot (O(delta) into bird).
-func (f *Feed) incremental(desA map[netip.Prefix][]byte, desF map[netip.Prefix]struct{}, ecFor func(netip.Prefix) []byte) {
+// incremental: only the diff vs the last-fed snapshot (O(delta) into bird). write
+// paces the stream and returns the first mid-pass flush error.
+func (f *Feed) incremental(desA map[netip.Prefix][]byte, desF map[netip.Prefix]struct{}, ecFor func(netip.Prefix) []byte, write func([]byte) error) error {
 	for p, attrs := range desA {
 		if prev, ok := f.anchors[p]; !ok || !bytes.Equal(prev, attrs) {
-			f.client.write(frameAnchor(opAdd, p, attrs)) // new, or communities changed (upsert)
+			if err := write(frameAnchor(opAdd, p, attrs)); err != nil { // new, or communities changed (upsert)
+				return err
+			}
 		}
 	}
 	for p := range f.anchors {
 		if _, ok := desA[p]; !ok {
-			f.client.write(frameAnchor(opDel, p, nil))
+			if err := write(frameAnchor(opDel, p, nil)); err != nil {
+				return err
+			}
 		}
 	}
 	for p := range desF {
 		if _, ok := f.flows[p]; !ok {
-			f.client.write(frameFlow(opAdd, p, ecFor(p)))
+			if err := write(frameFlow(opAdd, p, ecFor(p))); err != nil {
+				return err
+			}
 		}
 	}
 	for p := range f.flows {
 		if _, ok := desF[p]; !ok {
-			f.client.write(frameFlow(opDel, p, ecFor(p))) // ec ignored on DEL
+			if err := write(frameFlow(opDel, p, ecFor(p))); err != nil { // ec ignored on DEL
+				return err
+			}
 		}
 	}
+	return nil
+}
+
+// backoffReconnect spaces out successive full resyncs when bird reconnects rapidly
+// (crash-looping): re-dumping the whole homed set the instant the socket returns can
+// itself re-crash a just-restarted bird. Feed-goroutine-only state (apply runs on
+// the single Run loop). No-op unless pacing is enabled.
+func (f *Feed) backoffReconnect() {
+	if f.maxOps <= 0 {
+		return
+	}
+	now := time.Now()
+	if !f.lastConnect.IsZero() && now.Sub(f.lastConnect) < reconnectBackoffWindow {
+		f.connectStreak++
+		d := time.Duration(f.connectStreak) * reconnectBackoffStep
+		if d > reconnectBackoffMax {
+			d = reconnectBackoffMax
+		}
+		f.log.Warn("bird feed: rapid reconnect, backing off before resync",
+			"streak", f.connectStreak, "delay", d)
+		time.Sleep(d)
+	} else {
+		f.connectStreak = 0
+	}
+	f.lastConnect = time.Now()
 }

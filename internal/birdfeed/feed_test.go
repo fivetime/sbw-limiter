@@ -14,12 +14,13 @@ type fakeSink struct {
 	conn     bool
 	frames   [][]byte
 	flushErr error // injected flush failure (nil = success)
+	flushes  int   // count of flush() calls (pacing test)
 }
 
 func (s *fakeSink) connected() bool { return s.conn }
 func (s *fakeSink) connect() error  { s.conn = true; return nil }
 func (s *fakeSink) write(f []byte)  { s.frames = append(s.frames, append([]byte(nil), f...)) }
-func (s *fakeSink) flush() error    { return s.flushErr }
+func (s *fakeSink) flush() error    { s.flushes++; return s.flushErr }
 func (s *fakeSink) close()          { s.conn = false }
 
 func newTestFeed() (*Feed, *fakeSink) {
@@ -297,5 +298,48 @@ func TestFeedAnchorCarriesCommunities(t *testing.T) {
 	}
 	if len(s.frames) != 0 {
 		t.Fatalf("steady state must be zero-diff, wrote %d frames", len(s.frames))
+	}
+}
+
+// Pacing (#1, the 60K-churn os_panic amplifier fix): a resync larger than maxOps
+// flushes mid-pass (bounding bird-vpp's in-flight between chunks) while still
+// writing every frame. maxOps=2 over HELLO+5 ADD+EOR (7 frames) = 3 mid-pass
+// flushes + 1 final flush.
+func TestFeedPacingChunksResync(t *testing.T) {
+	f, s := newTestFeed()
+	f.maxOps = 2 // pace=0: no sleep, fast test
+	st := model.EdgeDesiredState{Anchors: []model.Anchor{
+		anchor("11.0.0.0/32"), anchor("11.0.0.1/32"), anchor("11.0.0.2/32"),
+		anchor("11.0.0.3/32"), anchor("11.0.0.4/32"),
+	}}
+	if err := f.apply(st); err != nil {
+		t.Fatal(err)
+	}
+	add, del, hello, eor := countOps(s.frames)
+	if hello != 1 || eor != 1 || add != 5 || del != 0 {
+		t.Fatalf("paced resync frames: hello=%d eor=%d add=%d del=%d (want 1/1/5/0)", hello, eor, add, del)
+	}
+	if s.flushes != 4 {
+		t.Fatalf("flushes=%d, want 4 (3 mid-pass chunks of 2 + 1 final)", s.flushes)
+	}
+}
+
+// A mid-pass paced flush failure (bird went away during a big resync) must return
+// the error, tear the connection down, and keep resync armed for the next pass.
+func TestFeedPacingMidPassFlushErrorResyncs(t *testing.T) {
+	f, s := newTestFeed()
+	f.maxOps = 2
+	s.flushErr = errors.New("bird gone")
+	st := model.EdgeDesiredState{Anchors: []model.Anchor{
+		anchor("11.0.0.0/32"), anchor("11.0.0.1/32"), anchor("11.0.0.2/32"),
+	}}
+	if err := f.apply(st); err == nil {
+		t.Fatal("want error from the mid-pass flush")
+	}
+	if !f.resync {
+		t.Fatal("resync must stay armed after a mid-pass flush error")
+	}
+	if s.connected() {
+		t.Fatal("client must be closed after a mid-pass flush error")
 	}
 }
