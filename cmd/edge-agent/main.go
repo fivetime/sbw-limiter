@@ -187,13 +187,6 @@ func main() {
 		// (③ probe verdict) at report time so the server routes a DETERMINATE fault to its
 		// fast failover (§4.2.4) instead of the blanket soft-death debounce.
 		agent.WithFault(agent.NewFaultSensor(conn, cfg.PolicerInterfaces, probeBroken, vppLiveDead, log)),
-		// Member presence for the server's member-up/down signal: the member interface's
-		// VPP ARP/ND neighbor table. Build reads the CACHED set (Latest), never a live
-		// dump: the dump is a VPP binary-API call that blocks on an unresponsive/wedged
-		// VPP until the reply timeout, and it must not stall the report — least of all
-		// the event-driven vpp-gone report racing to the server (§6.44 live: it added ~8s
-		// to failover). A background loop (below) refreshes the cache; report/liveness hot
-		// paths stay dump-free. (This ObservedMembers source is owed a rework — see the
 		// Bird-feed health (anchors/flowspec traction convergence): sustained apply
 		// failure was log-only — surface it so the server can emit the
 		// bird-feed-degraded BSS event (policy-integrity, not a death signal).
