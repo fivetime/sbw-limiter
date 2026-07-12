@@ -22,6 +22,7 @@ import (
 	"net/netip"
 
 	"github.com/fivetime/sbw-contract/model"
+	"github.com/fivetime/sbw-limiter/internal/redirectec"
 )
 
 // Wire constants — keep in lockstep with bird proto/api/api.h.
@@ -170,14 +171,7 @@ func frameFlow(op uint8, src netip.Prefix, ec []byte) []byte {
 // [0x01, 0x0c, a, b, c, d, 0x00, 0x00] with a.b.c.d = nextHop, C=0 (redirect).
 // Byte-identical to flowspec.redirectIP4ExtCommunity so vppfdp/R parse unchanged.
 // nextHop must be IPv4 (caller validates).
-func redirectIP4EC(nextHop netip.Addr) [8]byte {
-	var ec [8]byte
-	ec[0], ec[1] = 0x01, 0x0c
-	b4 := nextHop.As4()
-	copy(ec[2:6], b4[:])
-	// ec[6], ec[7] = 0 (local-admin, C=0 = redirect not copy)
-	return ec
-}
+func redirectIP4EC(nextHop netip.Addr) [8]byte { return redirectec.IP4(nextHop) }
 
 // redirectI6EC encodes the standard redirect-to-IPv6 transitive IPv6-Address-
 // Specific ext-community (draft-ietf-idr-flowspec-redirect-ip: type/sub-type
@@ -186,11 +180,4 @@ func redirectIP4EC(nextHop netip.Addr) [8]byte {
 // local-admin(2 BE)] — with local-admin 0 (C=0 = redirect). Byte-identical to
 // what flowspec.Render's `i6ec(0x000c, nextHop6, 0)` produces, so vppfdp/R parse
 // it unchanged. nextHop6 must be IPv6 (caller validates).
-func redirectI6EC(nextHop6 netip.Addr) [20]byte {
-	var ec [20]byte
-	binary.BigEndian.PutUint16(ec[0:2], 0x000c) // type 0x00 (IPv6-addr-specific) + sub-type 0x0c (redirect)
-	ip := nextHop6.As16()
-	copy(ec[2:18], ip[:])
-	// ec[18:20] = 0 (local-admin, C=0 = redirect not copy)
-	return ec
-}
+func redirectI6EC(nextHop6 netip.Addr) [20]byte { return redirectec.I6(nextHop6) }

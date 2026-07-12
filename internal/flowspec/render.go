@@ -30,6 +30,7 @@ import (
 	"strings"
 
 	"github.com/fivetime/sbw-contract/model"
+	"github.com/fivetime/sbw-limiter/internal/redirectec"
 )
 
 // Protocol4 is the static protocol name owning the v4 FlowSpec include. The
@@ -145,18 +146,11 @@ func collectSrcs(redirects []model.FlowRedirect, wantV6 bool) ([]netip.Prefix, e
 	return srcs, nil
 }
 
-// redirectIP4ExtCommunity encodes the standard redirect-to-IPv4 transitive
-// ext-community from draft-ietf-idr-flowspec-redirect-ip (type 0x01 IPv4-Address-
-// Specific, sub-type 0x0c) for nextHop into its two 32-bit halves, as BIRD's
-// `(generic, hi, lo)` form. The 8 bytes are [0x01, 0x0c, a, b, c, d, 0x00, 0x00]
-// where a.b.c.d = nextHop (global-admin) and the trailing 0x0000 is the local-admin
-// with C=0 (redirect, not copy). vppfdp consumes exactly this: e.g. 10.0.0.5 →
-// 0x010c0a00, 0x00050000. NOT RFC 8955's rt-redirect (sub 0x08 → redirect-to-VRF),
-// which is a different action. nextHop must be IPv4 (callers validate).
+// redirectIP4ExtCommunity returns the redirect-to-IPv4 ext-community as BIRD's
+// `(generic, hi, lo)` form — the two 32-bit halves of the canonical 8-byte layout
+// (redirectec.IP4, the single source of truth shared with the api-feed path). e.g.
+// 10.0.0.5 → 0x010c0a00, 0x00050000. nextHop must be IPv4 (callers validate).
 func redirectIP4ExtCommunity(nextHop netip.Addr) (hi, lo uint32) {
-	b4 := nextHop.As4()
-	ip := binary.BigEndian.Uint32(b4[:])
-	hi = 0x010c0000 | (ip >> 16)
-	lo = (ip & 0xffff) << 16
-	return hi, lo
+	ec := redirectec.IP4(nextHop)
+	return binary.BigEndian.Uint32(ec[0:4]), binary.BigEndian.Uint32(ec[4:8])
 }
