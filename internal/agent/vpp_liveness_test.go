@@ -225,3 +225,41 @@ func TestVppLivenessStaleReconnectRecovers(t *testing.T) {
 		t.Fatalf("want a final alive transition, got %v", got)
 	}
 }
+
+// §6.67 wall-①: a stalled heartbeat while materializing (busy) is a BUSY main
+// thread, not a wedge — the verdict is held; lastAdvance keeps aging, so a stall
+// that outlives the busy window is declared on the first ungated check.
+func TestVppLivenessBusyHoldsWedge(t *testing.T) {
+	p, read, transitions, now := newLivenessHarness(3 * time.Second)
+	busy := false
+	p.BindBusy(func() bool { return busy })
+
+	beat := uint64(7)
+	*read = func() (uint64, error) { return beat, nil }
+	p.check() // first read → alive baseline
+
+	// Frozen heartbeat under busy for far past the grace → still alive.
+	busy = true
+	for i := 0; i < 10; i++ {
+		*now = now.Add(2 * time.Second)
+		p.check()
+	}
+	if p.Dead() {
+		t.Fatal("stalled heartbeat while busy must not declare a wedge")
+	}
+	// Busy ends with the heartbeat STILL frozen (grace long elapsed) → immediate wedge.
+	busy = false
+	p.check()
+	if !p.Dead() {
+		t.Fatal("stall persisting past the busy window must declare the wedge at once")
+	}
+	if len(*transitions) == 0 || !(*transitions)[len(*transitions)-1] {
+		t.Fatal("expected a dead transition")
+	}
+	// Heartbeat resumes → recovers.
+	beat++
+	p.check()
+	if p.Dead() {
+		t.Fatal("advancing heartbeat must recover")
+	}
+}

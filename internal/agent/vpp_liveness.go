@@ -44,6 +44,19 @@ type VppLiveness struct {
 	reconnectEvery time.Duration
 	lastReconnect  time.Time
 
+	// busy, when bound, reports the edge is mid-materialization (phase Reconciling,
+	// §6.67 wall-①): a GENUINELY BUSY (not wedged) main thread starves the probe
+	// plugin's cooperative process node past wedgeGrace (3s), so the frozen heartbeat
+	// reads as a wedge while VPP is merely grinding a 100K-route install (observed at
+	// 120K: fault_kind=1 soft-deaths mid-materialization). While busy, a stalled
+	// heartbeat does NOT declare a wedge; lastAdvance is NOT reset, so the moment the
+	// edge leaves Reconciling with the heartbeat still frozen the wedge fires
+	// immediately. A TRULY wedged VPP mid-materialization errors the reconcile pass
+	// (5s reply timeouts) → phase flips Degraded → busy()==false → the gate opens —
+	// the phase model closes the loop, a real wedge is delayed, never lost. nil →
+	// ungated (legacy).
+	busy func() bool
+
 	// loop-local (only Run's goroutine touches these)
 	haveBeat    bool
 	lastBeat    uint64
@@ -51,6 +64,10 @@ type VppLiveness struct {
 
 	dead atomic.Bool
 }
+
+// BindBusy wires the materialization-busy signal (see the busy field doc). Call
+// before Run.
+func (p *VppLiveness) BindBusy(busy func() bool) { p.busy = busy }
 
 // NewVppLiveness builds a liveness monitor. readBeat reads /probe/heartbeat
 // (e.g. StatsReader.ReadGauge wrapped); disconnected classifies a read error as
@@ -130,6 +147,13 @@ func (p *VppLiveness) check() {
 	// wedge drag on (§6.44 live: SIGSTOP took 16s instead of ~3s). Only arm this
 	// once a beat has ever been seen, so a fresh VPP that hasn't registered the
 	// gauge (or an image without it) is never false-positived at startup.
+	// Mid-materialization a stalled heartbeat is a BUSY main thread, not a wedge
+	// (§6.67 wall-①) — hold the verdict; lastAdvance keeps aging, so if the stall
+	// persists past the busy window the wedge fires on the first ungated check.
+	if p.busy != nil && p.busy() {
+		p.log.Debug("vpp liveness: heartbeat stalled while materializing — busy, not wedged (verdict held)")
+		return
+	}
 	if p.haveBeat && p.now().Sub(p.lastAdvance) >= p.wedgeGrace {
 		p.set(true, "heartbeat not advancing past grace (main-thread wedge)")
 		// Stale-segment recovery: while wedged, periodically rebuild the stats

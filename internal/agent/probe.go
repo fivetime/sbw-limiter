@@ -38,6 +38,17 @@ type ForwardingProbe struct {
 	// the probe DISARMS and re-arms on first reachability, exactly like boot.
 	gen     func() uint64
 	lastGen uint64 // loop-local (only the Run goroutine compares/updates after Bind)
+
+	// busy, when bound, reports the edge is mid-materialization (phase Reconciling,
+	// §6.67 wall-①): a saturated VPP main thread starves the probe plugin's process
+	// node, so the reachability gauge goes stale/zero WITHOUT the path being broken
+	// (observed at 120K: 54-72s false black-hole windows → determinate-fault fast
+	// failover → churn storm). While busy a zero-reach round is INCONCLUSIVE — same
+	// treatment as a transport error: logged, counter untouched. A REAL black-hole
+	// that starts during materialization is declared once the edge leaves Reconciling
+	// (drained → Ready, or a truly wedged VPP errors the reconcile → Degraded), so ③
+	// is delayed by the busy window, never lost. nil → ungated (legacy).
+	busy func() bool
 }
 
 // NewForwardingProbe builds a probe. ping is one round (e.g. conn.Ping wrapped to return
@@ -62,6 +73,11 @@ func (p *ForwardingProbe) BindDataplaneGeneration(gen func() uint64) {
 	p.gen = gen
 	p.lastGen = gen()
 }
+
+// BindBusy wires the materialization-busy signal (phase Reconciling — see the busy
+// field doc): while busy, zero-reach rounds are inconclusive and do not count toward
+// the black-hole threshold. Call before Run.
+func (p *ForwardingProbe) BindBusy(busy func() bool) { p.busy = busy }
 
 // Run probes every interval until ctx is cancelled. A transport error (probe could not
 // run — busy main thread, channel error) is NEITHER a healthy round NOR a forwarding
@@ -115,7 +131,15 @@ func (p *ForwardingProbe) round() {
 		// a genuinely dead-from-boot edge is caught by other signals (vpp-gone,
 		// registration, link-down).
 		return
-	default: // recv == 0 after having been healthy → a real regression this round
+	default: // recv == 0 after having been healthy → a regression THIS round…
+		// …unless the edge is mid-materialization: a saturated main thread starves
+		// the probe plugin, so the gauge lies (§6.67 wall-①). Inconclusive — same as
+		// a transport error; the counter neither advances nor resets.
+		if p.busy != nil && p.busy() {
+			p.log.Info("forwarding probe: zero-reach while materializing — inconclusive, not counted",
+				"fails_held_at", p.fails)
+			return
+		}
 		p.fails++
 		if p.fails >= p.k && !p.broken.Load() {
 			p.log.Warn("forwarding probe: path black-holed", "consecutive_fails", p.fails, "threshold", p.k)

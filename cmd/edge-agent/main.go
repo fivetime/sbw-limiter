@@ -154,15 +154,21 @@ func main() {
 		// matches the feed's own retry cadence.
 	})
 
+	// Materialization-busy signal (§6.67 wall-①): while the edge is Reconciling, the
+	// VPP-layer sensors below treat their own starvation (frozen heartbeat, stale
+	// probe gauge) as busy-not-dead instead of declaring faults. A truly wedged VPP
+	// errors the reconcile → phase Degraded → the gates open (phase model closes it).
+	sensorBusy := func() bool { return phaseTracker.Phase() == model.PhaseReconciling }
+
 	// ③ forwarding-broken (§4.2.7/§4.2.8) — see setupForwardingProbe.
-	probeBroken, probeCleanup := setupForwardingProbe(ctx, cfg, conn, log)
+	probeBroken, probeCleanup := setupForwardingProbe(ctx, cfg, conn, log, sensorBusy)
 	if probeCleanup != nil {
 		defer probeCleanup()
 	}
 
 	// Stats-segment VPP liveness (§6.44) — see setupVppLiveness. OnTransition + Run
 	// are wired below, after the reporter exists.
-	vppLive, vppLiveDead, liveCleanup := setupVppLiveness(cfg, log)
+	vppLive, vppLiveDead, liveCleanup := setupVppLiveness(cfg, log, sensorBusy)
 	if liveCleanup != nil {
 		defer liveCleanup()
 	}
@@ -626,7 +632,7 @@ func setupCanary(cfg agent.Config, recon *agent.Reconciler, health *agent.Health
 // up as a stats disconnect (process death path), not a stall, and is absorbed by
 // the server's restartGrace like any vpp-gone. cleanup closes the (current)
 // stats reader — main defers it at the call site.
-func setupVppLiveness(cfg agent.Config, log *slog.Logger) (vppLive *agent.VppLiveness, dead func() bool, cleanup func()) {
+func setupVppLiveness(cfg agent.Config, log *slog.Logger, busy func() bool) (vppLive *agent.VppLiveness, dead func() bool, cleanup func()) {
 	liveStats, lerr := vpp.NewStatsReader(cfg.VPPStatsSocket)
 	if lerr != nil {
 		log.Error("vpp liveness disabled: dedicated stats connect failed (falling back to conn.Healthy)",
@@ -646,6 +652,7 @@ func setupVppLiveness(cfg agent.Config, log *slog.Logger) (vppLive *agent.VppLiv
 			return r.ReadGauge("/probe/heartbeat")
 		},
 		vpp.IsStatsDisconnected, time.Second, 3*time.Second, log)
+	vppLive.BindBusy(busy) // §6.67 wall-①: a stalled heartbeat while Reconciling is busy, not wedged
 	vppLive.OnStaleReconnect(func() {
 		nr, rerr := vpp.NewStatsReader(cfg.VPPStatsSocket)
 		if rerr != nil {
@@ -675,7 +682,7 @@ func setupVppLiveness(cfg agent.Config, log *slog.Logger) (vppLive *agent.VppLiv
 //
 // Disabled (nil, nil) if no target set. cleanup, when non-nil, closes the probe's
 // dedicated stats reader — main defers it at the call site.
-func setupForwardingProbe(ctx context.Context, cfg agent.Config, conn *vpp.Conn, log *slog.Logger) (broken func() bool, cleanup func()) {
+func setupForwardingProbe(ctx context.Context, cfg agent.Config, conn *vpp.Conn, log *slog.Logger, busy func() bool) (broken func() bool, cleanup func()) {
 	if cfg.ForwardingProbeTarget == "" {
 		return nil, nil
 	}
@@ -743,6 +750,7 @@ func setupForwardingProbe(ctx context.Context, cfg agent.Config, conn *vpp.Conn,
 		// reachability: the post-restart FIB-rebuild window (bird/vppfib
 		// re-feed, tens of seconds) must not read as a black-hole (§6.44).
 		fp.BindDataplaneGeneration(conn.Generation)
+		fp.BindBusy(busy) // §6.67 wall-①: zero-reach while Reconciling is inconclusive
 		go fp.Run(ctx)
 		broken = fp.Broken
 	}

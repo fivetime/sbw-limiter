@@ -128,3 +128,37 @@ func TestForwardingProbeDisarmsOnVPPRestart(t *testing.T) {
 		t.Fatal("a real post-rebuild regression must still break")
 	}
 }
+
+// §6.67 wall-①: while the edge is materializing (busy), a zero-reach round is
+// INCONCLUSIVE — the counter holds, no black-hole is declared no matter how long the
+// busy window lasts; a real regression is declared once busy clears.
+func TestForwardingProbeBusyGatesZeroReach(t *testing.T) {
+	var recv int
+	busy := false
+	p := NewForwardingProbe(func() (int, error) { return recv, nil }, 0, 3, nil)
+	p.BindBusy(func() bool { return busy })
+
+	recv = 3
+	p.round() // arm (everHealthy)
+
+	// Busy + zero-reach ×10 → counter held, never broken (was the 54-72s false window).
+	busy = true
+	recv = 0
+	for i := 0; i < 10; i++ {
+		p.round()
+	}
+	if p.Broken() {
+		t.Fatal("zero-reach while busy must be inconclusive, not a black-hole")
+	}
+	// Busy ends, path genuinely still dead → K rounds then broken (delayed, not lost).
+	busy = false
+	p.round()
+	p.round()
+	if p.Broken() {
+		t.Fatal("2 fails < K=3 after busy cleared must not break yet")
+	}
+	p.round()
+	if !p.Broken() {
+		t.Fatal("real black-hole after busy window must be declared")
+	}
+}
