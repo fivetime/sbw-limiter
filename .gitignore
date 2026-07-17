@@ -1,4 +1,5 @@
 /dist/
+/edge-agent
 *.test
 *.out
 *.prof

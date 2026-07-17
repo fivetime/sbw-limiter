@@ -16,8 +16,9 @@ import (
 //	  *DesiredStore (Accept / ControllerUp / ControllerDown, T-505); the
 //	  Reconciler reads it via DesiredStore.Desired (fail-static §6.4).
 //	UPLINK   (agent→controller): the Reporter assembles an EdgeReport from the
-//	  soft-death HealthChecker (B-05) + capacity/metering sources and sends it
-//	  via a ReportSink.
+//	  soft-death HealthChecker (B-05) + capacity sources and sends it via a
+//	  ReportSink. (Metering does not ride the EdgeReport: it goes out on its
+//	  own Kafka loop — see metering.go.)
 
 // ReportSink is the uplink transport: it delivers one EdgeReport to the
 // controller. Implemented by the distribution layer; the agent knows only this.
@@ -60,7 +61,7 @@ type PoolHashFunc func() uint64
 const wakeMinInterval = time.Second
 
 // Reporter assembles the agent's EdgeReport uplink (B-03) from the soft-death
-// health (B-05) plus capacity/metering sources, and sends it periodically.
+// health (B-05) plus capacity sources, and sends it periodically.
 type Reporter struct {
 	edgeID        model.EdgeID
 	health        HealthSource

@@ -88,8 +88,6 @@ func (m *Metrics) RecordHealth(r model.HealthReport) {
 	m.vppConnected.Set(boolGauge(r.VPPConnected))
 }
 
-// RecordPhase folds the current data-plane liveness phase into the gauge. Driven by
-// the phase probe ticker (more frequent than a reconcile pass).
 // RecordBirdFeed folds the bird-materialization health (birdfeed.Feed.Status /
 // BirdApplier.Status) into gauges: consecutive failed passes + last-success time.
 func (m *Metrics) RecordBirdFeed(fails, lastOKUnixMs int64) {
@@ -100,6 +98,8 @@ func (m *Metrics) RecordBirdFeed(fails, lastOKUnixMs int64) {
 	m.birdFeedLastOK.Set(float64(lastOKUnixMs) / 1000.0)
 }
 
+// RecordPhase folds the current data-plane liveness phase into the gauge. Driven by
+// the phase probe ticker (more frequent than a reconcile pass).
 func (m *Metrics) RecordPhase(p model.DataPlanePhase) {
 	if m == nil {
 		return

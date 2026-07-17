@@ -3,9 +3,8 @@
 # sbw-limiter / edge-agent — the L-node agent. Talks to VPP (govpp) over
 # /run/vpp/api.sock and to bird over /run/bird.ctl PURELY via sockets — it does
 # NOT shell out to vppctl/birdc, so it needs NEITHER bird NOR VPP binaries in its
-# image. The ONLY external command it runs is `ip route` (iproute2), for the
-# three-way route-count drift check (T-502). So: static Go binary + iproute2.
-# NOT based on the bird-vpp image.
+# image. It runs no external commands at all — pure sockets, so a static Go
+# binary suffices. NOT based on the bird-vpp image.
 #
 # Co-location is a DEPLOYMENT concern, not an image one: run this beside the VPP
 # (and bird) it drives, sharing /run/vpp (+ the bird socket) via a volume — e.g.
@@ -49,7 +48,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
       -o /out/edge-agent ./cmd/edge-agent
 
 ###############################################################################
-# runtime — alpine + iproute2 (the `ip route` dep) + CA certs. No bird/VPP.
+# runtime — alpine + CA certs. No bird/VPP, no external commands.
 ###############################################################################
 FROM alpine:3.23
 ARG VERSION=dev
@@ -58,7 +57,7 @@ LABEL org.opencontainers.image.title="sbw-edge-agent" \
       org.opencontainers.image.source="https://github.com/fivetime/sbw-limiter" \
       org.opencontainers.image.version="${VERSION}"
 
-RUN apk add --no-cache iproute2 ca-certificates
+RUN apk add --no-cache ca-certificates
 COPY --from=builder /out/edge-agent /usr/local/bin/edge-agent
 # metrics 9102 (edge_id-labelled). Config is via BWPOOL_* env (see compose).
 EXPOSE 9102

@@ -46,7 +46,7 @@ type Conn struct {
 
 	// gen counts healthy (re)connects: 1 on first connect, +1 each reconnect.
 	// A reconnect means VPP may have restarted and lost all data-plane state
-	// (policers/classify/ABF) — routes alone are re-dumped by linux-cp, but our
+	// (policers/classify) — routes alone are re-dumped by linux-cp, but our
 	// rules are not (T-503, §5/§7). reconnect notifies the reconcile loop so it
 	// resets its caches and reinstalls everything.
 	gen       atomic.Uint64

@@ -288,7 +288,7 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// Bootstrap returns the controller endpoints the homing director boots from:
+// Bootstrap returns the server endpoint list the agent dials (first entry used):
 // ControllerEndpoints if set, else the single ControllerEndpoint. Empty only when
 // neither is configured.
 func (c Config) Bootstrap() []string {

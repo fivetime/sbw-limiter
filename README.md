@@ -9,7 +9,7 @@
 - 连接 controller gRPC，注册 edge、订阅 desired state、发送 `EdgeReport`。
 - 维护 fail-static：controller 不可达时保留最后一次有效期望状态，不主动清空数据面。
 - 将 `PolicerSpec` 和 `ClassifySession` 物化到 VPP policer/classify，共享桶限速。
-- 将 `Anchor` 和 `FlowRedirect` 渲染成 BIRD include，并用 check/configure/rollback 方式应用。
+- 将 `Anchor` 和 `FlowRedirect` 喂给 BIRD：生产主路径为 bird api feed(`bird_feed_mode=api`,经 bird-vpp `api` proto 增量喂路由,无 configure);legacy 退路(配置未设 api 时的代码默认)为渲染 include 文件 + check/configure/rollback。
 - 通过 reconcile loop 自愈 VPP 重启、规则漂移和 in-memory index 丢失。
 - 可选读取 VPP stats segment，把 policer 计量样本推送到 Kafka/Redpanda。
 - 可选发布/撤销 canary route，配合 controller 识别软死。
@@ -20,8 +20,8 @@
 - `internal/agent/`：desired store、reconcile 主循环、delta apply、health、report、metering。
 - `internal/grpcclient/`：agent 侧直连 server 的 gRPC client(register/subscribe/report)。
 - `internal/vpp/`：govpp 物化 policer、classify、interface、stats。
-- `internal/anchors/`、`internal/flowspec/`、`internal/bird/`：BIRD include 渲染和 reload。
-- `internal/accounting/`：路由/计数对账辅助。
+- `internal/anchors/`、`internal/flowspec/`、`internal/bird/`：BIRD include 渲染和 reload(legacy configure 路径)。
+- `internal/birdfeed/`：bird api feed——经 bird-vpp `api` proto socket 增量喂 anchors/FlowSpec(生产主路径)。
 - `internal/binapi/`：VPP binary API generated bindings。
 - `deploy/systemd/`、`deploy/vpp/`、`docker/`、`configs/`：部署示例。
 
@@ -44,8 +44,10 @@
 - `capacity_bps` / `BWPOOL_CAPACITY_BPS`：edge NIC 线速，controller 使用其 90% 作为售卖容量。
 - `vpp_api_socket` / `BWPOOL_VPP_API_SOCKET`：VPP binary API socket。
 - `bird_socket_path` / `BWPOOL_BIRD_SOCKET`：BIRD control socket。
-- `bird_anchors_include` / `BWPOOL_BIRD_ANCHORS_INCLUDE`：agent 管理的 anchors include。
-- `bird_flowspec_include` / `BWPOOL_BIRD_FLOWSPEC_INCLUDE`：agent 管理的 FlowSpec include。
+- `bird_feed_mode` / `BWPOOL_BIRD_FEED`：anchors/FlowSpec 喂给 BIRD 的方式。`api` = 经 bird-vpp `api` proto 增量喂路由(生产/lab 部署均显式设为 api);未设时走 legacy include+configure 退路。
+- `bird_api_socket` / `BWPOOL_BIRD_API_SOCKET`：bird api proto socket,默认 `/run/bird/api.sock`。
+- `bird_anchors_include` / `BWPOOL_BIRD_ANCHORS_INCLUDE`：agent 管理的 anchors include(legacy 路径)。
+- `bird_flowspec_include` / `BWPOOL_BIRD_FLOWSPEC_INCLUDE`：agent 管理的 FlowSpec include(legacy 路径)。
 - `policer_interfaces` / `BWPOOL_POLICER_INTERFACES`：需要挂 policer-classify chain 的 VPP 接口。
 - `metrics_listen_addr` / `BWPOOL_METRICS_LISTEN_ADDR`：Prometheus `/metrics`。
 - `canary_include`、`canary_prefix`、`canary_lc`：软死 canary 配置。
@@ -65,7 +67,7 @@ go run ./cmd/edge-agent -config configs/agent.example.json
 
 ```bash
 cd docker
-CONTROLLER_ENDPOINTS=host.docker.internal:1791 docker compose up --build
+CONTROLLER_ENDPOINTS=host.docker.internal:1792 docker compose up --build
 ```
 
 这个 compose 只覆盖 VPP/policer 半边；完整 L 节点还需要 BIRD 配置和 include 路径。
@@ -77,7 +79,7 @@ controller 推送两类主要指令：
 - `DESIRED_STATE`：完整 per-edge 快照，用于冷启动、重连、drift resync 和兜底恢复。
 - `DESIRED_DELTA`：按 pool 变化的增量热路径，用于减少大规模 pool 变更时的 O(N) 重渲染。
 
-agent 接收后写入 `DesiredStore`，唤醒 reconcile。VPP 规则由 `internal/agent` 和 `internal/vpp` 物化；BIRD anchors/FlowSpec 由 `BirdApplier` 使用 atomic write、`birdc configure check`、reload、rollback 纪律应用。
+agent 接收后写入 `DesiredStore`，唤醒 reconcile。VPP 规则由 `internal/agent` 和 `internal/vpp` 物化；BIRD anchors/FlowSpec 在 api 模式(生产主路径)下由 `internal/birdfeed` 经 bird api proto 增量喂入，legacy 退路为 `BirdApplier` 使用 atomic write、`birdc configure check`、reload、rollback 纪律应用。
 
 ## Fail-static 与自愈
 

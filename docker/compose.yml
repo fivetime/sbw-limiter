@@ -1,10 +1,10 @@
 # Local smoke: VPP + edge-agent co-located (sharing /run/vpp). Shows the agent
 # image connecting to VPP over the api.sock — the "same node, shared socket"
-# deployment model (NOT image inheritance). The agent then dials the coverer's
-# agent-facing AgentService (set CONTROLLER_ENDPOINTS to a running sbw-coverer); without
+# deployment model (NOT image inheritance). The agent then dials sbw-server's
+# AgentService directly (set CONTROLLER_ENDPOINTS to a running sbw-server); without
 # it the agent just keeps retrying, which is the correct fail-static behaviour.
 #
-#   CONTROLLER_ENDPOINTS=host.docker.internal:1791 docker compose up --build
+#   CONTROLLER_ENDPOINTS=host.docker.internal:1792 docker compose up --build
 #
 # A full L node also runs bird (for the anchor/FlowSpec render side); this compose
 # covers the VPP/policer half. For the faithful topology see sbw-contract/lab.
@@ -44,8 +44,8 @@ services:
       BWPOOL_CAPACITY_BPS: "1000000000"
       BWPOOL_REPORT_INTERVAL: 2s
       BWPOOL_LOG_FORMAT: text
-      # point at a running coverer (e.g. the sbw-coverer AgentService on the host)
-      BWPOOL_CONTROLLER_ENDPOINTS: ${CONTROLLER_ENDPOINTS:-host.docker.internal:1791}
+      # point at a running sbw-server (its AgentService listen address on the host)
+      BWPOOL_CONTROLLER_ENDPOINTS: ${CONTROLLER_ENDPOINTS:-host.docker.internal:1792}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

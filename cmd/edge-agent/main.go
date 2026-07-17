@@ -259,12 +259,9 @@ func main() {
 		defer canaryCleanup()
 	}
 
-	// Controller connection via the homing director (L-06): the agent boots from
-	// the bootstrap endpoint set, Registers on any one, and is told its primary +
-	// fallback coverers; it homes onto the primary (reports + subscribes there) and
-	// re-homes on a REHOME push, falling back to another coverer if the primary is
-	// unreachable. With sharding off the controller returns no coverers and the
-	// agent simply stays on its single endpoint. The director is the ReportSink.
+	// Control-plane connection: the agent dials sbw-server directly (Register +
+	// Subscribe + Report over one conn; no coverer assignment) — see the RunDirect
+	// wiring below. The client is the ReportSink.
 	onDesired := func(st model.EdgeDesiredState) {
 		if store.Accept(st) {
 			recon.Wake() // apply a fresh push now, not on the next timer tick (T-705)

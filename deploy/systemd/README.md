@@ -1,26 +1,22 @@
 # systemd units (T-504)
 
-Service units for the two long-lived daemons, per DESIGN.md §7.
+Service unit for the edge-agent daemon, per DESIGN.md §7. (The former
+`bwpool-controller.service` is gone: the monolithic controller was retired and
+split into sbw-server + sbw-coverer, which live in their own repos.)
 
 | Unit | Binary | Key deps | Notes |
 |------|--------|----------|-------|
 | `bwpool-edge-agent.service` | `bwpool-edge-agent` | `Requires=vpp.service`, `After=vpp.service bird.service network-online.target` | Programs VPP + BIRD; runs on every edge. |
-| `bwpool-controller.service` | `bwpool-controller` | `After=network-online.target` | Control plane; no VPP/BIRD dependency. |
 
-Both use `Restart=always` + `StartLimitIntervalSec=0` so a crash (or a flapping
+It uses `Restart=always` + `StartLimitIntervalSec=0` so a crash (or a flapping
 data plane) is always brought back, and `Type=exec` so systemd tracks start
-accurately. The daemons catch `SIGTERM` and exit 0, so `systemctl stop` is a
+accurately. The daemon catches `SIGTERM` and exits 0, so `systemctl stop` is a
 clean stop, not a failure.
-
-> The agent's data-plane wiring (reconcile loop, route audit, anchor reloader)
-> lands in a later task; today the daemon idles after startup. The **unit
-> lifecycle** (start / crash-restart / clean stop / boot autostart) is already
-> real and verified.
 
 ## Install
 
 ```sh
-sudo deploy/systemd/install.sh both      # or: edge | controller
+sudo deploy/systemd/install.sh
 sudoedit /etc/bwpool/edge-agent.env      # set BWPOOL_EDGE_ID
 sudo systemctl enable --now bwpool-edge-agent.service
 ```
