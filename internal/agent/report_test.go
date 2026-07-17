@@ -82,6 +82,43 @@ func TestReporterBuildAssemblesValidReport(t *testing.T) {
 	}
 }
 
+// WithPhaseSource re-stamps HealthReport.Phase LIVE at build time (§6.67 wall-①):
+// the Observe-time snapshot only updates at pass boundaries, so a report built
+// mid-grind must carry the current phase (Reconciling), not the pre-pass one.
+func TestReporterBuildRestampsLivePhase(t *testing.T) {
+	hc := NewHealthChecker("edge-2", fakeLive{healthy: true})
+	// Last pass ended fully drained → the snapshot phase is NOT Reconciling.
+	pt := NewPhaseTracker(&phaseConn{up: true}, nil)
+	hcWith := NewHealthChecker("edge-2", fakeLive{healthy: true}, WithPhase(pt))
+	hcWith.Observe(model.EdgeDesiredState{Generation: 3}, Result{}, nil)
+	if rep, _ := hcWith.Last(); rep.Phase != model.PhaseReady {
+		t.Fatalf("precondition: snapshot phase = %q, want Ready", rep.Phase)
+	}
+
+	// A grind starts AFTER the pass ended: the live source now says Reconciling.
+	busy := true
+	pt.SetApplyBusy(func() bool { return busy })
+	r := NewReporter("edge-2", hcWith, WithPhaseSource(pt.Tick))
+	rep, ok := r.Build()
+	if !ok {
+		t.Fatal("Build ready")
+	}
+	if rep.Health.Phase != model.PhaseReconciling {
+		t.Errorf("mid-grind report phase = %q, want Reconciling (live re-stamp)", rep.Health.Phase)
+	}
+	busy = false
+	if rep, _ = r.Build(); rep.Health.Phase != model.PhaseReady {
+		t.Errorf("post-grind report phase = %q, want Ready", rep.Health.Phase)
+	}
+
+	// Without the option the snapshot stands (legacy behaviour).
+	hc.Observe(model.EdgeDesiredState{Generation: 3}, Result{}, nil)
+	legacy := NewReporter("edge-2", hc)
+	if rep, _ := legacy.Build(); rep.Health.Phase != "" {
+		t.Errorf("legacy (no phase source) should keep the snapshot phase, got %q", rep.Health.Phase)
+	}
+}
+
 func TestReporterBuildWithoutOptionalSources(t *testing.T) {
 	hc := NewHealthChecker("e", fakeLive{healthy: false})
 	hc.Observe(model.EdgeDesiredState{Generation: 1}, Result{}, nil) // vpp down

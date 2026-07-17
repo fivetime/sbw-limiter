@@ -130,6 +130,11 @@ func main() {
 	// loops freeze, which a probe misreads as a wedge (verify-proven); "worker really
 	// forwarding" can't be told passively (§4.1.6).
 	phaseTracker := agent.NewPhaseTracker(conn, log)
+	// In-flight/queued materialization (§6.67 wall-①): without this the phase only
+	// reflects apply progress at pass boundaries, so a minutes-long grind (full pass
+	// or delta stream) reads Ready throughout — sensor busy-gates open, server grace
+	// blind — in exactly the window they exist for.
+	phaseTracker.SetApplyBusy(recon.Busy)
 	health := agent.NewHealthChecker(model.EdgeID(cfg.EdgeID), conn,
 		agent.WithPhase(phaseTracker), agent.WithDeltasDropped(recon.DeltasDropped))
 	recon.AddObserver(health.Observe) // reconcile result drives soft-death health (B-05)
@@ -158,7 +163,9 @@ func main() {
 	// VPP-layer sensors below treat their own starvation (frozen heartbeat, stale
 	// probe gauge) as busy-not-dead instead of declaring faults. A truly wedged VPP
 	// errors the reconcile → phase Degraded → the gates open (phase model closes it).
-	sensorBusy := func() bool { return phaseTracker.Phase() == model.PhaseReconciling }
+	// Tick (not Phase): recompute live — the cached phase only moves on ticker/pass
+	// boundaries, and the sensors ask exactly when a grind is stalling those.
+	sensorBusy := func() bool { return phaseTracker.Tick() == model.PhaseReconciling }
 
 	// ③ forwarding-broken (§4.2.7/§4.2.8) — see setupForwardingProbe.
 	probeBroken, probeCleanup := setupForwardingProbe(ctx, cfg, conn, log, sensorBusy)
@@ -209,6 +216,10 @@ func main() {
 			}
 			return birdFeedStatus()
 		}),
+		// LIVE phase at report-build time (§6.67 wall-①): Tick re-samples the socket
+		// and busy sources NOW, so a mid-grind report says Reconciling — the server's
+		// phase-aware grace keys off this field.
+		agent.WithPhaseSource(phaseTracker.Tick),
 		agent.WithReporterLogger(log),
 	)
 

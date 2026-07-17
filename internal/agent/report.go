@@ -70,6 +70,7 @@ type Reporter struct {
 	birdFeed      func() (fails, lastOKUnixMs int64)
 	desiredCounts func() (policers, sessions int, ok bool)
 	actualCounts  func() (policers, sessions int, ok bool)
+	phase         func() model.DataPlanePhase
 	fault         FaultSource
 	now           func() int64
 	log           *slog.Logger
@@ -125,6 +126,16 @@ func WithActualCounts(fn func() (policers, sessions int, ok bool)) ReporterOptio
 // touches bird/VPP, so it cannot stall the report hot path.
 func WithBirdFeedStatus(fn func() (fails, lastOKUnixMs int64)) ReporterOption {
 	return func(r *Reporter) { r.birdFeed = fn }
+}
+
+// WithPhaseSource wires a LIVE data-plane phase source (PhaseTracker.Tick): Build
+// re-stamps HealthReport.Phase with it, replacing the Observe-time snapshot. The
+// snapshot only updates at reconcile pass END, so during a minutes-long grind every
+// report would carry the pre-pass phase (Ready) — and the server's phase-aware
+// grace (§6.67 wall-①) would never see Reconciling in exactly the window it exists
+// for. nil → the Observe-time phase stands (legacy).
+func WithPhaseSource(fn func() model.DataPlanePhase) ReporterOption {
+	return func(r *Reporter) { r.phase = fn }
 }
 
 // WithReporterClock overrides the timestamp source (tests).
@@ -189,6 +200,11 @@ func (r *Reporter) Build() (model.EdgeReport, bool) {
 	// it into the bird-feed-degraded/-recovered BSS events (policy-integrity signal).
 	if r.birdFeed != nil {
 		rep.Health.BirdFeedFails, rep.Health.BirdFeedLastOKUnixMs = r.birdFeed()
+	}
+	// LIVE phase re-stamp (§6.67 wall-①): the Observe-time phase in h only updates
+	// at pass boundaries; a mid-grind report must say Reconciling NOW.
+	if r.phase != nil {
+		rep.Health.Phase = r.phase()
 	}
 	// Desired counts from the CURRENT held state (fresh across deltas; §6.52 #5).
 	if r.desiredCounts != nil {

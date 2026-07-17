@@ -27,6 +27,12 @@ type PhaseInputs struct {
 	// server takes the FAST hard-death path and false-fails-over a live edge. Reporting
 	// Reconciling here makes the server's §6.63 grace ride out the bird restart.
 	BirdBusy bool
+	// ApplyBusy is true while the reconcile goroutine has work in flight or queued
+	// (a full pass or delta mid-apply, or deltaQ backlog — Reconciler.Busy, §6.67
+	// wall-①). Pending above only updates at pass END (Observe), so a minutes-long
+	// grind would otherwise read Ready the whole way through — exactly the window
+	// where the VPP main thread starves the death sensors. Busy == alive, not dead.
+	ApplyBusy bool
 }
 
 // ComputePhase reduces the facts to one phase. Pure + total — the whole point is to
@@ -41,7 +47,7 @@ func ComputePhase(in PhaseInputs) model.DataPlanePhase {
 		return model.PhasePending // startup / first connect not yet healthy
 	case in.ApplyErr != nil:
 		return model.PhaseDegraded // applies erroring (a real failure the agent observed)
-	case in.Pending > 0 || in.BirdBusy:
+	case in.Pending > 0 || in.BirdBusy || in.ApplyBusy:
 		return model.PhaseReconciling // busy applying (own deltas or bird still churning) — a slow main thread is normal here
 	default:
 		return model.PhaseReady // synced
@@ -67,6 +73,10 @@ type PhaseTracker struct {
 	// Reconciling, not Ready (§6.63 blind spot). Sampled on every recompute so both
 	// the reconcile Observe and the fast phase ticker pick it up.
 	birdBusy func() bool
+	// applyBusy (nil-safe) reports in-flight/queued materialization work
+	// (Reconciler.Busy, §6.67 wall-①) — folded into the phase so a long full pass
+	// or delta stream reads as Reconciling mid-grind, not only at pass boundaries.
+	applyBusy func() bool
 }
 
 // recomputeLocked recomputes the phase from the current cached inputs. mu held.
@@ -79,12 +89,17 @@ func (pt *PhaseTracker) recomputeLocked() {
 	if pt.birdBusy != nil {
 		birdBusy = pt.birdBusy()
 	}
+	applyBusy := false
+	if pt.applyBusy != nil {
+		applyBusy = pt.applyBusy()
+	}
 	next := ComputePhase(PhaseInputs{
 		SocketUp:      up,
 		EverConnected: pt.everConnected,
 		Pending:       pt.pending,
 		ApplyErr:      pt.applyErr,
 		BirdBusy:      birdBusy,
+		ApplyBusy:     applyBusy,
 	})
 	if next != pt.phase {
 		pt.log.Info("data-plane phase", "from", pt.phase, "to", next,
@@ -111,6 +126,17 @@ func (pt *PhaseTracker) SetBirdBusy(fn func() bool) {
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 	pt.birdBusy = fn
+}
+
+// SetApplyBusy wires the in-flight/queued materialization signal (Reconciler.Busy,
+// §6.67 wall-①). Without it the phase only reflects apply progress at pass
+// boundaries (Observe), so a minutes-long grind reads Ready throughout — the exact
+// window the sensor busy-gates and the server's phase-aware grace need covered.
+// Call once at startup before the phase tickers run. nil clears it.
+func (pt *PhaseTracker) SetApplyBusy(fn func() bool) {
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+	pt.applyBusy = fn
 }
 
 // SetApplyState records the latest reconcile pass outcome (pending = desired-actual

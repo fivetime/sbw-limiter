@@ -136,6 +136,14 @@ type Reconciler struct {
 	// from the transport dispatch goroutine, read from the health goroutine → atomic.
 	deltasDropped atomic.Uint64
 
+	// applying is true while the reconcile goroutine is mid-apply — a full pass OR a
+	// queued delta (§6.67 wall-①). The phase tracker's Observe feed only fires at
+	// pass END with pending=0, so without this a minutes-long 100K-route grind (or a
+	// sustained delta stream) reads as PhaseReady the whole way through: the busy
+	// gates on the VPP-layer death sensors stay OPEN in exactly the window they were
+	// built for. Busy() folds it (plus queue depth) into the phase as ApplyBusy.
+	applying atomic.Bool
+
 	// onDelta applies one queued delta from the reconcile goroutine: gap-detect
 	// against lastGen, merge into the held desired state, and apply just the touched
 	// pools (wired by main to DesiredStore.Merge + ApplyDelta). On a gap it requests
@@ -252,6 +260,12 @@ func (r *Reconciler) SubmitDelta(d model.EdgeDesiredDelta) {
 // (see deltasDropped). The health builder reads it into HealthReport.DeltasDropped so
 // the server can emit a delivery-degraded BSS event on a rise (DESIGN §9.1).
 func (r *Reconciler) DeltasDropped() uint64 { return r.deltasDropped.Load() }
+
+// Busy reports whether materialization work is in flight or queued: a full pass or
+// delta mid-apply on the reconcile goroutine, or deltas waiting in deltaQ. Wire to
+// PhaseTracker.SetApplyBusy (§6.67 wall-①) so a long grind reads as Reconciling —
+// not Ready — for the sensor busy-gates and the server's phase-aware grace alike.
+func (r *Reconciler) Busy() bool { return r.applying.Load() || len(r.deltaQ) > 0 }
 
 // Reset drops in-memory caches that a VPP restart invalidates. The policer
 // name→index map is the only such state: after a restart VPP reassigns indexes
@@ -842,7 +856,9 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration, provider D
 			// reconcile goroutine, mutually exclusive with the full pass. The handler
 			// gap-detects and either applies the touched pools or requests a resync.
 			if r.onDelta != nil {
+				r.applying.Store(true)
 				r.onDelta(d)
+				r.applying.Store(false)
 			}
 		case <-reconnects:
 			// VPP restarted (or the link flapped): the data plane lost our
@@ -858,6 +874,8 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration, provider D
 }
 
 func (r *Reconciler) runOnce(provider DesiredProvider) {
+	r.applying.Store(true)
+	defer r.applying.Store(false)
 	desired, ok := provider()
 	if !ok {
 		// Fail-static cold start (§6.4): no controller state ever received, so
