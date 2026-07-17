@@ -148,6 +148,16 @@ func (f *Feed) pass(provider Provider) {
 	}
 	if err := f.apply(st); err != nil {
 		f.fails.Add(1)
+		// Retry on a short fuse instead of waiting out a full interval tick —
+		// for EVERY failure path (2026-07-17 audit #5). The connect-failure case
+		// always needed this (bird's socket isn't up yet); the flush-error cases
+		// (bird died and the AGENT's own write detected it first) relied on the
+		// reader-EOF watcher to wake the feed, but f.client.close() on those paths
+		// tears the watcher down with the connection, so nothing re-armed and the
+		// steering re-feed degraded to the next ~60s tick. Each failed pass
+		// schedules exactly one wake (coalescing channel), so this self-arms every
+		// ~2s while bird is down and stops on the first clean pass.
+		time.AfterFunc(2*time.Second, f.Wake)
 		return
 	}
 	f.fails.Store(0)
@@ -165,11 +175,8 @@ func (f *Feed) apply(st model.EdgeDesiredState) error {
 	if !f.client.connected() {
 		if err := f.client.connect(); err != nil {
 			f.log.Warn("bird feed: connect failed", "socket", f.path, "err", err)
-			// bird is (re)starting — its socket isn't up yet. Retry on a short
-			// fuse instead of waiting out a full ReconcileInterval tick: each
-			// failed pass schedules exactly one wake (coalescing channel), so
-			// this self-arms every ~2s while bird is down and stops on success.
-			time.AfterFunc(2*time.Second, f.Wake)
+			// bird is (re)starting — its socket isn't up yet. The caller (pass)
+			// arms the short-fuse retry wake for every failed pass.
 			return err
 		}
 		f.log.Info("bird feed: connected", "socket", f.path)

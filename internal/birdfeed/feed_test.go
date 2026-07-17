@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/fivetime/sbw-contract/model"
 )
@@ -53,6 +54,26 @@ func countOps(frames [][]byte) (add, del, hello, eor int) {
 func anchor(s string) model.Anchor { return model.Anchor{Prefix: netip.MustParsePrefix(s)} }
 func flow(s string) model.FlowRedirect {
 	return model.FlowRedirect{SrcPrefix: netip.MustParsePrefix(s)}
+}
+
+// A pass that fails on FLUSH — bird's death detected by the agent's OWN write,
+// where f.client.close() also tears down the reader-EOF watcher that would have
+// woken the feed — must self-arm the short-fuse retry wake, not wait out the next
+// full interval tick (2026-07-17 audit #5).
+func TestFeedFlushFailureArmsRetryWake(t *testing.T) {
+	f, s := newTestFeed()
+	f.wake = make(chan struct{}, 1)
+	s.flushErr = errors.New("EPIPE (bird went away)")
+	st := model.EdgeDesiredState{Anchors: []model.Anchor{anchor("203.0.113.10/32")}}
+	f.pass(func() (model.EdgeDesiredState, bool) { return st, true })
+	if fails, _ := f.Status(); fails != 1 {
+		t.Fatalf("fails = %d after flush-failure pass, want 1", fails)
+	}
+	select {
+	case <-f.wake: // the ~2s fuse fired
+	case <-time.After(4 * time.Second):
+		t.Fatal("no retry wake after a flush-failure pass — steering re-feed degrades to the next interval tick")
+	}
 }
 
 func TestFeedResyncThenDiff(t *testing.T) {
